@@ -14,14 +14,16 @@ jobs:
   build:
     name: ${{ matrix.name }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          # macOS (Apple silicon) + Intel
+          # macOS (Apple silicon)
           - name: macos-aarch64
             runs-on: macos-latest
             target: aarch64-apple-darwin
+          # macOS (Intel) — native runner for reliable x86_64 builds
           - name: macos-x86_64
-            runs-on: macos-latest
+            runs-on: macos-13
             target: x86_64-apple-darwin
           # Linux x64
           - name: linux-x86_64
@@ -44,20 +46,18 @@ jobs:
       - name: Build binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Upload license + checksum
-        shell: bash
-        run: |
-          echo "Built ${{ matrix.target }}"
-
-      # macOS/Linux: tar.gz with `ping-uin` binary + LICENSE
+      # macOS/Linux: tar.gz with binary + LICENSE
       - name: Package unix artifact
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          mkdir -p dist
-          tar -C target/${{ matrix.target }}/release -czf "dist/ping-uin-${{ matrix.name }}.tar.gz" ping-uin
+          mkdir -p dist/staging
+          cp target/${{ matrix.target }}/release/ping-uin dist/staging/ping-uin
+          cp LICENSE dist/staging/LICENSE
+          tar -C dist/staging -czf "dist/ping-uin-${{ matrix.name }}.tar.gz" .
+          cd dist && shasum -a 256 "ping-uin-${{ matrix.name }}.tar.gz" > "ping-uin-${{ matrix.name }}.tar.gz.sha256"
 
-      # Windows: zip with `ping-uin.exe` binary + LICENSE
+      # Windows: zip with binary + LICENSE
       - name: Package windows artifact
         if: runner.os == 'Windows'
         shell: pwsh
@@ -66,6 +66,8 @@ jobs:
           Compress-Archive `
             -Path "target/${{ matrix.target }}/release/ping-uin.exe", "LICENSE" `
             -DestinationPath "dist/ping-uin-${{ matrix.name }}.zip"
+          $hash = Get-FileHash -Path "dist/ping-uin-${{ matrix.name }}.zip" -Algorithm SHA256
+          $hash.Hash | Out-File -FilePath "dist/ping-uin-${{ matrix.name }}.zip.sha256" -NoNewline
 
       - uses: actions/upload-artifact@v4
         with:
@@ -85,11 +87,25 @@ jobs:
           pattern: "*"
           path: dist/
 
-      - name: release
+      - name: Generate release notes checksums
+        shell: bash
+        run: |
+          echo "## SHA-256 Checksums" > checksums.md
+          echo "" >> checksums.md
+          echo '```' >> checksums.md
+          cat dist/*/*.sha256 >> checksums.md
+          echo '```' >> checksums.md
+
+      - name: Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: checksums.md
           files: |
             dist/macos-aarch64/ping-uin-*.tar.gz
+            dist/macos-aarch64/ping-uin-*.tar.gz.sha256
             dist/macos-x86_64/ping-uin-*.tar.gz
+            dist/macos-x86_64/ping-uin-*.tar.gz.sha256
             dist/linux-x86_64/ping-uin-*.tar.gz
+            dist/linux-x86_64/ping-uin-*.tar.gz.sha256
             dist/windows-x86_64/ping-uin-*.zip
+            dist/windows-x86_64/ping-uin-*.zip.sha256
