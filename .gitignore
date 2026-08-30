@@ -1,0 +1,4 @@
+/target
+/ip-top.json        # your personal hosts config
+/hosts.csv           # live sync CSV  (user data)
+/uptime-log.csv      # ping history    (user data)
