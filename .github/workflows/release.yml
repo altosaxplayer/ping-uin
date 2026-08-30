@@ -89,7 +89,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/macOS-aarch64/ping-uin-*.tar.gz
-            dist/macOS-x86_64/ping-uin-*.tar.gz
+            dist/macos-aarch64/ping-uin-*.tar.gz
+            dist/macos-x86_64/ping-uin-*.tar.gz
             dist/linux-x86_64/ping-uin-*.tar.gz
             dist/windows-x86_64/ping-uin-*.zip
