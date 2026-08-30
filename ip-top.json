@@ -1,0 +1,27 @@
+{
+  "hosts": [
+    {
+      "name": "8.8.8.8",
+      "interval_m": 1,
+      "group": "external"
+    },
+    {
+      "name": "1.1.1.1",
+      "interval_m": 2,
+      "group": "Group A"
+    },
+    {
+      "name": "google.com",
+      "interval_m": 2,
+      "group": "external"
+    },
+    {
+      "name": "192.168.1.1",
+      "interval_m": 3,
+      "group": "Test",
+      "alias": "Nothingness"
+    }
+  ],
+  "timeout_ms": 1000,
+  "graph_width": 40
+}

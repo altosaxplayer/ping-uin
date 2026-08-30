@@ -1,33 +1,42 @@
-# Packaging notes
+# Packaging
 
-## Homebrew (via your own tap — recommended)
+We (the project maintainers) handle distribution. Users don't need to do
+anything except `brew` / `winget`. This sibling doc keeps internal notes for
+those maintainers — it can stay public, it's just how we operate.
 
-1. Create a public repo named `homebrew-tap` on GitHub.
-2. Add `tap/Formula/ping-uin.rb` from `packaging/homebrew/ping-uin.rb` here,
-   replacing `<your-username>` with your GitHub user.
-3. Users can then:
+## Homebrew — we're the tap
+
+The formula `packaging/homebrew/ping-uin.rb` lives in this repo **until** we
+reach critical mass, and in our own tap `altosaxplayer/homebrew-tap` once we
+set it up. End users:
 
 ```bash
-brew tap <your-username>/tap \
-    https://github.com/<your-username>/homebrew-tap
+brew tap altosaxplayer/tap
 brew install ping-uin
 ```
 
-The formula builds **from source** with `cargo`, so Homebrew's audit is
-satisfied even before the first release (no binary URLs needed).
+Once codebase is ready, retag and our CI release (`.github/workflows/release.yml`)
+provides the checksums that the `url` in the formula expects — then the
+formula can be moved into `homebrew-tap` for clear UX.
 
-## winget
+The formula builds **from source** with `cargo`, so Homebrew's audit passes
+even before binaries exist.
 
-Once you have a GitHub Release with a Windows zip (`ping-uin-windows-x86_64.zip`)
-— produced automatically on tag push by `.github/workflows/release.yml` —
-generate a manifest with:
+## winget — PR to microsoft/winget-pkgs
+
+Maintainers run one command once we have a Windows release asset
+(produced automatically on tag push):
 
 ```powershell
-wingetcreate new `
-    https://github.com/<your-username>/ping-uin/releases/download/v0.1.0/ping-uin-windows-x86_64.zip
+wingetcreate new \
+    https://github.com/altosaxplayer/ping-uin/releases/download/v0.1.0/ping-uin-windows-x86_64.zip
 ```
 
-Then submit the generated manifest as a PR to `microsoft/winget-pkgs`.
+Then open a PR with the generated manifest on `microsoft/winget-pkgs`.
+Project-owned manifest: we ship, users just `winget install ping-uin`.
 
-Alternatively, keep `packaging/winget/manifest.yaml` on your own repo and have
-users install from a private index.
+## Why is this shared publicly?
+
+Transparency — it documents how we (maintainers) ship without making anyone
+else a packaging consumer. Users never need to think about taps/formulas; we
+handle all of it on ingest.
