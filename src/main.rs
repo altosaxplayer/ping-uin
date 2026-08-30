@@ -839,7 +839,7 @@ fn ui(frame: &mut Frame, app: &App) {
     let show_alerts = app.alerts;
     let alert_rows = if show_alerts { (downs.len().min(6).max(1) + if downs.len() > 6 { 1 } else { 0 }) as u16 } else { 0 };
 
-    let mut constraints = vec![Constraint::Length(8), Constraint::Length(3)];
+    let mut constraints = vec![Constraint::Length(5), Constraint::Length(3)];
     if show_alerts {
         constraints.push(Constraint::Length(alert_rows + 3));
     }
@@ -859,7 +859,7 @@ fn ui(frame: &mut Frame, app: &App) {
     };
     let title_area = main_layout[0];
 
-    // ── Title box: larger, centered ping-uin penguin logo in its own border ──
+    // ── Title box: centered ping-uin with penguin face in its own border ──
     let title_box = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -867,35 +867,22 @@ fn ui(frame: &mut Frame, app: &App) {
         .style(Style::default().bg(theme.main_bg));
     let title_inner = title_box.inner(title_area);
     frame.render_widget(title_box, title_area);
-
-    let logo_lines = vec![
-        Line::from(Span::styled("    .------.    ", Style::default().fg(theme.hi_fg))),
-        Line::from(Span::styled("   /  O O   \\   ", Style::default().fg(theme.hi_fg))),
-        Line::from(Span::styled("  |    V     |  ", Style::default().fg(theme.hi_fg))),
-        Line::from(Span::styled("  |   \\_/    |  ", Style::default().fg(theme.hi_fg))),
-        Line::from(Span::styled("   \\________/   ", Style::default().fg(theme.hi_fg))),
-        Line::from(vec![
-            Span::styled("▐ ", Style::default().fg(theme.hi_fg)),
-            Span::styled("ping-uin", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-            Span::styled(" ▌", Style::default().fg(theme.hi_fg)),
-        ]),
-    ];
-    let logo_height = logo_lines.len() as u16;
-    // Vertically center the logo inside the bordered title box.
-    let logo_area = if title_inner.height > logo_height {
-        let y_offset = title_inner.y + (title_inner.height - logo_height) / 2;
-        Rect {
-            x: title_inner.x,
-            y: y_offset,
-            width: title_inner.width,
-            height: logo_height,
-        }
-    } else {
-        title_inner
-    };
+    // Two-line centered logo: penguin above, name below.
+    let logo_penguin = Line::from(vec![
+        Span::styled("((•O•))", Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
+    ]);
+    let logo_name = Line::from(vec![
+        Span::styled("▐ ", Style::default().fg(theme.hi_fg)),
+        Span::styled("ping-uin", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+        Span::styled(" ▌", Style::default().fg(theme.hi_fg)),
+    ]);
+    let logo_text = Text::from(vec![
+        logo_penguin,
+        logo_name,
+    ]);
     frame.render_widget(
-        Paragraph::new(Text::from(logo_lines)).alignment(Alignment::Center),
-        logo_area,
+        Paragraph::new(logo_text).alignment(Alignment::Center),
+        title_inner,
     );
 
     // ── Stats box: dedicated box under header with up / down / % up ──
