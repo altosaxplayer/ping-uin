@@ -829,12 +829,17 @@ fn ui(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Block::default().style(Style::default().bg(theme.main_bg)), area);
 
-    // Layout: header / optional alerts box / table / footer.
-    // Alert box lists hosts that are down for the last 3 checks (when enabled).
-    let mut constraints = vec![Constraint::Length(3)];
+    // Layout: title / stats / optional alerts box / table / footer.
+    let up_count = app.hosts.iter().filter(|h| h.up).count();
+    let total = app.hosts.len();
+    let down_count = total.saturating_sub(up_count);
+    let pct_up = if total > 0 { (up_count as f64 / total as f64 * 100.0).round() as u64 } else { 0 };
+    let now = Local::now().format("%H:%M:%S").to_string();
     let downs: Vec<&HostState> = app.hosts.iter().filter(|h| h.down_streak(3)).collect();
     let show_alerts = app.alerts;
     let alert_rows = if show_alerts { (downs.len().min(6).max(1) + if downs.len() > 6 { 1 } else { 0 }) as u16 } else { 0 };
+
+    let mut constraints = vec![Constraint::Length(8), Constraint::Length(3)];
     if show_alerts {
         constraints.push(Constraint::Length(alert_rows + 3));
     }
@@ -847,53 +852,89 @@ fn ui(frame: &mut Frame, app: &App) {
         .constraints(constraints)
         .split(area);
 
-    let (alert_area, table_area, footer_area) = if show_alerts {
-        (Some(main_layout[1]), main_layout[2], main_layout[3])
+    let (stats_area, alert_area, table_area, footer_area) = if show_alerts {
+        (main_layout[1], Some(main_layout[2]), main_layout[3], main_layout[4])
     } else {
-        (None, main_layout[1], main_layout[2])
+        (main_layout[1], None, main_layout[2], main_layout[3])
     };
+    let title_area = main_layout[0];
 
-    let up_count = app.hosts.iter().filter(|h| h.up).count();
-    let total = app.hosts.len();
-    let down_count = total.saturating_sub(up_count);
-    let now = Local::now().format("%H:%M:%S").to_string();
-
-    // Penguin logo + accent title: ▐ ((•O•)) ping-uin ▌
-    let title_line = Line::from(vec![
-        Span::styled(" ▐ ", Style::default().fg(theme.hi_fg)),
-        Span::styled("((•O•)) ", Style::default().fg(theme.hi_fg)),
-        Span::styled("ping-uin", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-        Span::styled(" ▌ ", Style::default().fg(theme.hi_fg)),
-        Span::raw(" "),
-        Span::styled(format!("{} hosts", total), Style::default().fg(theme.inactive_fg)),
-        Span::styled(" · ", Style::default().fg(theme.divider)),
-        Span::styled(format!("{} up", up_count), Style::default().fg(theme.status_good)),
-        Span::styled(" · ", Style::default().fg(theme.divider)),
-        Span::styled(format!("{} down", down_count), Style::default().fg(if down_count > 0 { theme.status_danger } else { theme.inactive_fg })),
-    ]);
-
-    let right_line = Line::from(vec![
-        Span::styled(now, Style::default().fg(theme.inactive_fg)),
-        Span::styled(" · ", Style::default().fg(theme.divider)),
-        Span::styled(theme.name, Style::default().fg(theme.hi_fg)),
-        Span::styled(" ", Style::default()),
-    ]);
-
-    let header_box = Block::default()
+    // ── Title box: larger, centered ping-uin penguin logo in its own border ──
+    let title_box = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.box_color))
         .style(Style::default().bg(theme.main_bg));
+    let title_inner = title_box.inner(title_area);
+    frame.render_widget(title_box, title_area);
 
-    let header_inner_rect = header_box.inner(main_layout[0]);
-    frame.render_widget(header_box, main_layout[0]);
-    let header_inner = Layout::default()
+    let logo_lines = vec![
+        Line::from(Span::styled("    .------.    ", Style::default().fg(theme.hi_fg))),
+        Line::from(Span::styled("   /  O O   \\   ", Style::default().fg(theme.hi_fg))),
+        Line::from(Span::styled("  |    V     |  ", Style::default().fg(theme.hi_fg))),
+        Line::from(Span::styled("  |   \\_/    |  ", Style::default().fg(theme.hi_fg))),
+        Line::from(Span::styled("   \\________/   ", Style::default().fg(theme.hi_fg))),
+        Line::from(vec![
+            Span::styled("▐ ", Style::default().fg(theme.hi_fg)),
+            Span::styled("ping-uin", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Span::styled(" ▌", Style::default().fg(theme.hi_fg)),
+        ]),
+    ];
+    let logo_height = logo_lines.len() as u16;
+    // Vertically center the logo inside the bordered title box.
+    let logo_area = if title_inner.height > logo_height {
+        let y_offset = title_inner.y + (title_inner.height - logo_height) / 2;
+        Rect {
+            x: title_inner.x,
+            y: y_offset,
+            width: title_inner.width,
+            height: logo_height,
+        }
+    } else {
+        title_inner
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(logo_lines)).alignment(Alignment::Center),
+        logo_area,
+    );
+
+    // ── Stats box: dedicated box under header with up / down / % up ──
+    let stats_title = Line::from(vec![
+        Span::styled(" ▐ ", Style::default().fg(theme.hi_fg)),
+        Span::styled("stats", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+        Span::styled(" ▌ ", Style::default().fg(theme.hi_fg)),
+    ]);
+    let stats_block = Block::default()
+        .title(stats_title)
+        .title_alignment(Alignment::Left)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.box_color))
+        .style(Style::default().bg(theme.main_bg));
+    let stats_inner = stats_block.inner(stats_area);
+    frame.render_widget(stats_block, stats_area);
+    let stats_line = Line::from(vec![
+        Span::styled("● ", Style::default().fg(theme.status_good)),
+        Span::styled(format!("{} up", up_count), Style::default().fg(theme.status_good).add_modifier(Modifier::BOLD)),
+        Span::styled("   ", Style::default()),
+        Span::styled("● ", Style::default().fg(theme.status_danger)),
+        Span::styled(format!("{} down", down_count), Style::default().fg(theme.status_danger).add_modifier(Modifier::BOLD)),
+        Span::styled("   ", Style::default()),
+        Span::styled("◐ ", Style::default().fg(theme.hi_fg)),
+        Span::styled(format!("{}% up", pct_up), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  ·  {} hosts", total), Style::default().fg(theme.inactive_fg)),
+    ]);
+    let stats_right = Line::from(vec![
+        Span::styled(now, Style::default().fg(theme.inactive_fg)),
+        Span::styled(" · ", Style::default().fg(theme.divider)),
+        Span::styled(theme.name, Style::default().fg(theme.hi_fg)),
+    ]);
+    let stats_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(30), Constraint::Min(20)])
-        .split(header_inner_rect);
-
-    frame.render_widget(Paragraph::new(Text::from(title_line)), header_inner[0]);
-    frame.render_widget(Paragraph::new(Text::from(right_line)).alignment(Alignment::Right), header_inner[1]);
+        .constraints([Constraint::Min(30), Constraint::Length(22)])
+        .split(stats_inner);
+    frame.render_widget(Paragraph::new(Text::from(stats_line)), stats_layout[0]);
+    frame.render_widget(Paragraph::new(Text::from(stats_right)).alignment(Alignment::Right), stats_layout[1]);
 
     // Down-hosts alert box (x to toggle): red-bordered, group-agnostic.
     if let Some(alerts_rect) = alert_area {
