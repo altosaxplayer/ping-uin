@@ -25,9 +25,14 @@ use ratatui::{Frame, Terminal};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-/// Where the config/csv/log live. Resolved once at startup from the user
-/// config dir (e.g. `~/.config/ping-uin` on Linux/macOS, `%APPDATA%\ping-uin`
-/// on Windows). Falls back to "./ping-uin-config" when dirs is unavailable.
+/// Where the config/csv/log live. Resolved once at startup.
+///
+/// Portable mode: if the directory containing the running executable has a
+/// `ping-uin.portable` marker file, or already contains one of the data files,
+/// that directory is used instead of the system config dir.
+///
+/// Otherwise falls back to the user config dir
+/// (`~/.config/ping-uin` on Linux/macOS, `%APPDATA%\ping-uin` on Windows).
 struct Paths {
     config: PathBuf,
     csv: PathBuf,
@@ -36,8 +41,27 @@ struct Paths {
 
 static PATHS: OnceLock<Paths> = OnceLock::new();
 
+fn portable_dir() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    // Don't treat Cargo build directories as portable installs.
+    if exe_dir.components().any(|c| c.as_os_str() == "target") {
+        return None;
+    }
+    let marker = exe_dir.join("ping-uin.portable");
+    let has_marker = marker.exists();
+    let has_data = ["ip-top.json", "hosts.csv", "uptime-log.csv"]
+        .iter()
+        .any(|name| exe_dir.join(name).exists());
+    if has_marker || has_data {
+        Some(exe_dir)
+    } else {
+        None
+    }
+}
+
 fn resolve_paths() -> Paths {
-    let dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("ping-uin");
+    let dir = portable_dir()
+        .unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("ping-uin"));
     let _ = fs::create_dir_all(&dir);
     Paths {
         config: dir.join("ip-top.json"),

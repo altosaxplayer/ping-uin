@@ -85,7 +85,12 @@ edit it by hand and import.
 
 ## Data & privacy
 
-Everything **stays local**, never sent anywhere:
+Everything **stays local**, never sent anywhere.
+
+### Default location
+
+On Linux/macOS: `~/.config/ping-uin/`
+On Windows: `%APPDATA%\ping-uin\` (usually `C:\Users\<you>\AppData\Roaming\ping-uin\`)
 
 | File | Purpose |
 |------|---------|
@@ -93,8 +98,22 @@ Everything **stays local**, never sent anywhere:
 | `hosts.csv` | bulk-import/export mirror |
 | `uptime-log.csv` | rolling ping history (last ~10k events) |
 
-The default `.gitignore` already excludes the three files above so nothing
-personal hits GitHub unless you specifically force-add it.
+### Portable mode
+
+To keep the data files next to the executable (e.g., on a USB drive or in a
+self-contained folder), create an empty file named `ping-uin.portable` in the
+same directory as `ping-uin`/`ping-uin.exe`:
+
+```bash
+# Linux/macOS
+touch ping-uin.portable
+
+# Windows (PowerShell)
+New-Item -ItemType File -Name ping-uin.portable
+```
+
+On the next launch, `ip-top.json`, `hosts.csv`, and `uptime-log.csv` will be
+read from and written to that same directory instead of the system config path.
 
 ---
 
