@@ -298,6 +298,7 @@ enum InputMode {
     AddHost(AddHostForm),
     EditEntry { original: String, form: AddHostForm },
     SortPicker { selected: usize },
+    GroupFilterPicker { groups: Vec<String>, selected: usize },
     ConfirmDelete,
 }
 
@@ -348,6 +349,7 @@ struct App {
     hosts: Vec<HostState>,
     selected_idx: usize,
     group_by: bool,
+    group_filter: Option<String>,
     sort_mode: SortMode,
     alerts: bool,
     input_mode: InputMode,
@@ -663,9 +665,16 @@ fn sort_host_indices(indices: &mut Vec<usize>, hosts: &[HostState], sort_mode: S
     }
 }
 
-fn build_visible_rows(hosts: &[HostState], group_by: bool, sort_mode: SortMode) -> Vec<VisibleRow> {
+fn build_visible_rows(hosts: &[HostState], group_by: bool, group_filter: Option<&str>, sort_mode: SortMode) -> Vec<VisibleRow> {
+    let in_group = |h: &HostState| {
+        let g = if h.group.is_empty() { "default" } else { &h.group };
+        group_filter.map_or(true, |f| g == f)
+    };
     if !group_by {
-        let mut indices: Vec<usize> = (0..hosts.len()).collect();
+        let mut indices: Vec<usize> = hosts.iter().enumerate()
+            .filter(|(_, h)| in_group(h))
+            .map(|(i, _)| i)
+            .collect();
         sort_host_indices(&mut indices, hosts, sort_mode);
         // Status sorts get Down/Up section headers in flat view.
         if sort_mode == SortMode::DownFirst || sort_mode == SortMode::UpFirst {
@@ -688,6 +697,7 @@ fn build_visible_rows(hosts: &[HostState], group_by: bool, sort_mode: SortMode) 
     }
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (idx, h) in hosts.iter().enumerate() {
+        if !in_group(h) { continue; }
         let group = if h.group.is_empty() { "default".to_string() } else { h.group.clone() };
         groups.entry(group).or_default().push(idx);
     }
@@ -716,7 +726,7 @@ fn selected_visible_position(rows: &[VisibleRow], selected_idx: usize) -> Option
 }
 
 fn move_selection_up(app: &mut App) {
-    let rows = build_visible_rows(&app.hosts, app.group_by, app.sort_mode);
+    let rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode);
     if let Some(pos) = selected_visible_position(&rows, app.selected_idx) {
         for i in (0..pos).rev() {
             if let Some(idx) = rows[i].host_idx {
@@ -728,7 +738,7 @@ fn move_selection_up(app: &mut App) {
 }
 
 fn move_selection_down(app: &mut App) {
-    let rows = build_visible_rows(&app.hosts, app.group_by, app.sort_mode);
+    let rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode);
     if let Some(pos) = selected_visible_position(&rows, app.selected_idx) {
         for i in pos + 1..rows.len() {
             if let Some(idx) = rows[i].host_idx {
@@ -997,7 +1007,7 @@ fn ui(frame: &mut Frame, app: &App) {
             Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""),
         ]));
     } else {
-        let visible_rows = build_visible_rows(&app.hosts, app.group_by, app.sort_mode);
+        let visible_rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode);
         for row in visible_rows {
             match row.kind {
                 RowKind::GroupHeader(group) => rows.push(render_group_header(&group, &app.hosts, theme)),
@@ -1032,11 +1042,16 @@ fn ui(frame: &mut Frame, app: &App) {
             spans.extend(key_hint("e", "edit", theme));
             spans.extend(key_hint("i", "import csv", theme));
             spans.extend(key_hint("g", "group", theme));
+            spans.extend(key_hint("f", "filter group", theme));
             spans.extend(key_hint("s", "sort", theme));
             spans.extend(key_hint("x", "down box", theme));
             spans.extend(key_hint("t", "theme", theme));
             spans.extend(key_hint("q", "quit", theme));
-            spans.push(Span::styled(format!("  sort: {}", app.sort_mode.label()), Style::default().fg(theme.divider)));
+            let mut status_parts = vec![format!("sort: {}", app.sort_mode.label())];
+            if let Some(ref filter) = app.group_filter {
+                status_parts.push(format!("group: {}", filter));
+            }
+            spans.push(Span::styled(format!("  {}", status_parts.join("  ·  ")), Style::default().fg(theme.divider)));
             Text::from(Line::from(spans))
         }
         InputMode::AddHost(_) => Text::from(Line::from(vec![
@@ -1048,6 +1063,11 @@ fn ui(frame: &mut Frame, app: &App) {
             Span::styled("Sort hosts", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
             Span::raw("   "),
             Span::raw("[↑↓] pick   [Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+        ])),
+        InputMode::GroupFilterPicker { .. } => Text::from(Line::from(vec![
+            Span::styled("Filter group", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            Span::raw("[↑↓] pick   [Enter] apply   [Space] show all   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
         ])),
         InputMode::EditEntry { ref original, .. } => Text::from(Line::from(vec![
             Span::styled(format!("Edit {}", original), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
@@ -1128,6 +1148,42 @@ fn ui(frame: &mut Frame, app: &App) {
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
                     .title(accent_title("Sort hosts", theme))
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.box_color))
+                    .style(Style::default().bg(theme.popup_bg)));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(popup, popup_area);
+        }
+        InputMode::GroupFilterPicker { ref groups, selected } => {
+            let popup_area = centered_rect(36, 42, area);
+            let mut lines: Vec<Line> = vec![Line::from("")];
+            if groups.is_empty() {
+                lines.push(Line::from("No groups defined").style(Style::default().fg(theme.inactive_fg)));
+            } else {
+                for (i, group) in groups.iter().enumerate() {
+                    let selected_here = i == selected;
+                    let active_here = app.group_filter.as_ref() == Some(group);
+                    let marker = if selected_here { "▶ " } else { "  " };
+                    let check = if active_here { " ✓" } else { "" };
+                    let style = if selected_here {
+                        Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.main_fg)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, Style::default().fg(theme.hi_fg)),
+                        Span::styled(group.clone(), style),
+                        Span::styled(check, Style::default().fg(theme.status_good)),
+                    ]));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("[Enter] filter group   [Space] show all   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)));
+            let popup = Paragraph::new(Text::from(lines))
+                .block(Block::default()
+                    .title(accent_title("Filter by group", theme))
                     .title_alignment(Alignment::Center)
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1234,6 +1290,18 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.import_entries(&shared_hosts);
                             }
                             KeyCode::Char('g') => app.group_by = !app.group_by,
+                            KeyCode::Char('f') | KeyCode::Char('F') => {
+                                let mut groups: Vec<String> = app.hosts.iter()
+                                    .map(|h| if h.group.is_empty() { "default".to_string() } else { h.group.clone() })
+                                    .collect::<std::collections::BTreeSet<_>>()
+                                    .into_iter()
+                                    .collect();
+                                groups.sort();
+                                let selected = app.group_filter.as_ref()
+                                    .and_then(|f| groups.iter().position(|g| g == f))
+                                    .unwrap_or(0);
+                                app.input_mode = InputMode::GroupFilterPicker { groups, selected };
+                            }
                             KeyCode::Char('s') | KeyCode::Char('S') => {
                                 app.input_mode = InputMode::SortPicker { selected: app.sort_mode.index() };
                             }
@@ -1301,6 +1369,37 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             _ => {}
                         },
+                        InputMode::GroupFilterPicker { ref groups, selected } => {
+                            let groups = groups.clone();
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.group_filter = None;
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Up => {
+                                    let s = if selected == 0 { groups.len().saturating_sub(1) } else { selected - 1 };
+                                    app.input_mode = InputMode::GroupFilterPicker { groups, selected: s };
+                                }
+                                KeyCode::Down => {
+                                    let s = if groups.is_empty() { 0 } else { (selected + 1) % groups.len() };
+                                    app.input_mode = InputMode::GroupFilterPicker { groups, selected: s };
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(group) = groups.get(selected) {
+                                        app.group_filter = Some(group.clone());
+                                    }
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Char(' ') => {
+                                    app.group_filter = None;
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                _ => {}
+                            }
+                        }
                         InputMode::EditEntry { ref original, ref form } => {
                             let original = original.clone();
                             let mut form = form.clone();
@@ -1398,6 +1497,7 @@ fn main() -> io::Result<()> {
         hosts,
         selected_idx: 0,
         group_by: false,
+        group_filter: None,
         sort_mode: SortMode::None,
         alerts: false,
         input_mode: InputMode::Normal,
