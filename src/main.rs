@@ -299,6 +299,7 @@ enum InputMode {
     EditEntry { original: String, form: AddHostForm },
     SortPicker { selected: usize },
     GroupFilterPicker { groups: Vec<String>, selected: usize },
+    ImportPath { path: String },
     ConfirmDelete,
 }
 
@@ -445,8 +446,8 @@ impl App {
     }
 
     /// Read and merge hosts.csv: new rows get added; existing rows get updated.
-    fn import_entries(&mut self, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
-        if let Ok(entries) = read_entries_csv() {
+    fn import_entries(&mut self, path: &std::path::Path, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
+        if let Ok(entries) = read_entries_csv(path) {
             for entry in entries {
                 match self.config.hosts.iter().position(|h| h.name == entry.name) {
                     Some(i) => {
@@ -472,8 +473,8 @@ impl App {
 }
 
 /// Read hosts.csv rows into HostConfig entries.
-fn read_entries_csv() -> io::Result<Vec<HostConfig>> {
-    let mut rdr = csv::Reader::from_path(&paths().csv)?;
+fn read_entries_csv(path: &std::path::Path) -> io::Result<Vec<HostConfig>> {
+    let mut rdr = csv::Reader::from_path(path)?;
     let mut out = Vec::new();
     for record in rdr.records() {
         let r = record?;
@@ -1077,6 +1078,11 @@ fn ui(frame: &mut Frame, app: &App) {
             Span::raw("   "),
             Span::raw("[↑↓] pick   [Enter] apply   [Space] show all   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
         ])),
+        InputMode::ImportPath { .. } => Text::from(Line::from(vec![
+            Span::styled("Import CSV", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            Span::raw("[Enter] import   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+        ])),
         InputMode::EditEntry { ref original, .. } => Text::from(Line::from(vec![
             Span::styled(format!("Edit {}", original), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
             Span::raw("   "),
@@ -1197,6 +1203,27 @@ fn ui(frame: &mut Frame, app: &App) {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme.box_color))
                     .style(Style::default().bg(theme.popup_bg)));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(popup, popup_area);
+        }
+        InputMode::ImportPath { ref path } => {
+            let popup_area = centered_rect(60, 30, area);
+            let display_path = if path.is_empty() { " ".to_string() } else { path.clone() };
+            let popup = Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from("Path to hosts.csv:").style(Style::default().fg(theme.inactive_fg)),
+                Line::from(""),
+                Line::from(Span::styled(display_path, Style::default().fg(theme.title))),
+                Line::from(""),
+                Line::from("[Enter] import   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+            ]))
+            .block(Block::default()
+                .title(accent_title("Import CSV", theme))
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.box_color))
+                .style(Style::default().bg(theme.popup_bg)));
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
         }
@@ -1338,7 +1365,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                             }
                             KeyCode::Char('i') | KeyCode::Char('I') => {
-                                app.import_entries(&shared_hosts);
+                                let default_path = paths().csv.to_string_lossy().to_string();
+                                app.input_mode = InputMode::ImportPath { path: default_path };
                             }
                             KeyCode::Char('g') => app.group_by = !app.group_by,
                             KeyCode::Char('f') | KeyCode::Char('F') => {
@@ -1448,6 +1476,21 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.group_filter = None;
                                     app.input_mode = InputMode::Normal;
                                 }
+                                _ => {}
+                            }
+                        }
+                        InputMode::ImportPath { ref path } => {
+                            let mut path = path.clone();
+                            match key.code {
+                                KeyCode::Esc => { app.input_mode = InputMode::Normal; }
+                                KeyCode::Enter => {
+                                    app.input_mode = InputMode::Normal;
+                                    if !path.trim().is_empty() {
+                                        app.import_entries(std::path::Path::new(&path), &shared_hosts);
+                                    }
+                                }
+                                KeyCode::Backspace => { path.pop(); app.input_mode = InputMode::ImportPath { path }; }
+                                KeyCode::Char(c) => { path.push(c); app.input_mode = InputMode::ImportPath { path }; }
                                 _ => {}
                             }
                         }
