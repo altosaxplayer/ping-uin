@@ -115,6 +115,16 @@ New-Item -ItemType File -Name ping-uin.portable
 On the next launch, `ip-top.json`, `hosts.csv`, and `uptime-log.csv` will be
 read from and written to that same directory instead of the system config path.
 
+### In-place updates (portable mode only)
+
+When a newer release is available, the footer shows `↑ vX.Y.Z available`.
+In portable mode, press **`u`** to download and install the update automatically:
+
+- **macOS / Linux:** the running binary is replaced in place; restart to run the new version.
+- **Windows:** the app exits, a small PowerShell updater replaces `ping-uin.exe`, and you restart manually.
+
+Package-manager installs (Homebrew, winget, AUR) should use their normal update commands instead.
+
 ---
 
 ## Why "ping-uin"?

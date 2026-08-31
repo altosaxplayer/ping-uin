@@ -367,6 +367,16 @@ impl SortMode {
     }
 }
 
+#[derive(Clone, Debug)]
+enum UpdateState {
+    Idle,
+    Checking,
+    Downloading { version: String },
+    Replacing { version: String },
+    Error(String),
+    Done { version: String, restart_required: bool },
+}
+
 struct App {
     themes: Vec<Theme>,
     theme_idx: usize,
@@ -379,6 +389,7 @@ struct App {
     alerts: bool,
     input_mode: InputMode,
     update_available: Option<String>,
+    update_state: UpdateState,
     last_check: String,
     last_result_time: Option<Instant>,
 }
@@ -531,6 +542,7 @@ fn schedules_from_config(hosts: &[HostConfig]) -> Vec<HostSchedule> {
 enum Message {
     Result { host: String, up: bool, latency_ms: f64, timestamp: String, next_ping: Instant },
     UpdateAvailable { version: String },
+    UpdateState(UpdateState),
 }
 
 fn ping_host(host: &str, timeout_ms: u64, re: &Regex) -> (bool, f64) {
@@ -1074,6 +1086,9 @@ fn ui(frame: &mut Frame, app: &App) {
             spans.extend(key_hint("x", "down box", theme));
             spans.extend(key_hint("t", "theme", theme));
             spans.extend(key_hint("q", "quit", theme));
+            if portable_dir().is_some() && app.update_available.is_some() {
+                spans.extend(key_hint("u", "update", theme));
+            }
             let mut status_parts = vec![format!("sort: {}", app.sort_mode.label())];
             if let Some(ref filter) = app.group_filter {
                 status_parts.push(format!("group: {}", filter));
@@ -1275,6 +1290,40 @@ fn ui(frame: &mut Frame, app: &App) {
         }
         InputMode::Normal => {}
     }
+
+    // Update status overlay (shown on top of any input mode).
+    if !matches!(app.update_state, UpdateState::Idle) {
+        let popup_area = centered_rect(50, 32, area);
+        let (title, body, color) = match &app.update_state {
+            UpdateState::Idle => unreachable!(),
+            UpdateState::Checking => ("Update", vec![Line::from(""), Line::from("Checking latest release...")], theme.hi_fg),
+            UpdateState::Downloading { version } => ("Update", vec![Line::from(""), Line::from(format!("Downloading v{}...", version))], theme.hi_fg),
+            UpdateState::Replacing { version } => ("Update", vec![Line::from(""), Line::from(format!("Installing v{}...", version))], theme.hi_fg),
+            UpdateState::Error(e) => ("Update failed", vec![Line::from(""), Line::from(e.clone())], theme.status_danger),
+            UpdateState::Done { version, restart_required } => {
+                let msg = if *restart_required {
+                    format!("Updated to v{}. Please restart.", version)
+                } else {
+                    format!("Updated to v{}.", version)
+                };
+                ("Update complete", vec![Line::from(""), Line::from(msg)], theme.status_good)
+            }
+        };
+        let mut lines = body;
+        lines.push(Line::from(""));
+        lines.push(Line::from("[Esc] close").style(Style::default().fg(theme.inactive_fg)));
+        let popup = Paragraph::new(Text::from(lines))
+            .alignment(Alignment::Center)
+            .block(Block::default()
+                .title(accent_title(title, theme))
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(color))
+                .style(Style::default().bg(theme.popup_bg)));
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(popup, popup_area);
+    }
 }
 
 fn spawn_worker(tx: mpsc::Sender<Message>, hosts: Arc<RwLock<Vec<HostSchedule>>>, timeout_ms: u64, shutdown: Arc<AtomicBool>) -> thread::JoinHandle<()> {
@@ -1331,22 +1380,236 @@ fn spawn_update_checker(tx: mpsc::Sender<Message>, current_version: String) -> t
     thread::spawn(move || {
         // Wait a few seconds so the UI starts immediately.
         thread::sleep(Duration::from_secs(3));
-        let url = "https://api.github.com/repos/altosaxplayer/ping-uin/releases/latest";
-        let response = ureq::get(url)
-            .set("User-Agent", "ping-uin-update-check")
-            .timeout(Duration::from_secs(10))
-            .call();
-        if let Ok(response) = response {
-            if let Ok(body) = response.into_string() {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
-                    if let Some(tag) = value.get("tag_name").and_then(|v| v.as_str()) {
-                        let latest = tag.trim_start_matches('v').to_string();
-                        if is_newer_version(&current_version, &latest) {
-                            let _ = tx.send(Message::UpdateAvailable { version: latest });
-                        }
-                    }
+        if let Some(latest) = fetch_latest_release_version() {
+            if is_newer_version(&current_version, &latest) {
+                let _ = tx.send(Message::UpdateAvailable { version: latest });
+            }
+        }
+    })
+}
+
+fn fetch_latest_release_version() -> Option<String> {
+    let url = "https://api.github.com/repos/altosaxplayer/ping-uin/releases/latest";
+    let response = ureq::get(url)
+        .set("User-Agent", "ping-uin-update-check")
+        .timeout(Duration::from_secs(10))
+        .call();
+    if let Ok(response) = response {
+        if let Ok(body) = response.into_string() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(tag) = value.get("tag_name").and_then(|v| v.as_str()) {
+                    return Some(tag.trim_start_matches('v').to_string());
                 }
             }
+        }
+    }
+    None
+}
+
+#[derive(Clone, Debug)]
+struct ReleaseAsset {
+    url: String,
+    sha256: Option<String>,
+}
+
+fn release_asset_info(version: &str) -> Option<ReleaseAsset> {
+    let url = "https://api.github.com/repos/altosaxplayer/ping-uin/releases/latest";
+    let response = ureq::get(url)
+        .set("User-Agent", "ping-uin-update")
+        .timeout(Duration::from_secs(15))
+        .call()
+        .ok()?;
+    let body = response.into_string().ok()?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let tag = value.get("tag_name")?.as_str()?;
+    let latest_version = tag.trim_start_matches('v').to_string();
+    if latest_version != version {
+        return None;
+    }
+
+    let os = env::consts::OS;
+    let asset_name = match os {
+        "windows" => format!("ping-uin-windows-x86_64.zip"),
+        "macos" => format!("ping-uin-macos-{}.tar.gz", env::consts::ARCH),
+        _ => format!("ping-uin-linux-x86_64.tar.gz"),
+    };
+
+    let assets = value.get("assets")?.as_array()?;
+    let asset = assets.iter().find(|a| {
+        a.get("name").and_then(|n| n.as_str()) == Some(&asset_name)
+    })?;
+    let url = asset.get("browser_download_url")?.as_str()?.to_string();
+
+    // Try to parse checksum from release body.
+    let sha256 = value.get("body").and_then(|b| b.as_str()).and_then(|body| {
+        for line in body.lines() {
+            if line.contains(&asset_name) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    return Some(parts[0].to_uppercase());
+                }
+            }
+        }
+        None
+    });
+
+    Some(ReleaseAsset { url, sha256 })
+}
+
+fn download_file(url: &str, dest: &std::path::Path) -> io::Result<()> {
+    let mut file = fs::File::create(dest)?;
+    let response = ureq::get(url)
+        .set("User-Agent", "ping-uin-update")
+        .timeout(Duration::from_secs(120))
+        .call()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("download failed: {}", e)))?;
+    let mut reader = response.into_reader();
+    io::copy(&mut reader, &mut file)?;
+    Ok(())
+}
+
+fn sha256_file(path: &std::path::Path) -> io::Result<String> {
+    use sha2::Digest;
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()).to_uppercase())
+}
+
+#[cfg(target_os = "windows")]
+fn extract_windows_zip(zip_path: &std::path::Path, dest_dir: &std::path::Path) -> io::Result<PathBuf> {
+    let file = fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    for i in 0..archive.len() {
+        let mut zip_file = archive.by_index(i)?;
+        let name = zip_file.name();
+        if name.ends_with("ping-uin.exe") {
+            let out_path = dest_dir.join("ping-uin.exe");
+            let mut out_file = fs::File::create(&out_path)?;
+            io::copy(&mut zip_file, &mut out_file)?;
+            return Ok(out_path);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "ping-uin.exe not found in archive"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn extract_unix_tar(tar_path: &std::path::Path, dest_dir: &std::path::Path) -> io::Result<PathBuf> {
+    let file = fs::File::open(tar_path)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        if path.file_name().map_or(false, |n| n == "ping-uin") {
+            let out_path = dest_dir.join("ping-uin");
+            entry.unpack(&out_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&out_path)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&out_path, perms)?;
+            }
+            return Ok(out_path);
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "ping-uin not found in archive"))
+}
+
+/// In-place update for portable installs. Runs in a background thread.
+fn spawn_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        fn notify(tx: &mpsc::Sender<Message>, state: UpdateState) {
+            let _ = tx.send(Message::UpdateState(state));
+        }
+
+        let exe_path = match env::current_exe() {
+            Ok(p) => p,
+            Err(e) => { notify(&tx, UpdateState::Error(format!("cannot find executable: {}", e))); return; }
+        };
+        let exe_dir = match exe_path.parent() {
+            Some(d) => d.to_path_buf(),
+            None => { notify(&tx, UpdateState::Error("cannot find executable directory".to_string())); return; }
+        };
+
+        notify(&tx, UpdateState::Checking);
+        let asset = match release_asset_info(&version) {
+            Some(a) => a,
+            None => { notify(&tx, UpdateState::Error("could not find release asset".to_string())); return; }
+        };
+
+        notify(&tx, UpdateState::Downloading { version: version.clone() });
+        let temp_dir = match std::env::temp_dir().join(format!("ping-uin-update-{}", version)) {
+            d => { let _ = fs::create_dir_all(&d); d }
+        };
+        let archive_name = asset.url.rsplit('/').next().unwrap_or("archive");
+        let archive_path = temp_dir.join(archive_name);
+        if let Err(e) = download_file(&asset.url, &archive_path) {
+            notify(&tx, UpdateState::Error(format!("download failed: {}", e))); return;
+        }
+
+        // Verify checksum if available.
+        if let Some(expected) = asset.sha256 {
+            match sha256_file(&archive_path) {
+                Ok(actual) if actual != expected => {
+                    notify(&tx, UpdateState::Error("checksum mismatch".to_string())); return;
+                }
+                Err(e) => { notify(&tx, UpdateState::Error(format!("checksum error: {}", e))); return; }
+                _ => {}
+            }
+        }
+
+        notify(&tx, UpdateState::Replacing { version: version.clone() });
+
+        #[cfg(target_os = "windows")]
+        {
+            let new_exe = match extract_windows_zip(&archive_path, &temp_dir) {
+                Ok(p) => p,
+                Err(e) => { notify(&tx, UpdateState::Error(format!("extract failed: {}", e))); return; }
+            };
+            let updater_script = exe_dir.join("ping-uin-update.ps1");
+            let script = format!(
+                "Start-Sleep -Seconds 1\n\"{new}\" | Set-Content -Path \"{marker}\" -Force\nRemove-Item -Path \"{old}\" -Force -ErrorAction SilentlyContinue\nMove-Item -Path \"{new}\" -Destination \"{dest}\" -Force\nRemove-Item -Path \"{script}\" -Force -ErrorAction SilentlyContinue\n",
+                new = new_exe.display(),
+                old = exe_path.display(),
+                dest = exe_path.display(),
+                marker = exe_dir.join(".update-restart").display(),
+                script = updater_script.display(),
+            );
+            if let Err(e) = fs::write(&updater_script, script) {
+                notify(&tx, UpdateState::Error(format!("updater script failed: {}", e))); return;
+            }
+            let _ = Command::new("powershell")
+                .args(["-WindowStyle", "Hidden", "-ExecutionPolicy", "Bypass", "-File", &updater_script.to_string_lossy()])
+                .spawn();
+            notify(&tx, UpdateState::Done { version, restart_required: true });
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = &exe_dir; // used on Windows only
+            let new_exe = match extract_unix_tar(&archive_path, &temp_dir) {
+                Ok(p) => p,
+                Err(e) => { notify(&tx, UpdateState::Error(format!("extract failed: {}", e))); return; }
+            };
+            let backup = exe_path.with_extension("old");
+            if let Err(e) = fs::rename(&exe_path, &backup) {
+                notify(&tx, UpdateState::Error(format!("backup failed: {}", e))); return;
+            }
+            if let Err(e) = fs::rename(&new_exe, &exe_path) {
+                let _ = fs::rename(&backup, &exe_path);
+                notify(&tx, UpdateState::Error(format!("replace failed: {}", e))); return;
+            }
+            let _ = fs::remove_file(&backup);
+            let _ = fs::remove_dir_all(&temp_dir);
+            notify(&tx, UpdateState::Done { version, restart_required: true });
         }
     })
 }
@@ -1354,6 +1617,7 @@ fn spawn_update_checker(tx: mpsc::Sender<Message>, current_version: String) -> t
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
+    tx: mpsc::Sender<Message>,
     rx: mpsc::Receiver<Message>,
     shared_hosts: Arc<RwLock<Vec<HostSchedule>>>,
     shutdown: Arc<AtomicBool>,
@@ -1366,6 +1630,11 @@ fn run_app<B: ratatui::backend::Backend>(
         if event::poll(tick_rate)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    // Close update status popup with Esc regardless of input mode.
+                    if !matches!(app.update_state, UpdateState::Idle) && key.code == KeyCode::Esc {
+                        app.update_state = UpdateState::Idle;
+                        continue;
+                    }
                     match app.input_mode {
                         InputMode::Normal => match key.code {
                             KeyCode::Char('q') | KeyCode::Char('Q') => { shutdown.store(true, Ordering::Relaxed); return Ok(()); }
@@ -1391,6 +1660,21 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('i') | KeyCode::Char('I') => {
                                 let default_path = paths().csv.to_string_lossy().to_string();
                                 app.input_mode = InputMode::ImportPath { path: default_path };
+                            }
+                            KeyCode::Char('u') | KeyCode::Char('U') => {
+                                if portable_dir().is_some() {
+                                    if let Some(ref version) = app.update_available {
+                                        if matches!(app.update_state, UpdateState::Idle | UpdateState::Error(_) | UpdateState::Done { .. }) {
+                                            let version = version.clone();
+                                            app.update_state = UpdateState::Checking;
+                                            spawn_updater(tx.clone(), version);
+                                        }
+                                    } else {
+                                        app.update_state = UpdateState::Error("no update available".to_string());
+                                    }
+                                } else {
+                                    app.update_state = UpdateState::Error("update only works in portable mode".to_string());
+                                }
                             }
                             KeyCode::Char('g') => app.group_by = !app.group_by,
                             KeyCode::Char('f') | KeyCode::Char('F') => {
@@ -1581,6 +1865,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 Message::UpdateAvailable { version } => {
                     app.update_available = Some(version);
                 }
+                Message::UpdateState(state) => {
+                    app.update_state = state;
+                }
             }
         }
 
@@ -1610,7 +1897,7 @@ fn main() -> io::Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let worker = spawn_worker(tx.clone(), shared_hosts.clone(), config.timeout_ms, shutdown.clone());
-    let update_checker = spawn_update_checker(tx, env!("CARGO_PKG_VERSION").to_string());
+    let update_checker = spawn_update_checker(tx.clone(), env!("CARGO_PKG_VERSION").to_string());
 
     let mut app = App {
         themes: build_themes(),
@@ -1624,11 +1911,12 @@ fn main() -> io::Result<()> {
         alerts: false,
         input_mode: InputMode::Normal,
         update_available: None,
+        update_state: UpdateState::Idle,
         last_check: "—".to_string(),
         last_result_time: None,
     };
 
-    let result = run_app(&mut terminal, &mut app, rx, shared_hosts, shutdown.clone());
+    let result = run_app(&mut terminal, &mut app, tx, rx, shared_hosts, shutdown.clone());
     shutdown.store(true, Ordering::Relaxed);
     let _ = worker.join();
     let _ = update_checker.join();
