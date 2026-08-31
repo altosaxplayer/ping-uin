@@ -353,6 +353,7 @@ struct App {
     sort_mode: SortMode,
     alerts: bool,
     input_mode: InputMode,
+    update_available: Option<String>,
     last_check: String,
     last_result_time: Option<Instant>,
 }
@@ -504,6 +505,7 @@ fn schedules_from_config(hosts: &[HostConfig]) -> Vec<HostSchedule> {
 
 enum Message {
     Result { host: String, up: bool, latency_ms: f64, timestamp: String, next_ping: Instant },
+    UpdateAvailable { version: String },
 }
 
 fn ping_host(host: &str, timeout_ms: u64, re: &Regex) -> (bool, f64) {
@@ -1052,6 +1054,12 @@ fn ui(frame: &mut Frame, app: &App) {
                 status_parts.push(format!("group: {}", filter));
             }
             spans.push(Span::styled(format!("  {}", status_parts.join("  ·  ")), Style::default().fg(theme.divider)));
+            if let Some(ref version) = app.update_available {
+                spans.push(Span::styled(
+                    format!("  ↑ v{} available", version),
+                    Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
+                ));
+            }
             Text::from(Line::from(spans))
         }
         InputMode::AddHost(_) => Text::from(Line::from(vec![
@@ -1244,6 +1252,49 @@ fn spawn_worker(tx: mpsc::Sender<Message>, hosts: Arc<RwLock<Vec<HostSchedule>>>
                 }
             } else {
                 thread::sleep(Duration::from_millis(100));
+            }
+        }
+    })
+}
+
+fn version_parts(v: &str) -> Vec<u32> {
+    v.split('.')
+        .filter_map(|p| p.parse::<u32>().ok())
+        .collect()
+}
+
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    let cur = version_parts(current);
+    let lat = version_parts(latest);
+    for i in 0..cur.len().max(lat.len()) {
+        let c = cur.get(i).copied().unwrap_or(0);
+        let l = lat.get(i).copied().unwrap_or(0);
+        if l > c { return true; }
+        if l < c { return false; }
+    }
+    false
+}
+
+/// Check GitHub releases in the background and notify the UI if a newer version exists.
+fn spawn_update_checker(tx: mpsc::Sender<Message>, current_version: String) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        // Wait a few seconds so the UI starts immediately.
+        thread::sleep(Duration::from_secs(3));
+        let url = "https://api.github.com/repos/altosaxplayer/ping-uin/releases/latest";
+        let response = ureq::get(url)
+            .set("User-Agent", "ping-uin-update-check")
+            .timeout(Duration::from_secs(10))
+            .call();
+        if let Ok(response) = response {
+            if let Ok(body) = response.into_string() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(tag) = value.get("tag_name").and_then(|v| v.as_str()) {
+                        let latest = tag.trim_start_matches('v').to_string();
+                        if is_newer_version(&current_version, &latest) {
+                            let _ = tx.send(Message::UpdateAvailable { version: latest });
+                        }
+                    }
+                }
             }
         }
     })
@@ -1460,6 +1511,9 @@ fn run_app<B: ratatui::backend::Backend>(
                         let _ = log_result(&timestamp, &h.name, status, latency_ms);
                     }
                 }
+                Message::UpdateAvailable { version } => {
+                    app.update_available = Some(version);
+                }
             }
         }
 
@@ -1488,7 +1542,8 @@ fn main() -> io::Result<()> {
     let shared_hosts = Arc::new(RwLock::new(schedules_from_config(&config.hosts)));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let worker = spawn_worker(tx, shared_hosts.clone(), config.timeout_ms, shutdown.clone());
+    let worker = spawn_worker(tx.clone(), shared_hosts.clone(), config.timeout_ms, shutdown.clone());
+    let update_checker = spawn_update_checker(tx, env!("CARGO_PKG_VERSION").to_string());
 
     let mut app = App {
         themes: build_themes(),
@@ -1501,6 +1556,7 @@ fn main() -> io::Result<()> {
         sort_mode: SortMode::None,
         alerts: false,
         input_mode: InputMode::Normal,
+        update_available: None,
         last_check: "—".to_string(),
         last_result_time: None,
     };
@@ -1508,6 +1564,7 @@ fn main() -> io::Result<()> {
     let result = run_app(&mut terminal, &mut app, rx, shared_hosts, shutdown.clone());
     shutdown.store(true, Ordering::Relaxed);
     let _ = worker.join();
+    let _ = update_checker.join();
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
