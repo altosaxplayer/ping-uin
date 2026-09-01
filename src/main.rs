@@ -20,7 +20,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 use ratatui::{Frame, Terminal};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -383,6 +383,7 @@ struct App {
     config: Config,
     hosts: Vec<HostState>,
     selected_idx: usize,
+    table_state: TableState,
     group_by: bool,
     group_filter: Option<String>,
     sort_mode: SortMode,
@@ -770,6 +771,9 @@ fn move_selection_up(app: &mut App) {
         for i in (0..pos).rev() {
             if let Some(idx) = rows[i].host_idx {
                 app.selected_idx = idx;
+                if let Some(new_pos) = selected_visible_position(&rows, idx) {
+                    app.table_state.select(Some(new_pos));
+                }
                 return;
             }
         }
@@ -782,6 +786,9 @@ fn move_selection_down(app: &mut App) {
         for i in pos + 1..rows.len() {
             if let Some(idx) = rows[i].host_idx {
                 app.selected_idx = idx;
+                if let Some(new_pos) = selected_visible_position(&rows, idx) {
+                    app.table_state.select(Some(new_pos));
+                }
                 return;
             }
         }
@@ -793,10 +800,6 @@ fn render_host_row(h: &HostState, is_selected: bool, theme: &Theme, graph_width:
     let status_label = if h.up { "UP" } else { "DOWN" };
     let latency_str = if h.up { format!("{:.0} ms", h.latency_ms) } else { "—".to_string() };
     let uptime = if h.total_checks > 0 { h.up_checks as f64 / h.total_checks as f64 * 100.0 } else { 0.0 };
-    let next_str = {
-        let remaining = h.next_ping.saturating_duration_since(Instant::now());
-        if remaining.is_zero() { "now".to_string() } else { format!("{}s", remaining.as_secs()) }
-    };
     let row_style = if is_selected {
         Style::default().bg(theme.selected_bg).fg(theme.selected_fg)
     } else {
@@ -823,7 +826,6 @@ fn render_host_row(h: &HostState, is_selected: bool, theme: &Theme, graph_width:
         ])),
         Cell::from(Span::styled(latency_str, Style::default().fg(theme.main_fg))),
         Cell::from(Span::styled(format!("{}m", h.interval_m), Style::default().fg(theme.inactive_fg))),
-        Cell::from(Span::styled(next_str, Style::default().fg(theme.inactive_fg))),
         Cell::from(Span::styled(format!("{:.1}%", uptime), Style::default().fg(theme.graph_text))),
         Cell::from(Span::styled(h.group.clone(), Style::default().fg(theme.inactive_fg))),
         Cell::from(render_graph(&h.history, theme, graph_width)),
@@ -868,12 +870,12 @@ fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme) -> Row<'
     spans.push(Span::styled("──────────", Style::default().fg(theme.divider)));
     Row::new(vec![
         Cell::from(Line::from(spans)),
-        Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""),
+        Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""),
     ]).style(Style::default().bg(theme.main_bg))
 }
 
-fn ui(frame: &mut Frame, app: &App) {
-    let theme = app.theme();
+fn ui(frame: &mut Frame, app: &mut App) {
+    let theme = app.theme().clone();
     let area = frame.area();
 
     frame.render_widget(Block::default().style(Style::default().bg(theme.main_bg)), area);
@@ -1025,7 +1027,7 @@ fn ui(frame: &mut Frame, app: &App) {
         frame.render_widget(alert_box, alerts_rect);
     }
 
-    let mut title_spans = accent_title("last check", theme).spans;
+    let mut title_spans = accent_title("last check", &theme).spans;
     title_spans.push(Span::styled(if app.last_check.is_empty() { "—".to_string() } else { app.last_check.clone() }, Style::default().fg(theme.inactive_fg)));
     let table_block = Block::default()
         .title(Line::from(title_spans))
@@ -1035,7 +1037,7 @@ fn ui(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(theme.box_color))
         .style(Style::default().bg(theme.main_bg));
 
-    let header = Row::new(vec!["Host", "IP", "Status", "Latency", "Int", "Next", "Uptime", "Group", "History"])
+    let header = Row::new(vec!["Host", "IP", "Status", "Latency", "Int", "Uptime", "Group", "History"])
         .style(Style::default().fg(theme.inactive_fg).add_modifier(Modifier::BOLD))
         .height(1);
 
@@ -1043,16 +1045,16 @@ fn ui(frame: &mut Frame, app: &App) {
     if app.hosts.is_empty() {
         rows.push(Row::new(vec![
             Cell::from(Span::styled("No hosts — press 'a' to add one", Style::default().fg(theme.inactive_fg))),
-            Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""),
+            Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""),
         ]));
     } else {
         let visible_rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode);
         for row in visible_rows {
             match row.kind {
-                RowKind::GroupHeader(group) => rows.push(render_group_header(&group, &app.hosts, theme)),
+                RowKind::GroupHeader(group) => rows.push(render_group_header(&group, &app.hosts, &theme)),
                 RowKind::Host => {
                     let idx = row.host_idx.unwrap();
-                    rows.push(render_host_row(&app.hosts[idx], idx == app.selected_idx, theme, app.config.graph_width));
+                    rows.push(render_host_row(&app.hosts[idx], idx == app.selected_idx, &theme, app.config.graph_width));
                 }
             }
         }
@@ -1064,30 +1066,29 @@ fn ui(frame: &mut Frame, app: &App) {
         Constraint::Length(8),
         Constraint::Length(10),
         Constraint::Length(6),
-        Constraint::Length(7),
         Constraint::Length(9),
         Constraint::Length(10),
         Constraint::Min(app.config.graph_width as u16),
     ])
     .header(header)
     .block(table_block);
-    frame.render_widget(table, table_area);
+    frame.render_stateful_widget(table, table_area, &mut app.table_state);
 
     let footer_text = match app.input_mode {
         InputMode::Normal => {
             let mut spans = vec![Span::styled(" ↑/↓ select ", Style::default().fg(theme.inactive_fg))];
-            spans.extend(key_hint("a", "add", theme));
-            spans.extend(key_hint("d", "delete", theme));
-            spans.extend(key_hint("e", "edit", theme));
-            spans.extend(key_hint("i", "import csv", theme));
-            spans.extend(key_hint("g", "group", theme));
-            spans.extend(key_hint("f", "filter group", theme));
-            spans.extend(key_hint("s", "sort", theme));
-            spans.extend(key_hint("x", "down box", theme));
-            spans.extend(key_hint("t", "theme", theme));
-            spans.extend(key_hint("q", "quit", theme));
+            spans.extend(key_hint("a", "add", &theme));
+            spans.extend(key_hint("d", "delete", &theme));
+            spans.extend(key_hint("e", "edit", &theme));
+            spans.extend(key_hint("i", "import csv", &theme));
+            spans.extend(key_hint("g", "group", &theme));
+            spans.extend(key_hint("f", "filter group", &theme));
+            spans.extend(key_hint("s", "sort", &theme));
+            spans.extend(key_hint("x", "down box", &theme));
+            spans.extend(key_hint("t", "theme", &theme));
+            spans.extend(key_hint("q", "quit", &theme));
             if portable_dir().is_some() && app.update_available.is_some() {
-                spans.extend(key_hint("u", "update", theme));
+                spans.extend(key_hint("u", "update", &theme));
             }
             let mut status_parts = vec![format!("sort: {}", app.sort_mode.label())];
             if let Some(ref filter) = app.group_filter {
@@ -1168,7 +1169,7 @@ fn ui(frame: &mut Frame, app: &App) {
             lines.push(Line::from("[Enter] save   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)));
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
-                    .title(accent_title(title_text, theme))
+                    .title(accent_title(title_text, &theme))
                     .title_alignment(Alignment::Center)
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1200,7 +1201,7 @@ fn ui(frame: &mut Frame, app: &App) {
             lines.push(Line::from("[Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)));
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
-                    .title(accent_title("Sort hosts", theme))
+                    .title(accent_title("Sort hosts", &theme))
                     .title_alignment(Alignment::Center)
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1236,7 +1237,7 @@ fn ui(frame: &mut Frame, app: &App) {
             lines.push(Line::from("[Enter] filter group   [Space] show all   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)));
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
-                    .title(accent_title("Filter by group", theme))
+                    .title(accent_title("Filter by group", &theme))
                     .title_alignment(Alignment::Center)
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1257,7 +1258,7 @@ fn ui(frame: &mut Frame, app: &App) {
                 Line::from("[Enter] import   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
             ]))
             .block(Block::default()
-                .title(accent_title("Import CSV", theme))
+                .title(accent_title("Import CSV", &theme))
                 .title_alignment(Alignment::Center)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -1279,7 +1280,7 @@ fn ui(frame: &mut Frame, app: &App) {
             ]))
             .alignment(Alignment::Center)
             .block(Block::default()
-                .title(accent_title("Confirm delete", theme))
+                .title(accent_title("Confirm delete", &theme))
                 .title_alignment(Alignment::Center)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -1315,7 +1316,7 @@ fn ui(frame: &mut Frame, app: &App) {
         let popup = Paragraph::new(Text::from(lines))
             .alignment(Alignment::Center)
             .block(Block::default()
-                .title(accent_title(title, theme))
+                .title(accent_title(title, &theme))
                 .title_alignment(Alignment::Center)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -1905,6 +1906,7 @@ fn main() -> io::Result<()> {
         config,
         hosts,
         selected_idx: 0,
+        table_state: TableState::default(),
         group_by: false,
         group_filter: None,
         sort_mode: SortMode::None,
