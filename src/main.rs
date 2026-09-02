@@ -410,6 +410,7 @@ enum InputMode {
     ExportPath { path: String },
     HistoryView { host_idx: usize, range: HistoryRange },
     ThemePicker { original: usize, selected: usize },
+    MenuModal,
     ConfirmDelete,
 }
 
@@ -1085,7 +1086,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         constraints.push(Constraint::Length(alert_rows + 3));
     }
     constraints.push(Constraint::Min(5));
-    constraints.push(Constraint::Min(2));
+    constraints.push(Constraint::Length(1));
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1286,26 +1287,20 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 hints.push(("u", "update"));
             }
 
-            let mut spans = Vec::new();
-            for (i, (k, l)) in hints.iter().enumerate() {
-                if i > 0 { spans.push(Span::raw(" ")); }
+            let mut spans = vec![Span::styled(" menu ", Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD))];
+            for (_, (k, l)) in hints.iter().enumerate() {
+                spans.push(Span::raw(" "));
                 spans.extend(key_hint(k, l, &theme));
             }
+            spans.push(Span::styled(" [M] more ", Style::default().fg(theme.inactive_fg)));
             if let Some(ref version) = app.update_available {
                 spans.push(Span::styled(
-                    format!("  ↑v{} ", version),
+                    format!("↑v{} ", version),
                     Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
                 ));
             }
             let footer = Paragraph::new(Text::from(Line::from(spans)))
-                .wrap(Wrap { trim: true })
-                .block(Block::default()
-                    .title(accent_title("menu", &theme))
-                    .title_alignment(Alignment::Center)
-                    .borders(Borders::TOP)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.box_color))
-                    .style(Style::default().bg(theme.main_bg)));
+                .style(Style::default().bg(theme.popup_bg).fg(theme.main_fg));
             frame.render_widget(footer, footer_area);
         }
         _ => {
@@ -1357,6 +1352,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     Span::styled("Theme", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
                     Span::raw("[↑/↓] preview   [Enter] apply   [Esc/t] cancel").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::MenuModal => Text::from(Line::from(vec![
+                    Span::styled("Menu", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[Esc/M] close").style(Style::default().fg(theme.inactive_fg)),
                 ])),
                 InputMode::Normal => unreachable!(),
             };
@@ -1629,6 +1629,53 @@ fn ui(frame: &mut Frame, app: &mut App) {
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
                     .title(accent_title("theme", &theme))
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.box_color))
+                    .style(Style::default().bg(theme.popup_bg)));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(popup, popup_area);
+        }
+        InputMode::MenuModal => {
+            let mut menu_hints = vec![
+                ("a", "add host"),
+                ("d", "delete host"),
+                ("e", "edit host"),
+                ("h", "history"),
+                ("r", "rename host"),
+                ("c", "clear stats"),
+                ("i", "import"),
+                ("E", "export"),
+                ("g", "group"),
+                ("f", "filter group"),
+                ("s", "sort"),
+                ("x", "down box"),
+                ("t", "theme"),
+                ("q", "quit"),
+            ];
+            if portable_dir().is_some() && app.update_available.is_some() {
+                menu_hints.push(("u", "update"));
+            }
+            let rows = (menu_hints.len() + 1) / 2;
+            let popup_height = ((rows + 5).min(area.height as usize).max(8)) as u16;
+            let popup_area = centered_rect(60, popup_height, area);
+            let mut lines = vec![Line::from("")];
+            for chunk in menu_hints.chunks(2) {
+                let mut spans = vec![Span::raw("  ")];
+                for (i, (k, l)) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw("   "));
+                    }
+                    spans.extend(key_hint(k, l, &theme));
+                }
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("[Esc/M] close").style(Style::default().fg(theme.inactive_fg)));
+            let popup = Paragraph::new(Text::from(lines))
+                .block(Block::default()
+                    .title(accent_title("menu", &theme))
                     .title_alignment(Alignment::Center)
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -2134,6 +2181,9 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('t') | KeyCode::Char('T') => {
                                 app.input_mode = InputMode::ThemePicker { original: app.theme_idx, selected: app.theme_idx };
                             }
+                            KeyCode::Char('m') | KeyCode::Char('M') => {
+                                app.input_mode = InputMode::MenuModal;
+                            }
                             KeyCode::Up => move_selection_up(app),
                             KeyCode::Down => move_selection_down(app),
                             _ => {}
@@ -2296,6 +2346,14 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.input_mode = InputMode::ThemePicker { original, selected: s };
                                 }
                                 KeyCode::Enter => {
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                _ => {}
+                            }
+                        }
+                        InputMode::MenuModal => {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('m') | KeyCode::Char('M') => {
                                     app.input_mode = InputMode::Normal;
                                 }
                                 _ => {}
