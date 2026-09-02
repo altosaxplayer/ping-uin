@@ -431,6 +431,7 @@ struct App {
     update_state: UpdateState,
     last_check: String,
     last_result_time: Option<Instant>,
+    restart_after_exit: bool,
 }
 
 impl App {
@@ -1842,12 +1843,28 @@ fn spawn_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHand
             };
             let updater_script = exe_dir.join("ping-uin-update.ps1");
             let script = format!(
-                "Start-Sleep -Seconds 1\n\"{new}\" | Set-Content -Path \"{marker}\" -Force\nRemove-Item -Path \"{old}\" -Force -ErrorAction SilentlyContinue\nMove-Item -Path \"{new}\" -Destination \"{dest}\" -Force\nRemove-Item -Path \"{script}\" -Force -ErrorAction SilentlyContinue\n",
-                new = new_exe.display(),
+                "$parentPid = (Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").ParentProcessId\n\
+                $parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue\n\
+                while ($parent -and -not $parent.HasExited) {{ Start-Sleep -Milliseconds 200 }}\n\
+                $old = \"{old}\"\n\
+                $new = \"{new}\"\n\
+                $dest = \"{dest}\"\n\
+                try {{\n\
+                    if (Test-Path $dest) {{\n\
+                        Rename-Item -Path $dest -NewName \"$dest.old\" -Force\n\
+                    }}\n\
+                    Move-Item -Path $new -Destination $dest -Force\n\
+                    Remove-Item -Path \"$dest.old\" -Force -ErrorAction SilentlyContinue\n\
+                    Start-Process -FilePath $dest -WorkingDirectory (Split-Path -Parent $dest)\n\
+                }} catch {{\n\
+                    if (Test-Path \"$dest.old\") {{\n\
+                        Move-Item -Path \"$dest.old\" -Destination $dest -Force -ErrorAction SilentlyContinue\n\
+                    }}\n\
+                }}\n\
+                Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue\n",
                 old = exe_path.display(),
+                new = new_exe.display(),
                 dest = exe_path.display(),
-                marker = exe_dir.join(".update-restart").display(),
-                script = updater_script.display(),
             );
             if let Err(e) = fs::write(&updater_script, script) {
                 notify(&tx, UpdateState::Error(format!("updater script failed: {}", e))); return;
@@ -1894,8 +1911,8 @@ fn run_app<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|f| ui(f, app))?;
         if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     // Close update status popup with Esc regardless of input mode.
                     if !matches!(app.update_state, UpdateState::Idle) && key.code == KeyCode::Esc {
                         app.update_state = UpdateState::Idle;
@@ -2154,6 +2171,10 @@ fn run_app<B: ratatui::backend::Backend>(
                         },
                     }
                 }
+                Event::Resize(_, _) => {
+                    let _ = terminal.autoresize();
+                }
+                _ => {}
             }
         }
 
@@ -2179,6 +2200,11 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
                 Message::UpdateState(state) => {
                     app.update_state = state;
+                    if let UpdateState::Done { restart_required: true, .. } = app.update_state {
+                        app.restart_after_exit = true;
+                        let _ = terminal.draw(|f| ui(f, app));
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -2227,6 +2253,7 @@ fn main() -> io::Result<()> {
         update_state: UpdateState::Idle,
         last_check: "—".to_string(),
         last_result_time: None,
+        restart_after_exit: false,
     };
 
     let result = run_app(&mut terminal, &mut app, tx, rx, shared_hosts, shutdown.clone());
@@ -2238,5 +2265,20 @@ fn main() -> io::Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     execute!(terminal.backend_mut(), Show)?;
     terminal.show_cursor()?;
+
+    if app.restart_after_exit {
+        if let Ok(exe) = env::current_exe() {
+            #[cfg(target_os = "windows")]
+            {
+                // Windows updater script will restart the new binary after replacement.
+                // Just exit so the script can take over.
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = Command::new(&exe).spawn();
+            }
+        }
+    }
+
     result
 }
