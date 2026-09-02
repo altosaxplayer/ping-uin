@@ -22,7 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1039,7 +1039,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         constraints.push(Constraint::Length(alert_rows + 3));
     }
     constraints.push(Constraint::Min(5));
-    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Min(1));
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1293,7 +1293,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Span::raw("[Enter] export   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
         ])),
     };
-    frame.render_widget(footer_text, footer_area);
+    let footer = Paragraph::new(footer_text).wrap(Wrap { trim: true });
+    frame.render_widget(footer, footer_area);
 
     match app.input_mode {
         InputMode::AddHost(ref form) | InputMode::EditEntry { ref form, .. } => {
