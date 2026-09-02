@@ -263,6 +263,40 @@ fn build_themes() -> Vec<Theme> {
             divider: rgb("#3c3836"),
             popup_bg: rgb("#1d2021"),
         },
+        Theme {
+            name: "aetheria",
+            main_bg: rgb("#0e091d"),
+            main_fg: rgb("#14b9b5"),
+            title: rgb("#14b9b5"),
+            hi_fg: rgb("#ff7f41"),
+            selected_bg: rgb("#c8e967"),
+            selected_fg: rgb("#000000"),
+            inactive_fg: rgb("#c53253"),
+            graph_text: rgb("#fd3e6a"),
+            box_color: rgb("#e20342"),
+            status_good: rgb("#7cd699"),
+            status_danger: rgb("#e20342"),
+            graph_start: rgb("#04c5f0"),
+            divider: rgb("#a60234"),
+            popup_bg: rgb("#0e091d"),
+        },
+        Theme {
+            name: "archwave",
+            main_bg: rgb("#1a0d2e"),
+            main_fg: rgb("#d4a5ff"),
+            title: rgb("#5ffbf1"),
+            hi_fg: rgb("#f9f871"),
+            selected_bg: rgb("#2d1b4e"),
+            selected_fg: rgb("#5ffbf1"),
+            inactive_fg: rgb("#543a6e"),
+            graph_text: rgb("#fef6ff"),
+            box_color: rgb("#ff6ec7"),
+            status_good: rgb("#5ffbf1"),
+            status_danger: rgb("#ff6ec7"),
+            graph_start: rgb("#8b9aff"),
+            divider: rgb("#8b9aff"),
+            popup_bg: rgb("#1a0d2e"),
+        },
     ]
 }
 
@@ -362,6 +396,7 @@ enum InputMode {
     ImportPath { path: String },
     ExportPath { path: String },
     HistoryView { host_idx: usize, range: HistoryRange },
+    ThemePicker { original: usize, selected: usize },
     ConfirmDelete,
 }
 
@@ -436,10 +471,6 @@ struct App {
 
 impl App {
     fn theme(&self) -> &Theme { &self.themes[self.theme_idx] }
-
-    fn next_theme(&mut self) {
-        self.theme_idx = (self.theme_idx + 1) % self.themes.len();
-    }
 
     fn add_host(&mut self, name: String, interval_m: u64, group: String, alias: String, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
         let name = name.trim().to_string();
@@ -804,10 +835,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 /// btop-style hotkey hint: [ key ]  with divider brackets + hi_fg key
-fn key_hint(key: &'static str, label: &'static str, theme: &Theme) -> Vec<Span<'static>> {
+fn key_hint(key: &str, label: &str, theme: &Theme) -> Vec<Span<'static>> {
     vec![
         Span::styled("[", Style::default().fg(theme.divider)),
-        Span::styled(key, Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
+        Span::styled(key.to_string(), Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
         Span::styled("]", Style::default().fg(theme.divider)),
         Span::styled(format!(" {} ", label), Style::default().fg(theme.inactive_fg)),
     ]
@@ -978,6 +1009,54 @@ fn render_host_row(h: &HostState, is_selected: bool, theme: &Theme, graph_width:
     ]).style(row_style)
 }
 
+fn hint_width(key: &str, label: &str) -> usize {
+    // format: [key] label  (brackets + space + key + space + label + trailing space)
+    key.len() + label.len() + 5
+}
+
+fn render_menu_box(frame: &mut Frame, area: Rect, hints: &[(&str, &str)], theme: &Theme) {
+    let block = Block::default()
+        .title(accent_title("menu", theme))
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.box_color))
+        .style(Style::default().bg(theme.main_bg));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if hints.is_empty() || inner.width < 6 || inner.height < 1 {
+        return;
+    }
+
+    let max_width = hints.iter().map(|(k, l)| hint_width(k, l)).max().unwrap_or(0);
+    let spacing: usize = 2;
+    let col_width = max_width + spacing;
+    let cols = (inner.width as usize / col_width).max(1).min(hints.len());
+    let rows = (hints.len() + cols - 1) / cols;
+
+    let mut table_rows = Vec::new();
+    for r in 0..rows {
+        let mut cells = Vec::new();
+        for c in 0..cols {
+            let idx = r * cols + c;
+            let cell = if idx < hints.len() {
+                let (k, l) = hints[idx];
+                Cell::from(Line::from(key_hint(k, l, theme)))
+            } else {
+                Cell::from("")
+            };
+            cells.push(cell);
+        }
+        table_rows.push(Row::new(cells));
+    }
+
+    let constraints: Vec<Constraint> = (0..cols).map(|_| Constraint::Length(col_width as u16)).collect();
+    let table = Table::new(table_rows, &constraints)
+        .style(Style::default().bg(theme.main_bg).fg(theme.main_fg));
+    frame.render_widget(table, inner);
+}
+
 fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme) -> Row<'static> {
     // In flat-sort-by-status mode the pseudo-group is "Down" / "Up".
     let is_status_label = group == "Down" || group == "Up";
@@ -1041,7 +1120,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         constraints.push(Constraint::Length(alert_rows + 3));
     }
     constraints.push(Constraint::Min(5));
-    constraints.push(Constraint::Min(1));
+    constraints.push(Constraint::Min(3));
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1220,83 +1299,103 @@ fn ui(frame: &mut Frame, app: &mut App) {
     .block(table_block);
     frame.render_stateful_widget(table, table_area, &mut app.table_state);
 
-    let footer_text = match app.input_mode {
+    // Render footer: status line + menu box in Normal mode; simple help text for other modes.
+    match app.input_mode {
         InputMode::Normal => {
-            let mut spans = vec![Span::styled(" ↑/↓ select ", Style::default().fg(theme.inactive_fg))];
-            spans.extend(key_hint("a", "add", &theme));
-            spans.extend(key_hint("d", "delete", &theme));
-            spans.extend(key_hint("e", "edit", &theme));
-            spans.extend(key_hint("h", "history", &theme));
-            spans.extend(key_hint("i", "import csv", &theme));
-            spans.extend(key_hint("E", "export", &theme));
-            spans.extend(key_hint("g", "group", &theme));
-            spans.extend(key_hint("f", "filter group", &theme));
-            spans.extend(key_hint("s", "sort", &theme));
-            spans.extend(key_hint("x", "down box", &theme));
-            spans.extend(key_hint("t", "theme", &theme));
-            spans.extend(key_hint("q", "quit", &theme));
-            if portable_dir().is_some() && app.update_available.is_some() {
-                spans.extend(key_hint("u", "update", &theme));
-            }
+            let status_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(footer_area);
+
             let mut status_parts = vec![format!("sort: {}", app.sort_mode.label())];
             if let Some(ref filter) = app.group_filter {
                 status_parts.push(format!("group: {}", filter));
             }
-            spans.push(Span::styled(format!("  {}", status_parts.join("  ·  ")), Style::default().fg(theme.divider)));
+            let mut status_spans = vec![Span::styled(status_parts.join("  ·  "), Style::default().fg(theme.divider))];
             if let Some(ref version) = app.update_available {
-                spans.push(Span::styled(
+                status_spans.push(Span::styled(
                     format!("  ↑ v{} available", version),
                     Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
                 ));
             }
-            Text::from(Line::from(spans))
+            frame.render_widget(Paragraph::new(Text::from(Line::from(status_spans))), status_layout[0]);
+
+            let mut hints = vec![
+                ("↑/↓", "select"),
+                ("a", "add"),
+                ("d", "delete"),
+                ("e", "edit"),
+                ("h", "history"),
+                ("i", "import csv"),
+                ("E", "export"),
+                ("g", "group"),
+                ("f", "filter group"),
+                ("s", "sort"),
+                ("x", "down box"),
+                ("t", "theme"),
+                ("q", "quit"),
+            ];
+            if portable_dir().is_some() && app.update_available.is_some() {
+                hints.push(("u", "update"));
+            }
+            render_menu_box(frame, status_layout[1], &hints, &theme);
         }
-        InputMode::AddHost(_) => Text::from(Line::from(vec![
-            Span::styled("Add host", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-            Span::raw("   "),
-            Span::raw("[Tab]/[↑↓] move field   [Enter] add   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
-        ])),
-        InputMode::SortPicker { .. } => Text::from(Line::from(vec![
-            Span::styled("Sort hosts", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-            Span::raw("   "),
-            Span::raw("[↑↓] pick   [Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
-        ])),
-        InputMode::GroupFilterPicker { .. } => Text::from(Line::from(vec![
-            Span::styled("Filter group", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-            Span::raw("   "),
-            Span::raw("[↑↓] pick   [Enter] apply   [Space] show all   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
-        ])),
-        InputMode::ImportPath { .. } => Text::from(Line::from(vec![
-            Span::styled("Import CSV", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-            Span::raw("   "),
-            Span::raw("[Enter] import   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
-        ])),
-        InputMode::EditEntry { ref original, .. } => Text::from(Line::from(vec![
-            Span::styled(format!("Edit {}", original), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-            Span::raw("   "),
-            Span::raw("[Tab]/[↑↓] move field   [Enter] save   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
-        ])),
-        InputMode::ConfirmDelete => {
-            let name = app.hosts.get(app.selected_idx).map(|h| h.name.clone()).unwrap_or_default();
-            Text::from(Line::from(vec![
-                Span::styled("Delete ", Style::default().fg(theme.status_danger)),
-                Span::styled(name, Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-                Span::styled("? [y/n]", Style::default().fg(theme.status_danger)),
-            ]))
+        _ => {
+            let footer_text = match app.input_mode {
+                InputMode::AddHost(_) => Text::from(Line::from(vec![
+                    Span::styled("Add host", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[Tab]/[↑↓] move field   [Enter] add   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::SortPicker { .. } => Text::from(Line::from(vec![
+                    Span::styled("Sort hosts", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[↑↓] pick   [Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::GroupFilterPicker { .. } => Text::from(Line::from(vec![
+                    Span::styled("Filter group", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[↑↓] pick   [Enter] apply   [Space] show all   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::ImportPath { .. } => Text::from(Line::from(vec![
+                    Span::styled("Import CSV", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[Enter] import   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::EditEntry { ref original, .. } => Text::from(Line::from(vec![
+                    Span::styled(format!("Edit {}", original), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[Tab]/[↑↓] move field   [Enter] save   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::ConfirmDelete => {
+                    let name = app.hosts.get(app.selected_idx).map(|h| h.name.clone()).unwrap_or_default();
+                    Text::from(Line::from(vec![
+                        Span::styled("Delete ", Style::default().fg(theme.status_danger)),
+                        Span::styled(name, Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                        Span::styled("? [y/n]", Style::default().fg(theme.status_danger)),
+                    ]))
+                }
+                InputMode::HistoryView { .. } => Text::from(Line::from(vec![
+                    Span::styled("History", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[←/→] range   [Esc/h] close").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::ExportPath { .. } => Text::from(Line::from(vec![
+                    Span::styled("Export", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[Enter] export   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::ThemePicker { .. } => Text::from(Line::from(vec![
+                    Span::styled("Theme", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[↑/↓] preview   [Enter] apply   [Esc/t] cancel").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::Normal => unreachable!(),
+            };
+            let footer = Paragraph::new(footer_text).wrap(Wrap { trim: true });
+            frame.render_widget(footer, footer_area);
         }
-        InputMode::HistoryView { .. } => Text::from(Line::from(vec![
-            Span::styled("History", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-            Span::raw("   "),
-            Span::raw("[←/→] range   [Esc/h] close").style(Style::default().fg(theme.inactive_fg)),
-        ])),
-        InputMode::ExportPath { .. } => Text::from(Line::from(vec![
-            Span::styled("Export", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-            Span::raw("   "),
-            Span::raw("[Enter] export   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
-        ])),
-    };
-    let footer = Paragraph::new(footer_text).wrap(Wrap { trim: true });
-    frame.render_widget(footer, footer_area);
+    }
 
     match app.input_mode {
         InputMode::AddHost(ref form) | InputMode::EditEntry { ref form, .. } => {
@@ -1527,6 +1626,41 @@ fn ui(frame: &mut Frame, app: &mut App) {
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
                     .title(accent_title(&format!("history: {}", name), &theme))
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.box_color))
+                    .style(Style::default().bg(theme.popup_bg)));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(popup, popup_area);
+        }
+        InputMode::ThemePicker { original, selected } => {
+            let popup_area = centered_rect(45, 46, area);
+            let mut lines = vec![Line::from("")];
+            for (i, t) in app.themes.iter().enumerate() {
+                let marker = if i == selected { "▶ " } else { "  " };
+                let is_current = i == original;
+                let mut spans = vec![
+                    Span::styled(marker, Style::default().fg(theme.hi_fg)),
+                ];
+                if is_current {
+                    spans.push(Span::styled("* ", Style::default().fg(theme.status_good)));
+                } else {
+                    spans.push(Span::raw("  "));
+                }
+                let name_style = if i == selected {
+                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.main_fg)
+                };
+                spans.push(Span::styled(t.name.to_string(), name_style));
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("[↑/↓] preview   [Enter] apply   [Esc/t] cancel").style(Style::default().fg(theme.inactive_fg)));
+            let popup = Paragraph::new(Text::from(lines))
+                .block(Block::default()
+                    .title(accent_title("theme", &theme))
                     .title_alignment(Alignment::Center)
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1990,7 +2124,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.input_mode = InputMode::SortPicker { selected: app.sort_mode.index() };
                             }
                             KeyCode::Char('x') | KeyCode::Char('X') => { app.alerts = !app.alerts; }
-                            KeyCode::Char('t') | KeyCode::Char('T') => app.next_theme(),
+                            KeyCode::Char('t') | KeyCode::Char('T') => {
+                                app.input_mode = InputMode::ThemePicker { original: app.theme_idx, selected: app.theme_idx };
+                            }
                             KeyCode::Up => move_selection_up(app),
                             KeyCode::Down => move_selection_down(app),
                             _ => {}
@@ -2132,6 +2268,28 @@ fn run_app<B: ratatui::backend::Backend>(
                                     let idx = HistoryRange::ALL.iter().position(|&r| r == range).unwrap_or(1);
                                     let new_idx = (idx + 1) % HistoryRange::ALL.len();
                                     app.input_mode = InputMode::HistoryView { host_idx, range: HistoryRange::ALL[new_idx] };
+                                }
+                                _ => {}
+                            }
+                        }
+                        InputMode::ThemePicker { original, selected } => {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('t') | KeyCode::Char('T') => {
+                                    app.theme_idx = original;
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Up => {
+                                    let s = if selected == 0 { app.themes.len() - 1 } else { selected - 1 };
+                                    app.theme_idx = s;
+                                    app.input_mode = InputMode::ThemePicker { original, selected: s };
+                                }
+                                KeyCode::Down => {
+                                    let s = (selected + 1) % app.themes.len();
+                                    app.theme_idx = s;
+                                    app.input_mode = InputMode::ThemePicker { original, selected: s };
+                                }
+                                KeyCode::Enter => {
+                                    app.input_mode = InputMode::Normal;
                                 }
                                 _ => {}
                             }
