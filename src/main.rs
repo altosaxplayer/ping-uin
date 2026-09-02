@@ -1793,13 +1793,22 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
 }
 
 /// Check GitHub releases in the background and notify the UI if a newer version exists.
-fn spawn_update_checker(tx: mpsc::Sender<Message>, current_version: String) -> thread::JoinHandle<()> {
+fn spawn_update_checker(tx: mpsc::Sender<Message>, current_version: String, shutdown: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Wait a few seconds so the UI starts immediately.
         thread::sleep(Duration::from_secs(3));
-        if let Some(latest) = fetch_latest_release_version() {
-            if is_newer_version(&current_version, &latest) {
-                let _ = tx.send(Message::UpdateAvailable { version: latest });
+        let mut last_notified: Option<String> = None;
+        while !shutdown.load(Ordering::Relaxed) {
+            if let Some(latest) = fetch_latest_release_version() {
+                if is_newer_version(&current_version, &latest) && last_notified.as_deref() != Some(&latest) {
+                    last_notified = Some(latest.clone());
+                    let _ = tx.send(Message::UpdateAvailable { version: latest });
+                }
+            }
+            // Sleep in short chunks so shutdown is responsive.
+            for _ in 0..360 {
+                if shutdown.load(Ordering::Relaxed) { break; }
+                thread::sleep(Duration::from_secs(10));
             }
         }
     })
@@ -2444,7 +2453,7 @@ fn main() -> io::Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let worker = spawn_worker(tx.clone(), shared_hosts.clone(), config.timeout_ms, shutdown.clone());
-    let update_checker = spawn_update_checker(tx.clone(), env!("CARGO_PKG_VERSION").to_string());
+    let update_checker = spawn_update_checker(tx.clone(), env!("CARGO_PKG_VERSION").to_string(), shutdown.clone());
 
     let mut app = App {
         themes: build_themes(),
