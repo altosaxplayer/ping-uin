@@ -1133,7 +1133,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         constraints.push(Constraint::Length(alert_rows + 3));
     }
     constraints.push(Constraint::Min(5));
-    constraints.push(Constraint::Min(3));
+    constraints.push(Constraint::Min(1));
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1312,27 +1312,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
     .block(table_block);
     frame.render_stateful_widget(table, table_area, &mut app.table_state);
 
-    // Render footer: status line + menu box in Normal mode; simple help text for other modes.
+    // Render footer: collapse to smallest footprint when vertical space is tight.
     match app.input_mode {
         InputMode::Normal => {
-            let status_layout = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(1)])
-                .split(footer_area);
-
-            let mut status_parts = vec![format!("sort: {}", app.sort_mode.label())];
-            if let Some(ref filter) = app.group_filter {
-                status_parts.push(format!("group: {}", filter));
-            }
-            let mut status_spans = vec![Span::styled(status_parts.join("  ·  "), Style::default().fg(theme.divider))];
-            if let Some(ref version) = app.update_available {
-                status_spans.push(Span::styled(
-                    format!("  ↑ v{} available", version),
-                    Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
-                ));
-            }
-            frame.render_widget(Paragraph::new(Text::from(Line::from(status_spans))), status_layout[0]);
-
             let mut hints = vec![
                 ("↑/↓", "select"),
                 ("a", "add"),
@@ -1351,7 +1333,43 @@ fn ui(frame: &mut Frame, app: &mut App) {
             if portable_dir().is_some() && app.update_available.is_some() {
                 hints.push(("u", "update"));
             }
-            render_menu_box(frame, status_layout[1], &hints, &theme);
+
+            if footer_area.height >= 4 {
+                // Room for status line plus bordered menu box.
+                let status_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                    .split(footer_area);
+
+                let mut status_parts = vec![format!("sort: {}", app.sort_mode.label())];
+                if let Some(ref filter) = app.group_filter {
+                    status_parts.push(format!("group: {}", filter));
+                }
+                let mut status_spans = vec![Span::styled(status_parts.join("  ·  "), Style::default().fg(theme.divider))];
+                if let Some(ref version) = app.update_available {
+                    status_spans.push(Span::styled(
+                        format!("  ↑ v{} available", version),
+                        Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                frame.render_widget(Paragraph::new(Text::from(Line::from(status_spans))), status_layout[0]);
+                render_menu_box(frame, status_layout[1], &hints, &theme);
+            } else {
+                // Compact single-line menu; wraps if needed, stays visible even at 1 row.
+                let mut spans = Vec::new();
+                for (i, (k, l)) in hints.iter().enumerate() {
+                    if i > 0 { spans.push(Span::raw(" ")); }
+                    spans.extend(key_hint(k, l, &theme));
+                }
+                if let Some(ref version) = app.update_available {
+                    spans.push(Span::styled(
+                        format!("  ↑v{} ", version),
+                        Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                let footer = Paragraph::new(Text::from(Line::from(spans))).wrap(Wrap { trim: true });
+                frame.render_widget(footer, footer_area);
+            }
         }
         _ => {
             let footer_text = match app.input_mode {
@@ -1793,13 +1811,22 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
 }
 
 /// Check GitHub releases in the background and notify the UI if a newer version exists.
-fn spawn_update_checker(tx: mpsc::Sender<Message>, current_version: String) -> thread::JoinHandle<()> {
+fn spawn_update_checker(tx: mpsc::Sender<Message>, current_version: String, shutdown: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Wait a few seconds so the UI starts immediately.
         thread::sleep(Duration::from_secs(3));
-        if let Some(latest) = fetch_latest_release_version() {
-            if is_newer_version(&current_version, &latest) {
-                let _ = tx.send(Message::UpdateAvailable { version: latest });
+        let mut last_notified: Option<String> = None;
+        while !shutdown.load(Ordering::Relaxed) {
+            if let Some(latest) = fetch_latest_release_version() {
+                if is_newer_version(&current_version, &latest) && last_notified.as_deref() != Some(&latest) {
+                    last_notified = Some(latest.clone());
+                    let _ = tx.send(Message::UpdateAvailable { version: latest });
+                }
+            }
+            // Sleep in short chunks so shutdown is responsive.
+            for _ in 0..360 {
+                if shutdown.load(Ordering::Relaxed) { break; }
+                thread::sleep(Duration::from_secs(10));
             }
         }
     })
@@ -2444,7 +2471,7 @@ fn main() -> io::Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let worker = spawn_worker(tx.clone(), shared_hosts.clone(), config.timeout_ms, shutdown.clone());
-    let update_checker = spawn_update_checker(tx.clone(), env!("CARGO_PKG_VERSION").to_string());
+    let update_checker = spawn_update_checker(tx.clone(), env!("CARGO_PKG_VERSION").to_string(), shutdown.clone());
 
     let mut app = App {
         themes: build_themes(),
