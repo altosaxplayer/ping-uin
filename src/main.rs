@@ -61,6 +61,19 @@ fn portable_dir() -> Option<PathBuf> {
     }
 }
 
+fn is_homebrew_install(exe: &std::path::Path) -> bool {
+    exe.to_string_lossy().contains("/Cellar/ping-uin/")
+}
+
+fn homebrew_bin_path() -> Option<PathBuf> {
+    for path in ["/opt/homebrew/bin/ping-uin", "/usr/local/bin/ping-uin"] {
+        if std::path::Path::new(path).exists() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
 fn resolve_paths() -> Paths {
     let dir = portable_dir()
         .unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("ping-uin"));
@@ -1927,6 +1940,30 @@ fn extract_unix_tar(tar_path: &std::path::Path, dest_dir: &std::path::Path) -> i
     Err(io::Error::new(io::ErrorKind::NotFound, "ping-uin not found in archive"))
 }
 
+/// Homebrew update for installs managed by brew. Runs in a background thread.
+fn spawn_homebrew_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        fn notify(tx: &mpsc::Sender<Message>, state: UpdateState) {
+            let _ = tx.send(Message::UpdateState(state));
+        }
+
+        notify(&tx, UpdateState::Checking);
+        match Command::new("brew").args(["upgrade", "ping-uin"]).output() {
+            Ok(out) if out.status.success() => {
+                notify(&tx, UpdateState::Done { version, restart_required: true });
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                notify(&tx, UpdateState::Error(format!("brew upgrade failed:\n{}{}", stdout, stderr)));
+            }
+            Err(e) => {
+                notify(&tx, UpdateState::Error(format!("brew upgrade failed: {}", e)));
+            }
+        }
+    })
+}
+
 /// In-place update for portable installs. Runs in a background thread.
 fn spawn_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -2093,18 +2130,24 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.input_mode = InputMode::ExportPath { path: default_dir };
                             }
                             KeyCode::Char('u') | KeyCode::Char('U') => {
-                                if portable_dir().is_some() {
-                                    if let Some(ref version) = app.update_available {
-                                        if matches!(app.update_state, UpdateState::Idle | UpdateState::Error(_) | UpdateState::Done { .. }) {
-                                            let version = version.clone();
-                                            app.update_state = UpdateState::Checking;
+                                if let Some(ref version) = app.update_available {
+                                    if matches!(app.update_state, UpdateState::Idle | UpdateState::Error(_) | UpdateState::Done { .. }) {
+                                        let version = version.clone();
+                                        app.update_state = UpdateState::Checking;
+                                        if portable_dir().is_some() {
                                             spawn_updater(tx.clone(), version);
+                                        } else if let Ok(exe) = env::current_exe() {
+                                            if is_homebrew_install(&exe) {
+                                                spawn_homebrew_updater(tx.clone(), version);
+                                            } else {
+                                                app.update_state = UpdateState::Error("update only works in portable or homebrew mode".to_string());
+                                            }
+                                        } else {
+                                            app.update_state = UpdateState::Error("cannot determine install type".to_string());
                                         }
-                                    } else {
-                                        app.update_state = UpdateState::Error("no update available".to_string());
                                     }
                                 } else {
-                                    app.update_state = UpdateState::Error("update only works in portable mode".to_string());
+                                    app.update_state = UpdateState::Error("no update available".to_string());
                                 }
                             }
                             KeyCode::Char('g') => app.group_by = !app.group_by,
@@ -2441,7 +2484,12 @@ fn main() -> io::Result<()> {
             }
             #[cfg(not(target_os = "windows"))]
             {
-                let _ = Command::new(&exe).spawn();
+                let restart_exe = if is_homebrew_install(&exe) {
+                    homebrew_bin_path().unwrap_or(exe)
+                } else {
+                    exe
+                };
+                let _ = Command::new(&restart_exe).spawn();
             }
         }
     }
