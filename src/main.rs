@@ -650,7 +650,7 @@ fn log_result(timestamp: &str, host: &str, status: &str, latency_ms: f64) -> io:
     Ok(())
 }
 
-fn seed_from_log(hosts: &mut [HostState]) -> io::Result<()> {
+fn seed_from_log(hosts: &mut [HostState], graph_width: usize) -> io::Result<()> {
     ensure_log()?;
     let mut rdr = csv::Reader::from_path(&paths().log)?;
     for result in rdr.records() {
@@ -664,12 +664,14 @@ fn seed_from_log(hosts: &mut [HostState]) -> io::Result<()> {
         }
     }
     for h in hosts.iter_mut() {
-        while h.history.len() > h.history.capacity() { h.history.pop_front(); }
+        while h.history.len() > graph_width {
+            h.history.pop_front();
+        }
     }
     Ok(())
 }
 
-fn trim_log(hosts: &mut [HostState]) -> io::Result<()> {
+fn trim_log(hosts: &mut [HostState], graph_width: usize) -> io::Result<()> {
     let contents = fs::read_to_string(&paths().log)?;
     let mut lines: Vec<&str> = contents.lines().collect();
     if lines.len() > MAX_HISTORY + 1 {
@@ -678,7 +680,7 @@ fn trim_log(hosts: &mut [HostState]) -> io::Result<()> {
             .collect();
         fs::write(&paths().log, kept.join("\n") + "\n")?;
         for h in hosts.iter_mut() { h.total_checks = 0; h.up_checks = 0; h.history.clear(); }
-        seed_from_log(hosts)?;
+        seed_from_log(hosts, graph_width)?;
     }
     Ok(())
 }
@@ -1856,6 +1858,7 @@ fn spawn_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHand
                     }}\n\
                     Move-Item -Path $new -Destination $dest -Force\n\
                     Remove-Item -Path \"$dest.old\" -Force -ErrorAction SilentlyContinue\n\
+                    Remove-Item -Path \"{temp}\" -Recurse -Force -ErrorAction SilentlyContinue\n\
                     Start-Process -FilePath $dest -WorkingDirectory (Split-Path -Parent $dest)\n\
                 }} catch {{\n\
                     if (Test-Path \"$dest.old\") {{\n\
@@ -1866,6 +1869,7 @@ fn spawn_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHand
                 old = exe_path.display(),
                 new = new_exe.display(),
                 dest = exe_path.display(),
+                temp = temp_dir.display(),
             );
             if let Err(e) = fs::write(&updater_script, script) {
                 notify(&tx, UpdateState::Error(format!("updater script failed: {}", e))); return;
@@ -2192,6 +2196,9 @@ fn run_app<B: ratatui::backend::Backend>(
                         if up { h.up_checks += 1; }
                         let lat_u64 = if up { latency_ms.round() as u64 } else { 0 };
                         h.history.push_back(lat_u64);
+                        while h.history.len() > app.config.graph_width {
+                            h.history.pop_front();
+                        }
                         let status = if up { "UP" } else { "DOWN" };
                         let _ = log_result(&timestamp, &h.name, status, latency_ms);
                     }
@@ -2213,7 +2220,7 @@ fn run_app<B: ratatui::backend::Backend>(
         frames_since_trim += 1;
         if frames_since_trim >= 100 {
             frames_since_trim = 0;
-            let _ = trim_log(&mut app.hosts);
+            let _ = trim_log(&mut app.hosts, app.config.graph_width);
         }
     }
 }
@@ -2230,7 +2237,7 @@ fn main() -> io::Result<()> {
     let mut hosts: Vec<HostState> = config.hosts.iter()
         .map(|h| HostState::new(&h.name, h.interval_m, &h.group, h.alias.clone()))
         .collect();
-    seed_from_log(&mut hosts)?;
+    seed_from_log(&mut hosts, config.graph_width)?;
 
     let shared_hosts = Arc::new(RwLock::new(schedules_from_config(&config.hosts)));
     let shutdown = Arc::new(AtomicBool::new(false));
