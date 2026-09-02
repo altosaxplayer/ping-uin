@@ -1085,7 +1085,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         constraints.push(Constraint::Length(alert_rows + 3));
     }
     constraints.push(Constraint::Min(5));
-    constraints.push(Constraint::Min(3));
+    constraints.push(Constraint::Min(2));
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1302,7 +1302,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 .block(Block::default()
                     .title(accent_title("menu", &theme))
                     .title_alignment(Alignment::Center)
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme.box_color))
                     .style(Style::default().bg(theme.main_bg)));
