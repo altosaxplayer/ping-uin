@@ -1022,54 +1022,6 @@ fn render_host_row(h: &HostState, is_selected: bool, theme: &Theme, graph_width:
     ]).style(row_style)
 }
 
-fn hint_width(key: &str, label: &str) -> usize {
-    // format: [key] label  (brackets + space + key + space + label + trailing space)
-    key.len() + label.len() + 5
-}
-
-fn render_menu_box(frame: &mut Frame, area: Rect, hints: &[(&str, &str)], theme: &Theme) {
-    let block = Block::default()
-        .title(accent_title("menu", theme))
-        .title_alignment(Alignment::Center)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.box_color))
-        .style(Style::default().bg(theme.main_bg));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if hints.is_empty() || inner.width < 6 || inner.height < 1 {
-        return;
-    }
-
-    let max_width = hints.iter().map(|(k, l)| hint_width(k, l)).max().unwrap_or(0);
-    let spacing: usize = 2;
-    let col_width = max_width + spacing;
-    let cols = (inner.width as usize / col_width).max(1).min(hints.len());
-    let rows = (hints.len() + cols - 1) / cols;
-
-    let mut table_rows = Vec::new();
-    for r in 0..rows {
-        let mut cells = Vec::new();
-        for c in 0..cols {
-            let idx = r * cols + c;
-            let cell = if idx < hints.len() {
-                let (k, l) = hints[idx];
-                Cell::from(Line::from(key_hint(k, l, theme)))
-            } else {
-                Cell::from("")
-            };
-            cells.push(cell);
-        }
-        table_rows.push(Row::new(cells));
-    }
-
-    let constraints: Vec<Constraint> = (0..cols).map(|_| Constraint::Length(col_width as u16)).collect();
-    let table = Table::new(table_rows, &constraints)
-        .style(Style::default().bg(theme.main_bg).fg(theme.main_fg));
-    frame.render_widget(table, inner);
-}
-
 fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme) -> Row<'static> {
     // In flat-sort-by-status mode the pseudo-group is "Down" / "Up".
     let is_status_label = group == "Down" || group == "Up";
@@ -1133,7 +1085,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         constraints.push(Constraint::Length(alert_rows + 3));
     }
     constraints.push(Constraint::Min(5));
-    constraints.push(Constraint::Min(1));
+    constraints.push(Constraint::Length(1));
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1312,7 +1264,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     .block(table_block);
     frame.render_stateful_widget(table, table_area, &mut app.table_state);
 
-    // Render footer: collapse to smallest footprint when vertical space is tight.
+    // Render footer: fixed one-row compact menu so the host table always dominates.
     match app.input_mode {
         InputMode::Normal => {
             let mut hints = vec![
@@ -1334,42 +1286,19 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 hints.push(("u", "update"));
             }
 
-            if footer_area.height >= 4 {
-                // Room for status line plus bordered menu box.
-                let status_layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(1), Constraint::Min(1)])
-                    .split(footer_area);
-
-                let mut status_parts = vec![format!("sort: {}", app.sort_mode.label())];
-                if let Some(ref filter) = app.group_filter {
-                    status_parts.push(format!("group: {}", filter));
-                }
-                let mut status_spans = vec![Span::styled(status_parts.join("  ·  "), Style::default().fg(theme.divider))];
-                if let Some(ref version) = app.update_available {
-                    status_spans.push(Span::styled(
-                        format!("  ↑ v{} available", version),
-                        Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
-                    ));
-                }
-                frame.render_widget(Paragraph::new(Text::from(Line::from(status_spans))), status_layout[0]);
-                render_menu_box(frame, status_layout[1], &hints, &theme);
-            } else {
-                // Compact single-line menu; wraps if needed, stays visible even at 1 row.
-                let mut spans = Vec::new();
-                for (i, (k, l)) in hints.iter().enumerate() {
-                    if i > 0 { spans.push(Span::raw(" ")); }
-                    spans.extend(key_hint(k, l, &theme));
-                }
-                if let Some(ref version) = app.update_available {
-                    spans.push(Span::styled(
-                        format!("  ↑v{} ", version),
-                        Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
-                    ));
-                }
-                let footer = Paragraph::new(Text::from(Line::from(spans))).wrap(Wrap { trim: true });
-                frame.render_widget(footer, footer_area);
+            let mut spans = Vec::new();
+            for (i, (k, l)) in hints.iter().enumerate() {
+                if i > 0 { spans.push(Span::raw(" ")); }
+                spans.extend(key_hint(k, l, &theme));
             }
+            if let Some(ref version) = app.update_available {
+                spans.push(Span::styled(
+                    format!("  ↑v{} ", version),
+                    Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
+                ));
+            }
+            let footer = Paragraph::new(Text::from(Line::from(spans))).wrap(Wrap { trim: true });
+            frame.render_widget(footer, footer_area);
         }
         _ => {
             let footer_text = match app.input_mode {
