@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -9,7 +11,7 @@ use std::sync::{mpsc, Arc, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{
@@ -76,7 +78,7 @@ fn paths() -> &'static Paths {
 
 const DEFAULT_INTERVAL_M: u64 = 2;
 const DEFAULT_TIMEOUT_MS: u64 = 1000;
-const DEFAULT_GRAPH_WIDTH: usize = 40;
+const DEFAULT_GRAPH_WIDTH: usize = 20;
 const MAX_HISTORY: usize = 10000;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -316,7 +318,41 @@ struct AddHostForm {
     focus: usize,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HistoryRange {
+    Hours8,
+    Hours24,
+    Days7,
+}
+
+impl HistoryRange {
+    const ALL: [HistoryRange; 3] = [HistoryRange::Hours8, HistoryRange::Hours24, HistoryRange::Days7];
+
+    fn label(&self) -> &'static str {
+        match self {
+            HistoryRange::Hours8 => "8h",
+            HistoryRange::Hours24 => "24h",
+            HistoryRange::Days7 => "7d",
+        }
+    }
+
+    fn duration(&self) -> chrono::Duration {
+        match self {
+            HistoryRange::Hours8 => chrono::Duration::hours(8),
+            HistoryRange::Hours24 => chrono::Duration::hours(24),
+            HistoryRange::Days7 => chrono::Duration::days(7),
+        }
+    }
+
+    fn bucket_count(&self) -> usize {
+        match self {
+            HistoryRange::Hours8 => 32,
+            HistoryRange::Hours24 => 48,
+            HistoryRange::Days7 => 84,
+        }
+    }
+}
+
 enum InputMode {
     Normal,
     AddHost(AddHostForm),
@@ -324,6 +360,8 @@ enum InputMode {
     SortPicker { selected: usize },
     GroupFilterPicker { groups: Vec<String>, selected: usize },
     ImportPath { path: String },
+    ExportPath { path: String },
+    HistoryView { host_idx: usize, range: HistoryRange },
     ConfirmDelete,
 }
 
@@ -453,6 +491,25 @@ impl App {
         Ok(())
     }
 
+    /// Export current host list to a timestamped CSV in the chosen directory.
+    fn export_entries(&self, dir: &std::path::Path) -> io::Result<PathBuf> {
+        fs::create_dir_all(dir)?;
+        let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let dest = dir.join(format!("ping-uin-hosts-{}.csv", timestamp));
+        let mut wtr = csv::Writer::from_path(&dest)?;
+        wtr.write_record(["name", "interval_m", "group", "alias"])?;
+        for h in &self.config.hosts {
+            wtr.write_record([
+                h.name.clone(),
+                h.interval_m.to_string(),
+                h.group.clone(),
+                h.alias.clone().unwrap_or_default(),
+            ])?;
+        }
+        wtr.flush()?;
+        Ok(dest)
+    }
+
     /// Apply one all-fields edit (from the EditEntry form) by original name.
     fn edit_entry(&mut self, original: String, form: AddHostForm, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
         let new_name = form.host.trim().to_string();
@@ -532,11 +589,20 @@ struct HostSchedule {
     next_ping: Instant,
 }
 
+fn host_jitter(name: &str, interval_secs: u64) -> Duration {
+    let mut s = DefaultHasher::new();
+    name.hash(&mut s);
+    let hash = s.finish();
+    let max_jitter = (interval_secs / 2).min(30).max(1);
+    Duration::from_secs(hash % max_jitter)
+}
+
 fn schedules_from_config(hosts: &[HostConfig]) -> Vec<HostSchedule> {
+    let now = Instant::now();
     hosts.iter().map(|h| HostSchedule {
         name: h.name.clone(),
         interval_m: h.interval_m,
-        next_ping: Instant::now(),
+        next_ping: now + host_jitter(&h.name, h.interval_m * 60),
     }).collect()
 }
 
@@ -616,14 +682,94 @@ fn trim_log(hosts: &mut [HostState]) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Default)]
+struct LogEntry {
+    timestamp: chrono::DateTime<chrono::Local>,
+    up: bool,
+    latency_ms: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct HistorySummary {
+    total: usize,
+    up: usize,
+    down: usize,
+    uptime_pct: f64,
+    avg_latency_ms: f64,
+    last_down: Option<String>,
+    buckets: Vec<bool>, // true = mostly up in bucket
+}
+
+fn parse_log_entries(host: &str) -> Vec<LogEntry> {
+    let mut entries = Vec::new();
+    if let Ok(mut rdr) = csv::Reader::from_path(&paths().log) {
+        for rec in rdr.records().flatten() {
+            let entry_host = rec.get(1).unwrap_or("");
+            if entry_host != host { continue; }
+            let ts_str = rec.get(0).unwrap_or("");
+            if let Ok(ts) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S") {
+                let timestamp = chrono::Local.from_local_datetime(&ts).single().unwrap_or_else(chrono::Local::now);
+                let up = rec.get(2) == Some("UP");
+                let latency_ms = rec.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                entries.push(LogEntry { timestamp, up, latency_ms });
+            }
+        }
+    }
+    entries.sort_by_key(|a| a.timestamp);
+    entries
+}
+
+fn history_summary(host: &str, range: HistoryRange) -> HistorySummary {
+    let entries = parse_log_entries(host);
+    let now = chrono::Local::now();
+    let cutoff = now - range.duration();
+    let window: Vec<&LogEntry> = entries.iter().filter(|e| e.timestamp >= cutoff).collect();
+
+    let total = window.len();
+    let up = window.iter().filter(|e| e.up).count();
+    let down = total.saturating_sub(up);
+    let uptime_pct = if total > 0 { up as f64 / total as f64 * 100.0 } else { 0.0 };
+
+    let up_latencies: Vec<f64> = window.iter().filter(|e| e.up).map(|e| e.latency_ms).collect();
+    let avg_latency_ms = if !up_latencies.is_empty() {
+        up_latencies.iter().sum::<f64>() / up_latencies.len() as f64
+    } else {
+        0.0
+    };
+
+    let last_down = window.iter().rev().find(|e| !e.up).map(|e| e.timestamp.format("%Y-%m-%d %H:%M:%S").to_string());
+
+    let bucket_count = range.bucket_count();
+    let bucket_duration = range.duration() / bucket_count as i32;
+    let mut buckets = vec![false; bucket_count];
+    for (i, bucket) in buckets.iter_mut().enumerate().take(bucket_count) {
+        let bucket_start = cutoff + bucket_duration * i as i32;
+        let bucket_end = bucket_start + bucket_duration;
+        let bucket_entries: Vec<&LogEntry> = window.iter().filter(|e| e.timestamp >= bucket_start && e.timestamp < bucket_end).copied().collect();
+        if !bucket_entries.is_empty() {
+            let up_in_bucket = bucket_entries.iter().filter(|e| e.up).count();
+            *bucket = up_in_bucket * 2 >= bucket_entries.len();
+        } else {
+            // No data in bucket: mark as up if overall window is mostly up, else down.
+            *bucket = uptime_pct >= 50.0;
+        }
+    }
+
+    HistorySummary { total, up, down, uptime_pct, avg_latency_ms, last_down, buckets }
+}
+
 fn render_graph(history: &VecDeque<u64>, theme: &Theme, width: usize) -> Text<'static> {
     // btop-disks style: each ping is a block; green ■ if up, red bottom line _ if down.
-    // One space between blocks. Show the newest `width/2` samples.
+    // One space between blocks. Show the newest `width/2` samples with the newest on the left.
     let max_show = width / 2;
     let start = history.len().saturating_sub(max_show);
     let shown = history.len() - start;
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, &lat) in history.iter().skip(start).enumerate() {
+    // Prepend padding so older samples sit on the right.
+    let used = if shown > 0 { shown * 2 - 1 } else { 0 };
+    let pad = width.saturating_sub(used);
+    if pad > 0 { spans.push(Span::raw(" ".repeat(pad))); }
+    for (i, &lat) in history.iter().skip(start).rev().enumerate() {
         if i > 0 { spans.push(Span::raw(" ")); }
         if lat > 0 {
             spans.push(Span::styled("■", Style::default().fg(theme.graph_start)));
@@ -632,9 +778,6 @@ fn render_graph(history: &VecDeque<u64>, theme: &Theme, width: usize) -> Text<'s
             spans.push(Span::styled("_", Style::default().fg(theme.status_danger)));
         }
     }
-    let used = if shown > 0 { shown * 2 - 1 } else { 0 };
-    let pad = width.saturating_sub(used);
-    if pad > 0 { spans.push(Span::raw(" ".repeat(pad))); }
     Text::from(Line::from(spans))
 }
 
@@ -1068,7 +1211,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         Constraint::Length(6),
         Constraint::Length(9),
         Constraint::Length(10),
-        Constraint::Min(app.config.graph_width as u16),
+        Constraint::Length(app.config.graph_width as u16),
     ])
     .header(header)
     .block(table_block);
@@ -1080,7 +1223,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
             spans.extend(key_hint("a", "add", &theme));
             spans.extend(key_hint("d", "delete", &theme));
             spans.extend(key_hint("e", "edit", &theme));
+            spans.extend(key_hint("h", "history", &theme));
             spans.extend(key_hint("i", "import csv", &theme));
+            spans.extend(key_hint("E", "export", &theme));
             spans.extend(key_hint("g", "group", &theme));
             spans.extend(key_hint("f", "filter group", &theme));
             spans.extend(key_hint("s", "sort", &theme));
@@ -1136,6 +1281,16 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 Span::styled("? [y/n]", Style::default().fg(theme.status_danger)),
             ]))
         }
+        InputMode::HistoryView { .. } => Text::from(Line::from(vec![
+            Span::styled("History", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            Span::raw("[←/→] range   [Esc/h] close").style(Style::default().fg(theme.inactive_fg)),
+        ])),
+        InputMode::ExportPath { .. } => Text::from(Line::from(vec![
+            Span::styled("Export", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            Span::raw("   "),
+            Span::raw("[Enter] export   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+        ])),
     };
     frame.render_widget(footer_text, footer_area);
 
@@ -1267,6 +1422,115 @@ fn ui(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
         }
+        InputMode::ExportPath { ref path } => {
+            let popup_area = centered_rect(60, 30, area);
+            let display_path = if path.is_empty() { " ".to_string() } else { path.clone() };
+            let popup = Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from("Export host list to directory:").style(Style::default().fg(theme.inactive_fg)),
+                Line::from(""),
+                Line::from(Span::styled(display_path, Style::default().fg(theme.title))),
+                Line::from(""),
+                Line::from("A timestamped CSV will be created here.").style(Style::default().fg(theme.inactive_fg)),
+                Line::from(""),
+                Line::from("[Enter] export   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+            ]))
+            .block(Block::default()
+                .title(accent_title("Export hosts", &theme))
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.box_color))
+                .style(Style::default().bg(theme.popup_bg)));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(popup, popup_area);
+        }
+        InputMode::HistoryView { host_idx, range } => {
+            let popup_area = centered_rect(72, 46, area);
+            let host = &app.hosts[host_idx];
+            let name = host.display_name();
+            let summary = history_summary(&host.name, range);
+
+            let mut lines = vec![Line::from("")];
+
+            // Range selector
+            let mut range_spans = vec![Span::styled("range: ", Style::default().fg(theme.inactive_fg))];
+            for (i, r) in HistoryRange::ALL.iter().enumerate() {
+                if i > 0 { range_spans.push(Span::styled("  ", Style::default())); }
+                let style = if *r == range {
+                    Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.inactive_fg)
+                };
+                range_spans.push(Span::styled(format!("[{}]", r.label()), style));
+            }
+            lines.push(Line::from(range_spans));
+            lines.push(Line::from(""));
+
+            // Stats
+            lines.push(Line::from(vec![
+                Span::styled("checks: ", Style::default().fg(theme.inactive_fg)),
+                Span::styled(format!("{}", summary.total), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                Span::styled("   up: ", Style::default().fg(theme.inactive_fg)),
+                Span::styled(format!("{}", summary.up), Style::default().fg(theme.status_good).add_modifier(Modifier::BOLD)),
+                Span::styled("   down: ", Style::default().fg(theme.inactive_fg)),
+                Span::styled(format!("{}", summary.down), Style::default().fg(theme.status_danger).add_modifier(Modifier::BOLD)),
+            ]));
+            let uptime_color = if summary.uptime_pct >= 99.0 { theme.status_good } else if summary.uptime_pct >= 95.0 { theme.hi_fg } else { theme.status_danger };
+            lines.push(Line::from(vec![
+                Span::styled("uptime: ", Style::default().fg(theme.inactive_fg)),
+                Span::styled(format!("{:.2}%", summary.uptime_pct), Style::default().fg(uptime_color).add_modifier(Modifier::BOLD)),
+                Span::styled("   avg latency: ", Style::default().fg(theme.inactive_fg)),
+                Span::styled(format!("{:.1} ms", summary.avg_latency_ms), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+            ]));
+            if let Some(ref last_down) = summary.last_down {
+                lines.push(Line::from(vec![
+                    Span::styled("last down: ", Style::default().fg(theme.inactive_fg)),
+                    Span::styled(last_down.clone(), Style::default().fg(theme.status_danger)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("last down: ", Style::default().fg(theme.inactive_fg)),
+                    Span::styled("none", Style::default().fg(theme.status_good)),
+                ]));
+            }
+            lines.push(Line::from(""));
+
+            // Timeline
+            lines.push(Line::from(Span::styled("timeline (green = up, red = down)", Style::default().fg(theme.inactive_fg))));
+            let timeline_width = (popup_area.width as usize).saturating_sub(6).min(summary.buckets.len());
+            let start = summary.buckets.len().saturating_sub(timeline_width);
+            let mut timeline_spans: Vec<Span> = Vec::new();
+            for (i, &up) in summary.buckets.iter().skip(start).enumerate() {
+                if i > 0 { timeline_spans.push(Span::raw(" ")); }
+                if up {
+                    timeline_spans.push(Span::styled("▓", Style::default().fg(theme.status_good)));
+                } else {
+                    timeline_spans.push(Span::styled("▓", Style::default().fg(theme.status_danger)));
+                }
+            }
+            lines.push(Line::from(timeline_spans));
+            lines.push(Line::from(vec![
+                Span::styled("now →", Style::default().fg(theme.inactive_fg)),
+                Span::styled("".to_string(), Style::default()),
+                Span::styled("→ ", Style::default().fg(theme.inactive_fg)),
+                Span::styled(range.label(), Style::default().fg(theme.inactive_fg)),
+                Span::styled(" ago", Style::default().fg(theme.inactive_fg)),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from("[←/→] change range   [Esc/h] close").style(Style::default().fg(theme.inactive_fg)));
+
+            let popup = Paragraph::new(Text::from(lines))
+                .block(Block::default()
+                    .title(accent_title(&format!("history: {}", name), &theme))
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.box_color))
+                    .style(Style::default().bg(theme.popup_bg)));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(popup, popup_area);
+        }
         InputMode::ConfirmDelete => {
             let popup_area = centered_rect(45, 14, area);
             let name = app.hosts.get(app.selected_idx).map(|h| h.name.clone()).unwrap_or_default();
@@ -1338,7 +1602,8 @@ fn spawn_worker(tx: mpsc::Sender<Message>, hosts: Arc<RwLock<Vec<HostSchedule>>>
                 if wait.is_zero() {
                     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
                     let (up, latency_ms) = ping_host(&host.name, timeout_ms, &re);
-                    let next_ping = Instant::now() + Duration::from_secs(host.interval_m * 60);
+                    let interval_secs = host.interval_m * 60;
+                    let next_ping = Instant::now() + Duration::from_secs(interval_secs) + host_jitter(&host.name, interval_secs);
                     if let Ok(mut list) = hosts.write() {
                         if let Some(h) = list.iter_mut().find(|h| h.name == host.name) {
                             h.next_ping = next_ping;
@@ -1644,7 +1909,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.input_mode = InputMode::AddHost(AddHostForm::default());
                             }
                             KeyCode::Char('d') | KeyCode::Char('D') => { if !app.hosts.is_empty() { app.input_mode = InputMode::ConfirmDelete; } }
-                            KeyCode::Char('e') | KeyCode::Char('E') => {
+                            KeyCode::Char('e') => {
                                 if let Some(h) = app.hosts.get(app.selected_idx) {
                                     app.input_mode = InputMode::EditEntry {
                                         original: h.name.clone(),
@@ -1658,9 +1923,18 @@ fn run_app<B: ratatui::backend::Backend>(
                                     };
                                 }
                             }
+                            KeyCode::Char('h') | KeyCode::Char('H') => {
+                                if app.selected_idx < app.hosts.len() {
+                                    app.input_mode = InputMode::HistoryView { host_idx: app.selected_idx, range: HistoryRange::Hours24 };
+                                }
+                            }
                             KeyCode::Char('i') | KeyCode::Char('I') => {
                                 let default_path = paths().csv.to_string_lossy().to_string();
                                 app.input_mode = InputMode::ImportPath { path: default_path };
+                            }
+                            KeyCode::Char('E') => {
+                                let default_dir = dirs::home_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
+                                app.input_mode = InputMode::ExportPath { path: default_dir };
                             }
                             KeyCode::Char('u') | KeyCode::Char('U') => {
                                 if portable_dir().is_some() {
@@ -1800,6 +2074,43 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Backspace => { path.pop(); app.input_mode = InputMode::ImportPath { path }; }
                                 KeyCode::Char(c) => { path.push(c); app.input_mode = InputMode::ImportPath { path }; }
+                                _ => {}
+                            }
+                        }
+                        InputMode::ExportPath { ref path } => {
+                            let mut path = path.clone();
+                            match key.code {
+                                KeyCode::Esc => { app.input_mode = InputMode::Normal; }
+                                KeyCode::Enter => {
+                                    app.input_mode = InputMode::Normal;
+                                    if !path.trim().is_empty() {
+                                        let dir = std::path::Path::new(&path).to_path_buf();
+                                        match app.export_entries(&dir) {
+                                            Ok(dest) => app.update_state = UpdateState::Error(format!("exported to {}", dest.display())),
+                                            Err(e) => app.update_state = UpdateState::Error(format!("export failed: {}", e)),
+                                        }
+                                    }
+                                }
+                                KeyCode::Backspace => { path.pop(); app.input_mode = InputMode::ExportPath { path }; }
+                                KeyCode::Char(c) => { path.push(c); app.input_mode = InputMode::ExportPath { path }; }
+                                _ => {}
+                            }
+                        }
+                        InputMode::HistoryView { host_idx, range } => {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('h') | KeyCode::Char('H') => {
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Left => {
+                                    let idx = HistoryRange::ALL.iter().position(|&r| r == range).unwrap_or(1);
+                                    let new_idx = if idx == 0 { HistoryRange::ALL.len() - 1 } else { idx - 1 };
+                                    app.input_mode = InputMode::HistoryView { host_idx, range: HistoryRange::ALL[new_idx] };
+                                }
+                                KeyCode::Right => {
+                                    let idx = HistoryRange::ALL.iter().position(|&r| r == range).unwrap_or(1);
+                                    let new_idx = (idx + 1) % HistoryRange::ALL.len();
+                                    app.input_mode = InputMode::HistoryView { host_idx, range: HistoryRange::ALL[new_idx] };
+                                }
                                 _ => {}
                             }
                         }
