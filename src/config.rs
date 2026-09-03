@@ -136,6 +136,19 @@ pub struct HostConfig {
     /// TCP check port. None = ICMP ping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// Warn threshold in ms: up-but-slow reads WARN. None = disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_latency_ms: Option<u32>,
+    /// Custom check command run via shell; exit 0 = up, latency = wall time.
+    /// Takes precedence over ping/TCP when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_cmd: Option<String>,
+    /// Upstream host name: alerts suppressed while the upstream is down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<String>,
+    /// Mute maintenance window as unix epoch secs. None/expired = unmuted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub muted_until: Option<i64>,
 }
 
 fn default_group() -> String {
@@ -164,9 +177,42 @@ impl HostConfig {
             group,
             alias,
             port,
+            warn_latency_ms: None,
+            check_cmd: None,
+            depends_on: None,
+            muted_until: None,
         }
     }
 
+    /// Seconds of mute remaining, 0 when unmuted/expired.
+    pub fn mute_remaining_secs(&self, now_epoch: i64) -> i64 {
+        self.muted_until
+            .map(|until| (until - now_epoch).max(0))
+            .unwrap_or(0)
+    }
+}
+
+pub fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Compact `41m`-style duration for tickers.
+pub fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
+impl HostConfig {
     /// Effective check interval, clamped to sane bounds.
     pub fn effective_interval_secs(&self) -> u64 {
         let raw = if self.interval_secs > 0 {
@@ -219,6 +265,12 @@ pub struct Config {
     /// Collapsed group names in grouped view.
     #[serde(default)]
     pub collapsed_groups: Vec<String>,
+    /// Compact table density (hides IP + Group columns).
+    #[serde(default)]
+    pub compact: bool,
+    /// Selected host name restored on startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
 }
 
 fn default_timeout() -> u64 {
@@ -246,6 +298,8 @@ impl Default for Config {
             webhook_url: None,
             notify_bell: false,
             collapsed_groups: Vec::new(),
+            compact: false,
+            selected: None,
         }
     }
 }
@@ -376,7 +430,24 @@ impl Config {
                             .unwrap_or("default")
                             .to_string();
                         let alias = obj.get("alias").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        hosts.push(HostConfig::new(name, interval_secs, group, alias, parse_port(obj)));
+                        let mut h = HostConfig::new(name, interval_secs, group, alias, parse_port(obj));
+                        h.warn_latency_ms = obj
+                            .get("warn_latency_ms")
+                            .and_then(|v| v.as_u64())
+                            .filter(|w| *w > 0)
+                            .map(|w| w as u32);
+                        h.check_cmd = obj
+                            .get("check_cmd")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|s| s.to_string());
+                        h.depends_on = obj
+                            .get("depends_on")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.trim().is_empty())
+                            .map(|s| s.to_string());
+                        h.muted_until = obj.get("muted_until").and_then(|v| v.as_i64());
+                        hosts.push(h);
                     }
                 }
             }
@@ -409,6 +480,11 @@ impl Config {
                             .collect()
                     })
                     .unwrap_or_default(),
+                compact: value.get("compact").and_then(|v| v.as_bool()).unwrap_or(false),
+                selected: value
+                    .get("selected")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
             };
         }
         // Corrupt config: back it up instead of silently discarding user data.
@@ -428,8 +504,9 @@ impl Config {
     }
 }
 
-/// Read hosts.csv rows into HostConfig entries. Accepts both the new
-/// `name,interval,group,alias,port` layout and legacy 4-column files.
+/// Read hosts.csv rows into HostConfig entries. Accepts the full
+/// `name,interval,group,alias,port,warn_ms,check_cmd,depends_on` layout as
+/// well as shorter legacy files (missing trailing columns stay unset).
 pub fn read_entries_csv(path: &std::path::Path) -> io::Result<Vec<HostConfig>> {
     let mut rdr = csv::Reader::from_path(path)?;
     let mut out = Vec::new();
@@ -454,7 +531,20 @@ pub fn read_entries_csv(path: &std::path::Path) -> io::Result<Vec<HostConfig>> {
             .get(4)
             .and_then(|s| s.trim().parse::<u16>().ok())
             .filter(|p| *p > 0);
-        out.push(HostConfig::new(name, interval, group, alias, port));
+        let mut h = HostConfig::new(name, interval, group, alias, port);
+        h.warn_latency_ms = r
+            .get(5)
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|w| *w > 0);
+        h.check_cmd = r
+            .get(6)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        h.depends_on = r
+            .get(7)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        out.push(h);
     }
     Ok(out)
 }
@@ -524,6 +614,23 @@ mod tests {
         assert_eq!(parse_sort_mode("DownOnly"), SortMode::DownOnly);
         assert_eq!(parse_sort_mode("down only"), SortMode::DownOnly);
         assert_eq!(parse_sort_mode("bogus"), SortMode::None);
+    }
+
+    #[test]
+    fn format_duration_units() {
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(600), "10m");
+        assert_eq!(format_duration(5400), "1h30m");
+        assert_eq!(format_duration(90000), "1d");
+    }
+
+    #[test]
+    fn mute_remaining_counts_down() {
+        let mut h = HostConfig::new("x", 60, "g", None, None);
+        assert_eq!(h.mute_remaining_secs(1000), 0);
+        h.muted_until = Some(1060);
+        assert_eq!(h.mute_remaining_secs(1000), 60);
+        assert_eq!(h.mute_remaining_secs(2000), 0); // expired clamps to 0
     }
 
     #[test]

@@ -11,7 +11,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{Local, TimeZone};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -176,6 +179,10 @@ struct HostState {
     group: String,
     interval_secs: u64,
     port: Option<u16>,
+    warn_latency_ms: Option<u32>,
+    check_cmd: Option<String>,
+    depends_on: Option<String>,
+    muted_until: Option<i64>,
     next_ping: Instant,
     history: VecDeque<u64>,
     up: bool,
@@ -186,16 +193,24 @@ struct HostState {
     last_change: Option<Instant>,
     /// Recent state-change timestamps (pruned to 10 min). 3+ = flapping.
     flaps: VecDeque<Instant>,
+    /// When the current outage started (session-local). Drives the ticker.
+    down_since: Option<Instant>,
+    /// Escalation level reached: 0 none, 1 = 5min, 2 = 30min.
+    escalation: u8,
 }
 
 impl HostState {
-    fn new(name: &str, interval_secs: u64, group: &str, alias: Option<String>, port: Option<u16>) -> Self {
+    fn new(entry: &HostConfig) -> Self {
         HostState {
-            name: name.to_string(),
-            alias: alias.filter(|a| !a.trim().is_empty()),
-            group: group.to_string(),
-            interval_secs,
-            port,
+            name: entry.name.clone(),
+            alias: entry.alias.clone().filter(|a| !a.trim().is_empty()),
+            group: entry.group.clone(),
+            interval_secs: entry.effective_interval_secs(),
+            port: entry.port,
+            warn_latency_ms: entry.warn_latency_ms,
+            check_cmd: entry.check_cmd.clone(),
+            depends_on: entry.depends_on.clone(),
+            muted_until: entry.muted_until,
             next_ping: Instant::now(),
             history: VecDeque::with_capacity(config::DEFAULT_GRAPH_WIDTH),
             up: false,
@@ -204,7 +219,25 @@ impl HostState {
             up_checks: 0,
             last_change: None,
             flaps: VecDeque::new(),
+            down_since: None,
+            escalation: 0,
         }
+    }
+
+    /// Refresh check parameters from the config entry (add/edit/import).
+    fn sync_config(&mut self, entry: &HostConfig) {
+        self.interval_secs = entry.effective_interval_secs();
+        self.group = entry.group.clone();
+        self.alias = entry.alias.clone();
+        self.port = entry.port;
+        self.warn_latency_ms = entry.warn_latency_ms;
+        self.check_cmd = entry.check_cmd.clone();
+        self.depends_on = entry.depends_on.clone();
+        self.muted_until = entry.muted_until;
+    }
+
+    fn muted(&self) -> bool {
+        self.muted_until.map_or(false, |until| until > config::now_epoch())
     }
 
     /// Name shown in the UI: alias if set, else the target IP/hostname.
@@ -240,6 +273,85 @@ impl HostState {
     /// True when the state changed within the flash window.
     fn just_changed(&self) -> bool {
         self.last_change.map_or(false, |t| t.elapsed() < Duration::from_secs(15))
+    }
+
+    /// Up but slower than the warn threshold.
+    fn warn_active(&self) -> bool {
+        self.up
+            && self
+                .warn_latency_ms
+                .map_or(false, |w| self.latency_ms > w as f64)
+    }
+
+    /// How long the current outage has lasted, if down.
+    fn down_for(&self) -> Option<Duration> {
+        if self.up {
+            return None;
+        }
+        self.down_since.map(|t| t.elapsed())
+    }
+}
+
+/// Down because an upstream dependency is down (single-level resolution,
+/// matched by name or alias). Suppressed hosts keep their raw status but
+/// skip notifications and escalations.
+fn is_suppressed(hosts: &[HostState], name: &str) -> bool {
+    let h = match hosts.iter().find(|h| h.name == name) {
+        Some(h) => h,
+        None => return false,
+    };
+    let upstream = match &h.depends_on {
+        Some(u) => u,
+        None => return false,
+    };
+    hosts
+        .iter()
+        .find(|x| x.name == *upstream || x.alias.as_deref() == Some(upstream.as_str()))
+        .map_or(false, |u| !u.up)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::HostConfig;
+
+    fn state(name: &str, up: bool, depends_on: Option<&str>) -> HostState {
+        let mut cfg = HostConfig::new(name, 60, "g", None, None);
+        cfg.depends_on = depends_on.map(|s| s.to_string());
+        let mut h = HostState::new(&cfg);
+        h.up = up;
+        h
+    }
+
+    #[test]
+    fn suppression_follows_upstream() {
+        let hosts = vec![
+            state("gw", false, None),
+            state("web", false, Some("gw")),
+            state("db", false, Some("missing")),
+            state("cache", true, Some("gw")),
+            state("solo", false, None),
+        ];
+        assert!(is_suppressed(&hosts, "web")); // upstream down
+        assert!(is_suppressed(&hosts, "cache")); // up but upstream down
+        assert!(!is_suppressed(&hosts, "db")); // unknown upstream
+        assert!(!is_suppressed(&hosts, "solo")); // no dependency
+        assert!(!is_suppressed(&hosts, "nope")); // unknown host
+    }
+
+    #[test]
+    fn warn_state_needs_up_and_slow() {
+        let mut cfg = HostConfig::new("x", 60, "g", None, None);
+        cfg.warn_latency_ms = Some(100);
+        let mut h = HostState::new(&cfg);
+        h.up = true;
+        h.latency_ms = 250.0;
+        assert!(h.warn_active());
+        h.latency_ms = 50.0;
+        assert!(!h.warn_active());
+        h.up = false;
+        h.latency_ms = 250.0;
+        assert!(!h.warn_active()); // down, not warn
     }
 }
 
@@ -312,7 +424,7 @@ enum InputMode {
     GroupFilterPicker { groups: Vec<String>, selected: usize },
     ImportPath { path: String },
     ExportPath { path: String },
-    HistoryView { host_idx: usize, range: HistoryRange },
+    HistoryView { host_idx: usize, range: HistoryRange, compare_idx: Option<usize> },
     ThemePicker { original: usize, selected: usize },
     MenuModal,
     KeysHelp,
@@ -342,7 +454,18 @@ struct App {
     group_filter: Option<String>,
     sort_mode: SortMode,
     collapsed: HashSet<String>,
+    collapsed_rev: u64,
     search: Option<String>,
+    compact: bool,
+    wizard_dismissed: bool,
+    last_esc_check: Instant,
+    /// Cached visible rows + the fingerprint they were built from. Rebuilt
+    /// only when results or view settings change — not every frame.
+    row_cache: Vec<VisibleRow>,
+    row_key: RowKey,
+    /// Last rendered table geometry + visible slice, for mouse clicks.
+    table_rect: Rect,
+    table_slice: (usize, usize),
     input_mode: InputMode,
     update_available: Option<String>,
     update_state: UpdateState,
@@ -362,9 +485,10 @@ impl App {
         let interval_secs = interval_secs.clamp(config::MIN_INTERVAL_SECS, config::MAX_INTERVAL_SECS);
         let group = if group.trim().is_empty() { "default".to_string() } else { group.trim().to_string() };
         let alias = if alias.trim().is_empty() { None } else { Some(alias.trim().to_string()) };
-        self.config.hosts.push(HostConfig::new(&name, interval_secs, &group, alias.clone(), port));
+        let entry = HostConfig::new(&name, interval_secs, &group, alias, port);
+        self.hosts.push(HostState::new(&entry));
+        self.config.hosts.push(entry);
         self.persist();
-        self.hosts.push(HostState::new(&name, interval_secs, &group, alias, port));
         if let Ok(mut h) = shared_hosts.write() {
             *h = schedules_from_config(&self.config.hosts);
         }
@@ -394,7 +518,7 @@ impl App {
     }
 
     fn write_host_records(wtr: &mut csv::Writer<std::fs::File>, hosts: &[HostConfig]) -> io::Result<()> {
-        wtr.write_record(["name", "interval", "group", "alias", "port"])?;
+        wtr.write_record(["name", "interval", "group", "alias", "port", "warn_ms", "check_cmd", "depends_on"])?;
         for h in hosts {
             wtr.write_record([
                 h.name.clone(),
@@ -402,6 +526,9 @@ impl App {
                 h.group.clone(),
                 h.alias.clone().unwrap_or_default(),
                 h.port.map(|p| p.to_string()).unwrap_or_default(),
+                h.warn_latency_ms.map(|w| w.to_string()).unwrap_or_default(),
+                h.check_cmd.clone().unwrap_or_default(),
+                h.depends_on.clone().unwrap_or_default(),
             ])?;
         }
         wtr.flush()?;
@@ -421,6 +548,91 @@ impl App {
         let dest = dir.join(format!("ping-uin-hosts-{}.csv", timestamp));
         let mut wtr = csv::Writer::from_path(&dest)?;
         Self::write_host_records(&mut wtr, &self.config.hosts)?;
+        Ok(dest)
+    }
+
+    /// Static HTML status page: host table with status/latency/uptime/SLA
+    /// plus text sparklines. `scp` it anywhere — no server needed.
+    fn html_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+
+    fn export_status_page(&mut self, dir: &std::path::Path) -> io::Result<PathBuf> {
+        fs::create_dir_all(dir)?;
+        let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+        let human = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let dest = dir.join(format!("ping-uin-status-{}.html", stamp));
+        let mut rows = String::new();
+        for h in &self.hosts {
+            let summary = cached_history_summary(&mut self.history_cache, &h.name, HistoryRange::Hours24);
+            let sla = if summary.total == 0 {
+                "—".to_string()
+            } else {
+                format!("{:.1}%", summary.uptime_pct)
+            };
+            let (cls, label) = if h.muted() {
+                ("muted", "MUTED")
+            } else if h.flapping() {
+                ("flap", "FLAP")
+            } else if h.up && h.warn_active() {
+                ("warn", "WARN")
+            } else if h.up {
+                ("up", "UP")
+            } else if is_suppressed(&self.hosts, &h.name) {
+                ("dep", "DEP")
+            } else {
+                ("down", "DOWN")
+            };
+            let spark: String = h
+                .history
+                .iter()
+                .map(|lat| {
+                    if *lat > 0 {
+                        "<span class=\"u\">■</span>"
+                    } else {
+                        "<span class=\"d\">_</span>"
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let uptime = if h.total_checks > 0 {
+                format!("{:.1}%", h.up_checks as f64 / h.total_checks as f64 * 100.0)
+            } else {
+                "—".to_string()
+            };
+            rows.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td class=\"{}\">● {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"spark\">{}</td></tr>\n",
+                Self::html_escape(&h.display_name()),
+                Self::html_escape(&h.target()),
+                cls,
+                label,
+                if h.up { format!("{:.0} ms", h.latency_ms) } else { "—".to_string() },
+                h.group,
+                uptime,
+                sla,
+                spark,
+            ));
+        }
+        let up = self.hosts.iter().filter(|h| h.up).count();
+        let down = self.hosts.len().saturating_sub(up);
+        let html = format!(
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>ping-uin status {human}</title><style>\
+            body{{background:#161a22;color:#c8ccd4;font-family:monospace;padding:24px}}\
+            h1{{color:#eef0f6}}table{{border-collapse:collapse;width:100%}}\
+            th,td{{text-align:left;padding:6px 10px;border-bottom:1px solid #2c313c}}\
+            th{{color:#5a6375}}.up{{color:#a3be8c}}.down{{color:#dc6d6d}}\
+            .warn,.flap{{color:#e5c07b}}.muted,.dep{{color:#5a6375}}\
+            .spark{{letter-spacing:2px}}.u{{color:#8fb573}}.d{{color:#dc6d6d}}\
+            </style></head><body><h1>((•O•)) ping-uin status</h1>\
+            <p>{up} up · {down} down · generated {human}</p>\
+            <table><tr><th>Host</th><th>Target</th><th>Status</th><th>Latency</th>\
+            <th>Group</th><th>Uptime</th><th>SLA 24h</th><th>History</th></tr>{rows}\
+            </table></body></html>"
+        );
+        fs::write(&dest, html)?;
         Ok(dest)
     }
 
@@ -445,10 +657,7 @@ impl App {
             self.config.hosts[idx].alias  = alias.clone();
             self.config.hosts[idx].port   = port;
             if let Some(h) = self.hosts.get_mut(idx) {
-                h.interval_secs = interval_secs;
-                h.group      = group;
-                h.alias      = alias;
-                h.port       = port;
+                h.sync_config(&self.config.hosts[idx]);
             }
             self.history_cache.clear();
             self.persist();
@@ -466,15 +675,12 @@ impl App {
                     Some(i) => {
                         self.config.hosts[i] = entry.clone();
                         if let Some(h) = self.hosts.get_mut(i) {
-                            h.interval_secs = entry.effective_interval_secs();
-                            h.group      = entry.group.clone();
-                            h.alias      = entry.alias.clone();
-                            h.port       = entry.port;
+                            h.sync_config(&entry);
                         }
                     }
                     None => {
+                        self.hosts.push(HostState::new(&entry));
                         self.config.hosts.push(entry.clone());
-                        self.hosts.push(HostState::new(&entry.name, entry.effective_interval_secs(), &entry.group, entry.alias.clone(), entry.port));
                     }
                 }
             }
@@ -493,7 +699,29 @@ impl App {
         self.config.group_by = self.group_by;
         self.config.sort_mode = self.sort_mode;
         self.config.collapsed_groups = self.collapsed.iter().cloned().collect();
+        self.config.compact = self.compact;
         let _ = self.config.save();
+    }
+
+    /// Mute/unmute the selected host for an hour (maintenance windows).
+    fn toggle_mute_selected(&mut self, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
+        let idx = self.selected_idx;
+        let entry = match self.config.hosts.get_mut(idx) {
+            Some(e) => e,
+            None => return,
+        };
+        let now = config::now_epoch();
+        if entry.mute_remaining_secs(now) > 0 {
+            entry.muted_until = None;
+            self.update_state = UpdateState::Info("host unmuted".to_string());
+        } else {
+            entry.muted_until = Some(now + 3600);
+            self.update_state = UpdateState::Info("host muted for 1h".to_string());
+        }
+        self.persist();
+        if let Ok(mut h) = shared_hosts.write() {
+            *h = schedules_from_config(&self.config.hosts);
+        }
     }
 
     /// Collapse/expand the selected host's group (grouped view).
@@ -506,6 +734,7 @@ impl App {
         if !self.collapsed.remove(&group) {
             self.collapsed.insert(group);
         }
+        self.collapsed_rev = self.collapsed_rev.wrapping_add(1);
         self.save_prefs();
     }
 
@@ -755,6 +984,37 @@ fn accent_title(text: &str, theme: &Theme) -> Line<'static> {
     ])
 }
 
+/// Newest-left bucket timeline + now/ago axis, shared by history + compare.
+fn timeline_lines(theme: &Theme, summary: &HistorySummary, range: HistoryRange, popup_width: usize) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled(
+        "timeline (green = up, red = down)",
+        Style::default().fg(theme.inactive_fg),
+    ))];
+    let timeline_width = popup_width.saturating_sub(6).min(summary.buckets.len());
+    let start = summary.buckets.len().saturating_sub(timeline_width);
+    let mut timeline_spans: Vec<Span> = Vec::new();
+    for (i, &up) in summary.buckets.iter().skip(start).rev().enumerate() {
+        if i > 0 {
+            timeline_spans.push(Span::raw(" "));
+        }
+        if up {
+            timeline_spans.push(Span::styled("▓", Style::default().fg(theme.status_good)));
+        } else {
+            timeline_spans.push(Span::styled("▓", Style::default().fg(theme.status_danger)));
+        }
+    }
+    lines.push(Line::from(timeline_spans));
+    let row_w = if timeline_width > 0 { timeline_width * 2 - 1 } else { 0 };
+    let ago_label = format!("{} ago", range.label());
+    let gap = row_w.saturating_sub(3 + ago_label.chars().count()).max(1);
+    lines.push(Line::from(vec![
+        Span::styled("now", Style::default().fg(theme.inactive_fg)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(ago_label, Style::default().fg(theme.inactive_fg)),
+    ]));
+    lines
+}
+
 #[derive(Clone)]
 enum RowKind {
     GroupHeader { name: String, collapsed: bool, hidden: usize },
@@ -765,6 +1025,45 @@ enum RowKind {
 struct VisibleRow {
     kind: RowKind,
     host_idx: Option<usize>,
+}
+
+/// Fingerprint for the visible-row cache. `checks` is the sum of per-host
+/// check counters, so any probe result invalidates the cache.
+#[derive(Clone, PartialEq, Eq, Default)]
+struct RowKey {
+    checks: u64,
+    host_count: usize,
+    group_by: bool,
+    group_filter: Option<String>,
+    sort_mode: SortMode,
+    search: Option<String>,
+    collapsed_rev: u64,
+}
+
+/// Borrow the cached visible rows, rebuilding only on change. Cuts per-frame
+/// allocation churn (rows + all their strings) to ~zero at steady state.
+fn cached_visible_rows(app: &mut App) -> &Vec<VisibleRow> {
+    let key = RowKey {
+        checks: app.hosts.iter().map(|h| h.total_checks).sum(),
+        host_count: app.hosts.len(),
+        group_by: app.group_by,
+        group_filter: app.group_filter.clone(),
+        sort_mode: app.sort_mode,
+        search: app.search.clone(),
+        collapsed_rev: app.collapsed_rev,
+    };
+    if key != app.row_key {
+        app.row_cache = build_visible_rows(
+            &app.hosts,
+            app.group_by,
+            app.group_filter.as_deref(),
+            app.sort_mode,
+            app.search.as_deref(),
+            &app.collapsed,
+        );
+        app.row_key = key;
+    }
+    &app.row_cache
 }
 
 fn sort_host_indices(indices: &mut Vec<usize>, hosts: &[HostState], sort_mode: SortMode) {
@@ -908,51 +1207,82 @@ fn selected_visible_position(rows: &[VisibleRow], selected_idx: usize) -> Option
 }
 
 fn move_selection_up(app: &mut App) {
-    let rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode, app.search.as_deref(), &app.collapsed);
-    if let Some(pos) = selected_visible_position(&rows, app.selected_idx) {
-        for i in (0..pos).rev() {
-            if let Some(idx) = rows[i].host_idx {
-                app.selected_idx = idx;
-                if let Some(new_pos) = selected_visible_position(&rows, idx) {
-                    app.table_state.select(Some(new_pos));
-                }
-                return;
-            }
-        }
+    let sel = app.selected_idx;
+    let next = {
+        let rows = cached_visible_rows(app);
+        let pos = match selected_visible_position(rows, sel) {
+            Some(p) => p,
+            None => return,
+        };
+        (0..pos).rev().find_map(|i| rows[i].host_idx)
+    };
+    if let Some(idx) = next {
+        app.selected_idx = idx;
     }
 }
 
 fn move_selection_down(app: &mut App) {
-    let rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode, app.search.as_deref(), &app.collapsed);
-    if let Some(pos) = selected_visible_position(&rows, app.selected_idx) {
-        for i in pos + 1..rows.len() {
-            if let Some(idx) = rows[i].host_idx {
-                app.selected_idx = idx;
-                if let Some(new_pos) = selected_visible_position(&rows, idx) {
-                    app.table_state.select(Some(new_pos));
-                }
-                return;
-            }
-        }
+    let sel = app.selected_idx;
+    let next = {
+        let rows = cached_visible_rows(app);
+        let pos = match selected_visible_position(rows, sel) {
+            Some(p) => p,
+            None => return,
+        };
+        (pos + 1..rows.len()).find_map(|i| rows[i].host_idx)
+    };
+    if let Some(idx) = next {
+        app.selected_idx = idx;
     }
 }
 
-fn render_host_row(h: &HostState, is_selected: bool, theme: &Theme, graph_width: usize) -> Row<'static> {
+fn render_host_row(
+    h: &HostState,
+    is_selected: bool,
+    theme: &Theme,
+    graph_width: usize,
+    muted: bool,
+    suppressed: bool,
+    sla_24h: Option<f64>,
+) -> Row<'static> {
     let flapping = h.flapping();
-    let (status_color, status_label) = if flapping {
+    // Priority: MUTED > FLAP > DOWN > WARN > UP; DEP dims a down host whose
+    // upstream is down.
+    let (status_color, status_label) = if muted {
+        (theme.inactive_fg, "MUTED")
+    } else if flapping {
         (theme.hi_fg, "FLAP")
+    } else if h.up && h.warn_active() {
+        (theme.hi_fg, "WARN")
     } else if h.up {
         (theme.status_good, "UP")
+    } else if suppressed {
+        (theme.inactive_fg, "DEP")
     } else {
         (theme.status_danger, "DOWN")
     };
     // Fresh transitions flash underlined for ~15s.
-    let status_style = if h.just_changed() {
+    let status_style = if h.just_changed() && !muted {
         Style::default().fg(status_color).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
         Style::default().fg(status_color).add_modifier(Modifier::BOLD)
     };
-    let latency_str = if h.up { format!("{:.0} ms", h.latency_ms) } else { "—".to_string() };
+    // Latency cell doubles as ticker: mute remaining, outage duration, ms.
+    let latency_str = if muted {
+        let rem = h.muted_until.map_or(String::new(), |until| {
+            let s = (until - config::now_epoch()).max(0) as u64;
+            format!("mut {}", config::format_duration(s))
+        });
+        rem
+    } else if !h.up {
+        h.down_for()
+            .map(|d| format!("↓ {}", config::format_duration(d.as_secs())))
+            .unwrap_or_else(|| "—".to_string())
+    } else if h.up {
+        format!("{:.0} ms", h.latency_ms)
+    } else {
+        "—".to_string()
+    };
     let uptime = if h.total_checks > 0 { h.up_checks as f64 / h.total_checks as f64 * 100.0 } else { 0.0 };
     let row_style = if is_selected {
         Style::default().bg(theme.selected_bg).fg(theme.selected_fg)
@@ -981,9 +1311,27 @@ fn render_host_row(h: &HostState, is_selected: bool, theme: &Theme, graph_width:
         Cell::from(Span::styled(latency_str, Style::default().fg(theme.main_fg))),
         Cell::from(Span::styled(format_interval(h.interval_secs), Style::default().fg(theme.inactive_fg))),
         Cell::from(Span::styled(format!("{:.1}%", uptime), Style::default().fg(theme.graph_text))),
+        Cell::from(sla_cell(sla_24h, theme)),
         Cell::from(Span::styled(h.group.clone(), Style::default().fg(theme.inactive_fg))),
         Cell::from(render_graph(&h.history, theme, graph_width)),
     ]).style(row_style)
+}
+
+/// 24h SLA cell: green ≥99%, accent ≥95%, red below, dim dash when no data.
+fn sla_cell(sla_24h: Option<f64>, theme: &Theme) -> Span<'static> {
+    match sla_24h {
+        None => Span::styled("—", Style::default().fg(theme.inactive_fg)),
+        Some(pct) => {
+            let color = if pct >= 99.0 {
+                theme.status_good
+            } else if pct >= 95.0 {
+                theme.hi_fg
+            } else {
+                theme.status_danger
+            };
+            Span::styled(format!("{:.1}%", pct), Style::default().fg(color))
+        }
+    }
 }
 
 fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme, collapsed: bool, hidden: usize, show_counts: bool) -> Row<'static> {
@@ -1033,7 +1381,7 @@ fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme, collapse
     spans.push(Span::styled("──────────", Style::default().fg(theme.divider)));
     Row::new(vec![
         Cell::from(Line::from(spans)),
-        Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""),
+        Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""),
     ]).style(Style::default().bg(theme.main_bg))
 }
 
@@ -1230,7 +1578,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
     // The menu box never changes height, so the table never jumps.
     let up_count = app.hosts.iter().filter(|h| h.up).count();
     let total = app.hosts.len();
-    let down_count = total.saturating_sub(up_count);
+    let muted_total = app.hosts.iter().filter(|h| h.muted()).count();
+    let down_count = app.hosts.iter().filter(|h| !h.up && !h.muted()).count();
     let pct_up = if total > 0 { (up_count as f64 / total as f64 * 100.0).round() as u64 } else { 0 };
     let now = Local::now().format("%H:%M:%S").to_string();
 
@@ -1340,6 +1689,23 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
         ));
     }
+    if muted_total > 0 {
+        stats_spans.push(Span::styled(
+            format!("  ·  {} muted", muted_total),
+            Style::default().fg(theme.inactive_fg),
+        ));
+    }
+    let suppressed_count = app
+        .hosts
+        .iter()
+        .filter(|h| !h.up && !h.muted() && is_suppressed(&app.hosts, &h.name))
+        .count();
+    if suppressed_count > 0 {
+        stats_spans.push(Span::styled(
+            format!("  ·  {} via upstream", suppressed_count),
+            Style::default().fg(theme.inactive_fg),
+        ));
+    }
     if let Some(q) = app.search.as_deref().filter(|q| !q.trim().is_empty()) {
         stats_spans.push(Span::styled(
             format!("  ·  /{}", q),
@@ -1370,24 +1736,58 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(theme.box_color))
         .style(Style::default().bg(theme.main_bg));
 
-    let header = Row::new(vec!["Host", "IP", "Status", "Latency", "Int", "Uptime", "Group", "History"])
+    // Compact density hides the IP + Group columns (zero-width constraints).
+    let (ip_w, group_w): (u16, u16) = if app.compact { (0, 0) } else { (18, 10) };
+    let header = Row::new(vec!["Host", "IP", "Status", "Latency", "Int", "Uptime", "SLA", "Group", "History"])
         .style(Style::default().fg(theme.inactive_fg).add_modifier(Modifier::BOLD))
         .height(1);
+
+    // Viewport culling: only build widget rows for what's on screen.
+    // Keeps per-frame allocation flat no matter how many hosts exist.
+    let viewport = table_area.height.saturating_sub(3).max(1) as usize;
+    let sel = app.selected_idx;
+    // Clone only the on-screen slice: O(viewport), not O(hosts).
+    let (slice, selected_pos, slice_start) = {
+        let visible = cached_visible_rows(app);
+        let pos = selected_visible_position(visible, sel).unwrap_or(0);
+        let start = if visible.len() <= viewport {
+            0
+        } else {
+            pos.saturating_sub(viewport / 2)
+                .min(visible.len().saturating_sub(viewport))
+        };
+        let end = (start + viewport).min(visible.len());
+        (visible[start..end].to_vec(), pos, start)
+    };
+    app.table_state.select(Some(selected_pos.saturating_sub(slice_start)));
+    app.table_rect = table_area;
+    app.table_slice = (slice_start, slice_start + slice.len());
 
     let mut rows = Vec::new();
     if app.hosts.is_empty() {
         rows.push(Row::new(vec![
             Cell::from(Span::styled("No hosts — press 'a' to add one", Style::default().fg(theme.inactive_fg))),
-            Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""),
+            Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""),
         ]));
     } else {
-        let visible_rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode, app.search.as_deref(), &app.collapsed);
-        for row in visible_rows {
-            match row.kind {
-                RowKind::GroupHeader { name, collapsed, hidden } => rows.push(render_group_header(&name, &app.hosts, &theme, collapsed, hidden, app.sort_mode != SortMode::Group)),
+        let show_counts = app.sort_mode != SortMode::Group;
+        let graph_width = app.config.graph_width;
+        for row in &slice {
+            match &row.kind {
+                RowKind::GroupHeader { name, collapsed, hidden } => rows.push(render_group_header(name, &app.hosts, &theme, *collapsed, *hidden, show_counts)),
                 RowKind::Host => {
                     let idx = row.host_idx.unwrap();
-                    rows.push(render_host_row(&app.hosts[idx], idx == app.selected_idx, &theme, app.config.graph_width));
+                    let is_sel = idx == app.selected_idx;
+                    let (muted, suppressed) = {
+                        let h = &app.hosts[idx];
+                        (h.muted(), !h.up && is_suppressed(&app.hosts, &h.name))
+                    };
+                    let host_name = app.hosts[idx].name.clone();
+                    let sla = {
+                        let summary = cached_history_summary(&mut app.history_cache, &host_name, HistoryRange::Hours24);
+                        if summary.total == 0 { None } else { Some(summary.uptime_pct) }
+                    };
+                    rows.push(render_host_row(&app.hosts[idx], is_sel, &theme, graph_width, muted, suppressed, sla));
                 }
             }
         }
@@ -1395,12 +1795,13 @@ fn ui(frame: &mut Frame, app: &mut App) {
 
     let table = Table::new(rows, [
         Constraint::Length(18),
-        Constraint::Length(18),
+        Constraint::Length(ip_w),
         Constraint::Length(8),
         Constraint::Length(10),
         Constraint::Length(6),
         Constraint::Length(9),
-        Constraint::Length(10),
+        Constraint::Length(8),
+        Constraint::Length(group_w),
         Constraint::Length(app.config.graph_width as u16),
     ])
     .header(header)
@@ -1678,8 +2079,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
         }
-        InputMode::HistoryView { host_idx, range } => {
-            let popup_area = centered_rect(72, 46, area);
+        InputMode::HistoryView { host_idx, range, compare_idx } => {
+            let tall = compare_idx.is_some();
+            let popup_area = centered_rect(74, if tall { 66 } else { 48 }, area);
             let host_name = app.hosts.get(host_idx).map(|h| h.name.clone()).unwrap_or_default();
             let name = app.hosts.get(host_idx).map(|h| h.display_name()).unwrap_or_default();
             let summary = cached_history_summary(&mut app.history_cache, &host_name, range);
@@ -1730,29 +2132,22 @@ fn ui(frame: &mut Frame, app: &mut App) {
             lines.push(Line::from(""));
 
             // Timeline, newest bucket on the left to match the main strip.
-            lines.push(Line::from(Span::styled("timeline (green = up, red = down)", Style::default().fg(theme.inactive_fg))));
-            let timeline_width = (popup_area.width as usize).saturating_sub(6).min(summary.buckets.len());
-            let start = summary.buckets.len().saturating_sub(timeline_width);
-            let mut timeline_spans: Vec<Span> = Vec::new();
-            for (i, &up) in summary.buckets.iter().skip(start).rev().enumerate() {
-                if i > 0 { timeline_spans.push(Span::raw(" ")); }
-                if up {
-                    timeline_spans.push(Span::styled("▓", Style::default().fg(theme.status_good)));
-                } else {
-                    timeline_spans.push(Span::styled("▓", Style::default().fg(theme.status_danger)));
-                }
+            lines.extend(timeline_lines(&theme, &summary, range, popup_area.width as usize));
+            // Side-by-side compare against a second host (Tab cycles target).
+            if let Some(c_idx) = compare_idx.and_then(|c| app.hosts.get(c).map(|h| (c, h.name.clone(), h.display_name()))) {
+                let (c_idx, c_name, c_display) = c_idx;
+                let _ = c_idx;
+                let c_summary = cached_history_summary(&mut app.history_cache, &c_name, range);
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("vs ", Style::default().fg(theme.inactive_fg)),
+                    Span::styled(c_display, Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {:.2}% up", c_summary.uptime_pct), Style::default().fg(theme.graph_text)),
+                ]));
+                lines.extend(timeline_lines(&theme, &c_summary, range, popup_area.width as usize));
             }
-            lines.push(Line::from(timeline_spans));
-            let row_w = if timeline_width > 0 { timeline_width * 2 - 1 } else { 0 };
-            let ago_label = format!("{} ago", range.label());
-            let gap = row_w.saturating_sub(3 + ago_label.chars().count()).max(1);
-            lines.push(Line::from(vec![
-                Span::styled("now", Style::default().fg(theme.inactive_fg)),
-                Span::raw(" ".repeat(gap)),
-                Span::styled(ago_label, Style::default().fg(theme.inactive_fg)),
-            ]));
             lines.push(Line::from(""));
-            lines.push(Line::from("[←/→] change range   [Esc/h] close").style(Style::default().fg(theme.inactive_fg)));
+            lines.push(Line::from("[←/→] range   [Tab] compare   [Esc/h] close").style(Style::default().fg(theme.inactive_fg)));
 
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
@@ -1816,6 +2211,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ("/", "search"),
                 ("?", "keys"),
                 ("Enter", "collapse group"),
+                ("!", "mute 1h"),
+                ("v", "compact"),
                 ("t", "theme"),
                 ("u", "update"),
                 ("q", "quit"),
@@ -1849,9 +2246,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
         }
         InputMode::KeysHelp => {
             let sections: Vec<(&str, Vec<(&str, &str)>)> = vec![
-                ("navigate", vec![("↑/↓", "select"), ("Enter", "collapse group"), ("g", "grouped/flat")]),
-                ("hosts", vec![("a", "add"), ("e", "edit"), ("d", "delete"), ("c", "clear stats")]),
-                ("inspect", vec![("h", "history"), ("s", "view/sort"), ("f", "filter group"), ("/", "search")]),
+                ("navigate", vec![("↑/↓", "select"), ("Enter", "collapse group"), ("g", "grouped/flat"), ("v", "compact")]),
+                ("hosts", vec![("a", "add"), ("e", "edit"), ("d", "delete"), ("c", "clear stats"), ("!", "mute 1h")]),
+                ("inspect", vec![("h", "history"), ("Tab", "compare"), ("s", "view/sort"), ("f", "filter group"), ("/", "search")]),
                 ("run", vec![("Space/p", "ping now"), ("i", "import csv"), ("E", "export csv")]),
                 ("app", vec![("t", "theme"), ("u", "update"), ("M", "menu"), ("?", "this help"), ("q", "quit"), ("Esc", "reset view")]),
             ];
@@ -1909,6 +2306,50 @@ fn ui(frame: &mut Frame, app: &mut App) {
         InputMode::Search { .. } | InputMode::Normal => {}
     }
 
+    // First-run wizard: empty host list gets import/add/seed choices.
+    if app.hosts.is_empty()
+        && !app.wizard_dismissed
+        && matches!(app.input_mode, InputMode::Normal)
+    {
+        let popup_area = centered_rect(58, 40, area);
+        let popup = Paragraph::new(Text::from(vec![
+            Line::from(""),
+            Line::from("No hosts yet — get started:").style(
+                Style::default().fg(theme.title).add_modifier(Modifier::BOLD),
+            ),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ▶ ", Style::default().fg(theme.hi_fg)),
+                Span::styled("[i] ", Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
+                Span::styled("import hosts.csv", Style::default().fg(theme.main_fg)),
+            ]),
+            Line::from(vec![
+                Span::styled("  ▶ ", Style::default().fg(theme.hi_fg)),
+                Span::styled("[a] ", Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
+                Span::styled("add your first host", Style::default().fg(theme.main_fg)),
+            ]),
+            Line::from(vec![
+                Span::styled("  ▶ ", Style::default().fg(theme.hi_fg)),
+                Span::styled("[d] ", Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
+                Span::styled("seed the demo set (8.8.8.8, 1.1.1.1, …)", Style::default().fg(theme.main_fg)),
+            ]),
+            Line::from(""),
+            Line::from("[i/a/d] choose   [Esc] dismiss").style(Style::default().fg(theme.inactive_fg)),
+        ]))
+        .alignment(Alignment::Left)
+        .block(
+            Block::default()
+                .title(accent_title("welcome", &theme))
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.box_color))
+                .style(Style::default().bg(theme.popup_bg)),
+        );
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(popup, popup_area);
+    }
+
     // Update / info overlay (shown on top of any input mode).
     if !matches!(app.update_state, UpdateState::Idle) {
         let popup_area = centered_rect(56, 34, area);
@@ -1945,36 +2386,114 @@ fn ui(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn spawn_worker(tx: mpsc::Sender<Message>, hosts: Arc<RwLock<Vec<HostSchedule>>>, timeout_ms: u64, shutdown: Arc<AtomicBool>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let re = Regex::new(r"time[<=]([\d.]+)\s*ms").unwrap();
-        while !shutdown.load(Ordering::Relaxed) {
-            let now = Instant::now();
-            let due = { hosts.read().unwrap().iter().min_by_key(|h| h.next_ping).cloned() };
-            if let Some(host) = due {
-                let wait = host.next_ping.saturating_duration_since(now);
-                if wait.is_zero() {
-                    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                    let (up, latency_ms) = check_host(&host.name, host.port, timeout_ms, &re);
-                    let interval_secs = host.interval_secs;
-                    let next_ping = Instant::now() + Duration::from_secs(interval_secs) + host_jitter(&host.name, interval_secs);
-                    if let Ok(mut list) = hosts.write() {
-                        if let Some(h) = list.iter_mut().find(|h| h.name == host.name) {
-                            h.next_ping = next_ping;
-                        }
+/// Parallel check pool: 16 workers drain due hosts concurrently instead of
+/// one-at-a-time. A down host still costs its full timeout, but it no longer
+/// blocks every host behind it. Deliberately fork-based (no raw sockets), so
+/// no root/CAP_NET_RAW is ever required.
+const WORKER_POOL_SIZE: usize = 16;
+
+struct CheckJob {
+    name: String,
+    port: Option<u16>,
+    check_cmd: Option<String>,
+    timeout_ms: u64,
+    interval_secs: u64,
+}
+
+fn spawn_worker_pool(
+    tx: mpsc::Sender<Message>,
+    hosts: Arc<RwLock<Vec<HostSchedule>>>,
+    timeout_ms: u64,
+    shutdown: Arc<AtomicBool>,
+) -> Vec<thread::JoinHandle<()>> {
+    let (job_tx, job_rx) = mpsc::channel::<CheckJob>();
+    let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
+    let mut handles = Vec::with_capacity(WORKER_POOL_SIZE + 1);
+
+    // Workers: one compiled regex each, loop until the job channel closes.
+    for _ in 0..WORKER_POOL_SIZE {
+        let tx = tx.clone();
+        let hosts = hosts.clone();
+        let job_rx = job_rx.clone();
+        handles.push(thread::spawn(move || {
+            let re = Regex::new(r"time[<=]([\d.]+)\s*ms").unwrap();
+            loop {
+                let job = { job_rx.lock().unwrap().recv() };
+                let job = match job {
+                    Ok(j) => j,
+                    Err(_) => break, // scheduler gone: shut down
+                };
+                let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                let (up, latency_ms) =
+                    check_host(&job.name, job.port, job.check_cmd.as_deref(), job.timeout_ms, &re);
+                let next_ping = Instant::now()
+                    + Duration::from_secs(job.interval_secs)
+                    + host_jitter(&job.name, job.interval_secs);
+                if let Ok(mut list) = hosts.write() {
+                    if let Some(h) = list.iter_mut().find(|h| h.name == job.name) {
+                        h.next_ping = next_ping;
+                        h.inflight = false;
                     }
-                    // Channel closed means the UI already quit; stop.
-                    if tx.send(Message::Result { host: host.name, up, latency_ms, timestamp, next_ping }).is_err() {
+                }
+                // Channel closed means the UI already quit; stop.
+                if tx
+                    .send(Message::Result {
+                        host: job.name,
+                        up,
+                        latency_ms,
+                        timestamp,
+                        next_ping,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    // Scheduler: every 100ms, dispatch each due host exactly once.
+    // The inflight flag prevents overlap when a check outlasts its interval.
+    {
+        let hosts = hosts.clone();
+        let shutdown = shutdown.clone();
+        handles.push(thread::spawn(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                let due: Vec<CheckJob> = {
+                    let mut list = hosts.write().unwrap();
+                    let mut due = Vec::new();
+                    let now = Instant::now();
+                    for h in list.iter_mut() {
+                        // Muted hosts are skipped entirely, not probed.
+                        // Expiry is evaluated here so checks resume on their own.
+                        let muted = h
+                            .muted_until
+                            .map_or(false, |until| until > crate::config::now_epoch());
+                        if muted || h.inflight || h.next_ping > now {
+                            continue;
+                        }
+                        h.inflight = true;
+                        due.push(CheckJob {
+                            name: h.name.clone(),
+                            port: h.port,
+                            check_cmd: h.check_cmd.clone(),
+                            timeout_ms,
+                            interval_secs: h.interval_secs,
+                        });
+                    }
+                    due
+                };
+                for job in due {
+                    if job_tx.send(job).is_err() {
                         break;
                     }
-                } else {
-                    thread::sleep(wait.min(Duration::from_millis(100)));
                 }
-            } else {
                 thread::sleep(Duration::from_millis(100));
             }
-        }
-    })
+        }));
+    }
+
+    handles
 }
 
 fn version_parts(v: &str) -> Vec<u32> {
@@ -2445,7 +2964,25 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('a') | KeyCode::Char('A') => {
                                 app.input_mode = InputMode::AddHost(AddHostForm::default());
                             }
-                            KeyCode::Char('d') | KeyCode::Char('D') => { if !app.hosts.is_empty() { app.input_mode = InputMode::ConfirmDelete; } }
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                if app.hosts.is_empty() {
+                                    // First-run wizard: seed the demo set.
+                                    let demo = Config::default();
+                                    for h in &demo.hosts {
+                                        app.add_host(
+                                            h.name.clone(),
+                                            h.effective_interval_secs(),
+                                            h.group.clone(),
+                                            h.alias.clone().unwrap_or_default(),
+                                            h.port,
+                                            &shared_hosts,
+                                        );
+                                    }
+                                    app.wizard_dismissed = true;
+                                } else {
+                                    app.input_mode = InputMode::ConfirmDelete;
+                                }
+                            }
                             KeyCode::Char('c') | KeyCode::Char('C') => {
                                 app.clear_selected_stats();
                                 app.update_state = UpdateState::Info("stats cleared for selected host".to_string());
@@ -2460,7 +2997,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             KeyCode::Char('h') | KeyCode::Char('H') => {
                                 if app.selected_idx < app.hosts.len() {
-                                    app.input_mode = InputMode::HistoryView { host_idx: app.selected_idx, range: HistoryRange::Hours24 };
+                                    app.input_mode = InputMode::HistoryView { host_idx: app.selected_idx, range: HistoryRange::Hours24, compare_idx: None };
                                 }
                             }
                             KeyCode::Char('i') | KeyCode::Char('I') => {
@@ -2532,8 +3069,20 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Enter => {
                                 app.toggle_collapse_selected();
                             }
+                            // ! mutes/unmutes the selected host for 1h.
+                            KeyCode::Char('!') => {
+                                app.toggle_mute_selected(&shared_hosts);
+                            }
+                            // v toggles compact table density.
+                            KeyCode::Char('v') | KeyCode::Char('V') => {
+                                app.compact = !app.compact;
+                                app.save_prefs();
+                            }
                             // Get out of any sort/filter: Esc restores the full host list.
                             KeyCode::Esc => {
+                                if app.hosts.is_empty() {
+                                    app.wizard_dismissed = true;
+                                }
                                 if app.sort_mode != SortMode::None || app.group_filter.is_some() {
                                     app.sort_mode = SortMode::None;
                                     app.group_filter = None;
@@ -2689,9 +3238,15 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.input_mode = InputMode::Normal;
                                     if !path.trim().is_empty() {
                                         let dir = std::path::Path::new(&path).to_path_buf();
-                                        match app.export_entries(&dir) {
-                                            Ok(dest) => app.update_state = UpdateState::Info(format!("exported to {}", dest.display())),
-                                            Err(e) => app.update_state = UpdateState::Error(format!("export failed: {}", e)),
+                                        let csv = app.export_entries(&dir);
+                                        let html = app.export_status_page(&dir);
+                                        match (csv, html) {
+                                            (Ok(c), Ok(h)) => app.update_state = UpdateState::Info(format!(
+                                                "exported\n{}\n{}",
+                                                c.display(),
+                                                h.display()
+                                            )),
+                                            (Err(e), _) | (_, Err(e)) => app.update_state = UpdateState::Error(format!("export failed: {}", e)),
                                         }
                                     }
                                 }
@@ -2700,7 +3255,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 _ => {}
                             }
                         }
-                        InputMode::HistoryView { host_idx, range } => {
+                        InputMode::HistoryView { host_idx, range, compare_idx } => {
                             match key.code {
                                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('h') | KeyCode::Char('H') => {
                                     app.input_mode = InputMode::Normal;
@@ -2708,12 +3263,26 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Left => {
                                     let idx = HistoryRange::ALL.iter().position(|&r| r == range).unwrap_or(1);
                                     let new_idx = if idx == 0 { HistoryRange::ALL.len() - 1 } else { idx - 1 };
-                                    app.input_mode = InputMode::HistoryView { host_idx, range: HistoryRange::ALL[new_idx] };
+                                    app.input_mode = InputMode::HistoryView { host_idx, range: HistoryRange::ALL[new_idx], compare_idx };
                                 }
                                 KeyCode::Right => {
                                     let idx = HistoryRange::ALL.iter().position(|&r| r == range).unwrap_or(1);
                                     let new_idx = (idx + 1) % HistoryRange::ALL.len();
-                                    app.input_mode = InputMode::HistoryView { host_idx, range: HistoryRange::ALL[new_idx] };
+                                    app.input_mode = InputMode::HistoryView { host_idx, range: HistoryRange::ALL[new_idx], compare_idx };
+                                }
+                                // Tab cycles a side-by-side compare target; a full
+                                // cycle back to the host itself turns it off.
+                                KeyCode::Tab => {
+                                    let n = app.hosts.len();
+                                    let next = match compare_idx {
+                                        None if n > 1 => Some((host_idx + 1) % n),
+                                        Some(c) => {
+                                            let nx = (c + 1) % n.max(1);
+                                            if nx == host_idx || n < 2 { None } else { Some(nx) }
+                                        }
+                                        _ => None,
+                                    };
+                                    app.input_mode = InputMode::HistoryView { host_idx, range, compare_idx: next };
                                 }
                                 _ => {}
                             }
@@ -2773,7 +3342,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('h') | KeyCode::Char('H') => {
                                     app.input_mode = if app.selected_idx < app.hosts.len() {
-                                        InputMode::HistoryView { host_idx: app.selected_idx, range: HistoryRange::Hours24 }
+                                        InputMode::HistoryView { host_idx: app.selected_idx, range: HistoryRange::Hours24, compare_idx: None }
                                     } else {
                                         InputMode::Normal
                                     };
@@ -2791,6 +3360,26 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Enter => {
                                     app.input_mode = InputMode::Normal;
                                     app.toggle_collapse_selected();
+                                }
+                                KeyCode::Char('!') => {
+                                    app.input_mode = InputMode::Normal;
+                                    app.toggle_mute_selected(&shared_hosts);
+                                }
+                                KeyCode::Char('v') | KeyCode::Char('V') => {
+                                    app.input_mode = InputMode::Normal;
+                                    app.compact = !app.compact;
+                                    app.save_prefs();
+                                }
+                                KeyCode::Char('t') | KeyCode::Char('T') => {
+                                    app.input_mode = InputMode::ThemePicker { original: app.theme_idx, selected: app.theme_idx };
+                                }
+                                KeyCode::Char('u') | KeyCode::Char('U') => {
+                                    app.input_mode = InputMode::Normal;
+                                    if app.update_available.is_some() {
+                                        app.update_state = UpdateState::Info("press u in the main view to install".to_string());
+                                    } else {
+                                        spawn_one_shot_update_check(tx.clone(), env!("CARGO_PKG_VERSION").to_string());
+                                    }
                                 }
                                 KeyCode::Char('g') => {
                                     app.input_mode = InputMode::Normal;
@@ -2901,6 +3490,33 @@ fn run_app<B: ratatui::backend::Backend>(
                 Event::Resize(_, _) => {
                     let _ = terminal.autoresize();
                 }
+                Event::Mouse(m) => {
+                    // Click-to-select + wheel scroll, normal view only.
+                    if !matches!(app.input_mode, InputMode::Normal) {
+                        continue;
+                    }
+                    match m.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let rel = m.row.saturating_sub(app.table_rect.y) as usize;
+                            // Skip block border + header row.
+                            if rel >= 2 {
+                                let (s, e) = app.table_slice;
+                                let i = s + rel - 2;
+                                if i < e {
+                                    let target = cached_visible_rows(app)
+                                        .get(i)
+                                        .and_then(|r| r.host_idx);
+                                    if let Some(idx) = target {
+                                        app.selected_idx = idx;
+                                    }
+                                }
+                            }
+                        }
+                        MouseEventKind::ScrollUp => move_selection_up(app),
+                        MouseEventKind::ScrollDown => move_selection_down(app),
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
@@ -2911,7 +3527,8 @@ fn run_app<B: ratatui::backend::Backend>(
                     app.last_check = timestamp.clone();
                     app.last_result_time = Some(Instant::now());
                     // Notify on transitions only (skip the very first result per host).
-                    let mut transition: Option<(String, bool, f64, String)> = None;
+                    // Suppressed (downstream-of-down-upstream) hosts stay silent.
+                    let mut transition: Option<(String, String, bool, f64, String)> = None;
                     if let Some(h) = app.hosts.iter_mut().find(|h| h.name == host) {
                         let first = h.total_checks == 0;
                         let changed = !first && up != h.up;
@@ -2920,7 +3537,13 @@ fn run_app<B: ratatui::backend::Backend>(
                         h.latency_ms = latency_ms;
                         h.next_ping = next_ping;
                         h.total_checks += 1;
-                        if up { h.up_checks += 1; }
+                        if up {
+                            h.up_checks += 1;
+                            h.down_since = None;
+                            h.escalation = 0;
+                        } else if h.down_since.is_none() {
+                            h.down_since = Some(Instant::now());
+                        }
                         let lat_u64 = if up { latency_ms.round() as u64 } else { 0 };
                         h.history.push_back(lat_u64);
                         while h.history.len() > app.config.graph_width {
@@ -2929,16 +3552,19 @@ fn run_app<B: ratatui::backend::Backend>(
                         let status = if up { "UP" } else { "DOWN" };
                         let _ = log_result(&timestamp, &h.name, status, latency_ms);
                         if changed {
-                            transition = Some((h.target(), up, latency_ms, timestamp.clone()));
+                            transition = Some((h.name.clone(), h.target(), up, latency_ms, timestamp.clone()));
                         }
                     }
-                    if let Some((target, up, latency_ms, timestamp)) = transition {
-                        if let Some(url) = app.config.webhook_url.clone() {
-                            post_webhook(url, target.clone(), up, latency_ms, timestamp);
-                        }
-                        if app.config.notify_bell && !up {
-                            print!("\x07");
-                            let _ = io::stdout().flush();
+                    if let Some((name, target, up, latency_ms, timestamp)) = transition {
+                        if !is_suppressed(&app.hosts, &name) {
+                            let event = if up { "up" } else { "down" };
+                            if let Some(url) = app.config.webhook_url.clone() {
+                                post_webhook(url, target.clone(), up, latency_ms, timestamp, event);
+                            }
+                            if app.config.notify_bell && !up {
+                                print!("\x07");
+                                let _ = io::stdout().flush();
+                            }
                         }
                     }
                 }
@@ -2962,6 +3588,41 @@ fn run_app<B: ratatui::backend::Backend>(
             let _ = trim_log(&mut app.hosts, app.config.graph_width);
             app.history_cache.clear();
         }
+
+        // Escalation ladder, evaluated every ~5s: still down after 5 min →
+        // `still_down_5m` webhook; after 30 min → bell + `still_down_30m`.
+        // Muted and suppressed (downstream-of-down) hosts stay silent.
+        if app.last_esc_check.elapsed() > Duration::from_secs(5) {
+            app.last_esc_check = Instant::now();
+            let now_ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let pending: Vec<(String, String, f64, u8)> = app
+                .hosts
+                .iter()
+                .filter(|h| !h.up && !h.muted() && h.total_checks > 0)
+                .filter_map(|h| {
+                    let mins = h.down_since.map(|t| t.elapsed().as_secs() / 60)?;
+                    let level = if mins >= 30 { 2 } else if mins >= 5 { 1 } else { 0 };
+                    if level > h.escalation && !is_suppressed(&app.hosts, &h.name) {
+                        Some((h.name.clone(), h.target(), h.latency_ms, level))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (name, target, latency_ms, level) in pending {
+                if let Some(h) = app.hosts.iter_mut().find(|h| h.name == name) {
+                    h.escalation = level;
+                }
+                let event = if level >= 2 { "still_down_30m" } else { "still_down_5m" };
+                if let Some(url) = app.config.webhook_url.clone() {
+                    post_webhook(url, target, false, latency_ms, now_ts.clone(), event);
+                }
+                if app.config.notify_bell && level >= 2 {
+                    print!("\x07");
+                    let _ = io::stdout().flush();
+                }
+            }
+        }
     }
 }
 
@@ -2978,7 +3639,7 @@ fn run_once(format: &str) -> io::Result<()> {
     for h in config.hosts.clone() {
         handles.push(thread::spawn(move || {
             let re = Regex::new(r"time[<=]([\d.]+)\s*ms").unwrap();
-            let (up, latency_ms) = check_host(&h.name, h.port, timeout_ms, &re);
+            let (up, latency_ms) = check_host(&h.name, h.port, h.check_cmd.as_deref(), timeout_ms, &re);
             (h, up, latency_ms)
         }));
     }
@@ -3059,19 +3720,20 @@ fn main() -> io::Result<()> {
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     stdout.execute(Hide)?;
+    stdout.execute(EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let config = Config::load();
     let mut hosts: Vec<HostState> = config.hosts.iter()
-        .map(|h| HostState::new(&h.name, h.effective_interval_secs(), &h.group, h.alias.clone(), h.port))
+        .map(HostState::new)
         .collect();
     seed_from_log(&mut hosts, config.graph_width)?;
 
     let shared_hosts = Arc::new(RwLock::new(schedules_from_config(&config.hosts)));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let worker = spawn_worker(tx.clone(), shared_hosts.clone(), config.timeout_ms, shutdown.clone());
+    let workers = spawn_worker_pool(tx.clone(), shared_hosts.clone(), config.timeout_ms, shutdown.clone());
     let update_checker = spawn_update_checker(tx.clone(), env!("CARGO_PKG_VERSION").to_string(), shutdown.clone());
 
     let themes = build_themes();
@@ -3083,7 +3745,15 @@ fn main() -> io::Result<()> {
         group_by: config.group_by,
         sort_mode: config.sort_mode,
         collapsed,
+        collapsed_rev: 0,
         search: None,
+        compact: config.compact,
+        wizard_dismissed: false,
+        last_esc_check: Instant::now(),
+        row_cache: Vec::new(),
+        row_key: RowKey::default(),
+        table_rect: Rect::default(),
+        table_slice: (0, 0),
         config,
         hosts,
         selected_idx: 0,
@@ -3098,13 +3768,25 @@ fn main() -> io::Result<()> {
         history_cache: HashMap::new(),
         last_trim: Instant::now(),
     };
+    // Session restore: re-select last session's host.
+    if let Some(sel) = app.config.selected.clone() {
+        if let Some(i) = app.hosts.iter().position(|h| h.name == sel) {
+            app.selected_idx = i;
+        }
+    }
 
     let result = run_app(&mut terminal, &mut app, tx, rx, shared_hosts, shutdown.clone());
+    // Persist session selection for next startup.
+    app.config.selected = app.hosts.get(app.selected_idx).map(|h| h.name.clone());
+    let _ = app.config.save();
     shutdown.store(true, Ordering::Relaxed);
-    let _ = worker.join();
+    for w in workers {
+        let _ = w.join();
+    }
     let _ = update_checker.join();
 
     disable_raw_mode()?;
+    execute!(terminal.backend_mut(), DisableMouseCapture)?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     execute!(terminal.backend_mut(), Show)?;
     terminal.show_cursor()?;

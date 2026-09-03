@@ -22,14 +22,20 @@ A pink little penguin face ((•O•)) watches over your network.
 **per-host intervals** and shows the results in a rolling, btop-style interface:
 
 * **Per-host intervals** — `30s`, `5m`, or `2h` per host, down to 5 seconds
-* **Ping or TCP** — ICMP ping by default, or set a port (`db.internal:5432`) for a connect check
+* **Ping, TCP, or custom commands** — ICMP by default, a port (`db:5432`) for connect checks, or any shell command (exit 0 = up)
+* **WARN state** — per-host latency thresholds turn slow-but-up hosts amber
 * **Per-host history strip** — `■` green blocks for up, red `_` for down, newest on the left
-* **Flap + flash** — flapping hosts read `FLAP`, fresh transitions flash underlined
+* **Flap + flash** — flapping hosts read `FLAP`, fresh transitions flash underlined, outages ticker `↓ 14m`
 * **Grouped view** with collapsible groups (`Enter`) and down-first ordering
 * **View picker** — order by down-first / up-first / name / group, or filter to **down only**
 * **`/` search** across names, aliases, and groups
-* **Notifications** — generic webhook POST plus optional terminal bell on up/down transitions
+* **24h SLA column** straight from the ping log
+* **Maintenance mutes** (`!` = 1h) and **upstream dependencies** that silence downstream noise
+* **Escalating alerts** — `still_down_5m` / `still_down_30m` webhooks plus bell
+* **Notifications** — generic webhook POST plus optional terminal bell on transitions
 * **Headless `--once` mode** — one pass over all hosts as text or JSON, exit code doubles as the probe result
+* **HTML status export** — one keypress renders a shareable status page
+* **Mouse support**, compact density (`v`), session restore, first-run wizard
 * **Multiple themes** — `btop`, `dracula`, `nord`, `gruvbox-dark`, `ayu-light`, `archwave`
 * **CSV bulk import** — dump your host list in a spreadsheet, import in one press
 * **Alias your IPs** — turn `1.1.1.1` into `Cloudflare`, `server3.internal` into `DB host`
@@ -62,10 +68,12 @@ gateway (`192.168.1.1`), and `google.com`.
 | `a` | add a host (single form) |
 | `e` | edit the selected host — name/IP/interval/group/alias/port in one form |
 | `d` | delete the selected host (confirmation popup) |
-| `h` | per-host history (8h / 24h / 7d) |
+| `h` | per-host history (8h / 24h / 7d, `Tab` compares a second host) |
 | `c` | clear stats for selected host |
+| `!` | mute/unmute selected host for 1h (maintenance) |
+| `v` | compact table density (hides IP + Group columns) |
 | `i` | **import from `hosts.csv`** — merge in bulk, new rows added, existing rows updated |
-| `E` | export host list to timestamped CSV |
+| `E` | export timestamped CSV **plus** an HTML status page |
 | `g` | toggle grouped/flat view |
 | `f` | filter by group (`Space` = show all, `Esc` = cancel) |
 | `s` | view picker — `off` / down-first / up-first / name / group / **down only** (`1-6` quick-pick, `Space` = show all) |
@@ -73,6 +81,7 @@ gateway (`192.168.1.1`), and `google.com`.
 | `Enter` | collapse/expand the selected host's group |
 | `/` | search names, aliases, groups (`Enter` keeps, `Esc` clears) |
 | `?` | full key-binding cheat sheet |
+| mouse | click to select, wheel to scroll |
 | `t` | theme picker (live preview, persists) |
 | `u` | check for updates / install when available |
 | `M` | full menu (actionable) |
@@ -96,17 +105,20 @@ Press `i` and the app prompts for a CSV path (defaulting to the `hosts.csv`
 in your config dir) and merges it — new rows added, existing rows updated:
 
 ```csv
-name,interval,group,alias,port
-8.8.8.8,1m,public-dns,Google DNS,
-1.1.1.1,2m,public-dns,Cloudflare,
-server3.internal,5m,router,Server 3,
-db.internal,30s,databases,Primary DB,5432
-192.168.1.1,3m,router,,
+name,interval,group,alias,port,warn_ms,check_cmd,depends_on
+8.8.8.8,1m,public-dns,Google DNS,,,,
+1.1.1.1,2m,public-dns,Cloudflare,,,,,
+server3.internal,5m,router,Server 3,,,,
+db.internal,30s,databases,Primary DB,5432,200,,
+web.internal,30s,web,Web,,500,,db.internal
+192.168.1.1,3m,router,,,,,
 ```
 
 Intervals accept `30s`/`5m`/`2h` (bare numbers mean minutes); a `port`
-turns the row into a TCP connect check instead of a ping. Legacy 4-column
-files without `port` still import fine.
+turns the row into a TCP connect check, `warn_ms` flags slow-but-up hosts
+amber, `check_cmd` runs a shell command instead (exit 0 = up), and
+`depends_on` names an upstream whose outage silences this host's alerts.
+Shorter legacy files still import fine — missing columns stay unset.
 
 New rows become new pings; existing rows get updated. Sync round-trips both
 ways — `hosts.csv` is also rewritten on every in-TUI change, so you can always
@@ -185,9 +197,15 @@ discarded.
 }
 ```
 
-- `webhook_url` — POSTs `{app, host, status, latency_ms, timestamp}` JSON
-  on every up/down transition (Slack-compatible shape).
-- `notify_bell` — rings the terminal bell on down-transitions.
+- `webhook_url` — POSTs `{app, host, status, event, latency_ms, timestamp}`
+  JSON on every up/down transition (Slack-compatible shape), plus
+  `still_down_5m` / `still_down_30m` escalation events for long outages.
+- `notify_bell` — rings the terminal bell on down-transitions (and again
+  at the 30-minute escalation).
+
+Downstream hosts with `depends_on` pointing at a down upstream read `DEP`
+and stay silent — fix the upstream, not the noise. `!` mutes a host for an
+hour of maintenance (countdown in the Latency column, excluded from tallies).
 
 ### Headless mode
 

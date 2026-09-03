@@ -17,6 +17,12 @@ pub struct HostSchedule {
     pub port: Option<u16>,
     pub interval_secs: u64,
     pub next_ping: Instant,
+    /// Set while a worker owns this host; prevents overlapping checks.
+    pub inflight: bool,
+    /// Mute window end (unix secs). Evaluated at dispatch so expiry
+    /// resumes checks without any rebuild.
+    pub muted_until: Option<i64>,
+    pub check_cmd: Option<String>,
 }
 
 pub fn host_jitter(name: &str, interval_secs: u64) -> Duration {
@@ -40,6 +46,9 @@ pub fn schedules_from_config(hosts: &[HostConfig]) -> Vec<HostSchedule> {
                 port: h.port,
                 interval_secs,
                 next_ping: now + host_jitter(&h.name, interval_secs),
+                inflight: false,
+                muted_until: h.muted_until,
+                check_cmd: h.check_cmd.clone(),
             }
         })
         .collect()
@@ -90,22 +99,83 @@ pub fn tcp_check(host: &str, port: u16, timeout_ms: u64) -> (bool, f64) {
     (false, 0.0)
 }
 
-/// Route a check: TCP when the host has a port, ICMP ping otherwise.
-pub fn check_host(host: &str, port: Option<u16>, timeout_ms: u64, re: &Regex) -> (bool, f64) {
+/// Custom shell check: exit 0 = up, wall-clock time = latency.
+/// Killed at `timeout_ms`; timeout counts as down.
+pub fn cmd_check(cmd: &str, timeout_ms: u64) -> (bool, f64) {
+    let timeout = Duration::from_millis(timeout_ms.max(500));
+    let start = Instant::now();
+    let mut child = match shell_command(cmd).spawn() {
+        Ok(c) => c,
+        Err(_) => return (false, 0.0),
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                return (status.success(), ms);
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return (false, 0.0);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return (false, 0.0),
+        }
+    }
+}
+
+fn shell_command(cmd: &str) -> Command {
+    if cfg!(target_os = "windows") {
+        let mut c = Command::new("cmd");
+        c.args(["/C", cmd]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    }
+}
+
+/// Route a check: custom command first, then TCP when a port is set,
+/// otherwise ICMP ping.
+pub fn check_host(
+    host: &str,
+    port: Option<u16>,
+    check_cmd: Option<&str>,
+    timeout_ms: u64,
+    re: &Regex,
+) -> (bool, f64) {
+    if let Some(cmd) = check_cmd.filter(|c| !c.trim().is_empty()) {
+        return cmd_check(cmd, timeout_ms);
+    }
     match port {
         Some(p) => tcp_check(host, p, timeout_ms),
         None => ping_host(host, timeout_ms, re),
     }
 }
 
-/// Fire-and-forget webhook POST on up/down transitions. Never blocks the UI.
-pub fn post_webhook(url: String, host: String, up: bool, latency_ms: f64, timestamp: String) {
+/// Fire-and-forget webhook POST on transitions and escalations.
+/// `event` is e.g. "down", "up", "still_down_5m", "still_down_30m".
+/// Never blocks the UI.
+pub fn post_webhook(
+    url: String,
+    host: String,
+    up: bool,
+    latency_ms: f64,
+    timestamp: String,
+    event: &str,
+) {
+    let event = event.to_string();
     std::thread::spawn(move || {
         let status = if up { "up" } else { "down" };
         let body = serde_json::json!({
             "app": "ping-uin",
             "host": host,
             "status": status,
+            "event": event,
             "latency_ms": latency_ms,
             "timestamp": timestamp,
         })
@@ -140,6 +210,17 @@ mod tests {
         assert_eq!(sched.len(), 1);
         assert_eq!(sched[0].interval_secs, 30);
         assert_eq!(sched[0].port, Some(5432));
+    }
+
+    #[test]
+    fn cmd_check_true_is_up_false_is_down() {
+        let (up, ms) = cmd_check("true", 2000);
+        assert!(up);
+        assert!(ms < 2000.0);
+        let (up, _) = cmd_check("false", 2000);
+        assert!(!up);
+        let (up, _) = cmd_check("exit 3", 2000);
+        assert!(!up);
     }
 
     #[test]
