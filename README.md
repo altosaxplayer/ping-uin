@@ -21,11 +21,11 @@ A pink little penguin face ((•O•)) watches over your network.
 `ping-uin` is a lightweight TUI that pings your devices on **per-host intervals**
 and shows the results in a rolling, btop-style interface:
 
-* **Per-host intervals** — one host can ping every minute, another every 30
-* **Per-host history strip** — `■` green blocks for up, red `_` for down
-* **Grouped view** with collapse/expand + down-first ordering
+* **Per-host intervals** — one host can ping every minute, another every 30 minutes
+* **Per-host history strip** — `■` green blocks for up, red `_` for down, newest on the left
+* **Grouped view** with down-first ordering inside each group
 * **View picker** — order by down-first / up-first / name / group, or filter to **down only**
-* **Multiple themes** — `btop`, `dracula`, `nord`, `gruvbox-dark`
+* **Multiple themes** — `btop`, `dracula`, `nord`, `gruvbox-dark`, `ayu-light`, `archwave`
 * **CSV bulk import** — dump your host list in a spreadsheet, import in one press
 * **Alias your IPs** — turn `1.1.1.1` into `Cloudflare`, `server3.internal` into `DB host`
 
@@ -38,13 +38,13 @@ or anything else you'd rather not drop into a heavy dashboard for.
 
 ```bash
 # clone, build, run
-cargo install --path .   # builds 'ip-top' binary
+cargo install --path .   # builds the 'ping-uin' binary
 cargo run --release      # or just run it straight
 ```
 
-A starter `ip-top.json` is seeded the first time you launch, so it works even
-before you add any config. The starter set ships with a few public IP records
-(Google DNS, Cloudflare, google.com).
+A starter host set is built in on first launch, so it works even before you
+add any config: Google DNS (`8.8.8.8`), Cloudflare (`1.1.1.1`), your local
+gateway (`192.168.1.1`), and `google.com`.
 
 ---
 
@@ -63,7 +63,7 @@ before you add any config. The starter set ships with a few public IP records
 | `E` | export host list to timestamped CSV |
 | `g` | toggle grouped/flat view |
 | `f` | filter by group (`Space` = show all, `Esc` = cancel) |
-| `s` | view picker — `off` / down-first / up-first / name / group / **down only** |
+| `s` | view picker — `off` / down-first / up-first / name / group / **down only** (`1-6` quick-pick) |
 | `t` | theme picker (live preview, persists) |
 | `u` | check for updates / install when available |
 | `M` | full menu (actionable) |
@@ -80,7 +80,8 @@ before you add any config. The starter set ships with a few public IP records
 
 ## CSV bulk import
 
-Press `i` and the app merges whatever is in `hosts.csv` next to the binary:
+Press `i` and the app prompts for a CSV path (defaulting to the `hosts.csv`
+in your config dir) and merges it — new rows added, existing rows updated:
 
 ```csv
 name,interval_m,group,alias
@@ -166,7 +167,7 @@ Fully AI-created, evolving in chat-driven sessions:
 
 1. Old PowerShell loop → Python + `rich` live table
 2. Re-written in `Rust` + `ratatui` with real-time updates
-3. Themes, grouping, alerts, CSV bulk import, etc., added iteratively
+3. Themes, grouping, view picker, CSV bulk import, self-updates, etc., added iteratively
 
 No human review was involved. If anything weird happens, open an issue and
 the next AI watch-commander will fix it. Probably.

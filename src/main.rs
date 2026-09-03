@@ -136,7 +136,7 @@ impl Default for Config {
         Config {
             hosts: vec![
                 HostConfig::new("8.8.8.8", 1, "external", None),
-                HostConfig::new("1.1.1.1", 2, "external", Some("Google".to_string())),
+                HostConfig::new("1.1.1.1", 2, "external", Some("Cloudflare".to_string())),
                 HostConfig::new("192.168.1.1", 2, "router", None),
                 HostConfig::new("google.com", 2, "external", None),
             ],
