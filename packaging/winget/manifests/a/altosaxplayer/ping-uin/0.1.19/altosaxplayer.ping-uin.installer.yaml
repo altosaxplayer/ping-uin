@@ -1,0 +1,16 @@
+# Created manually for ping-uin v0.1.19
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+
+PackageIdentifier: altosaxplayer.ping-uin
+PackageVersion: 0.1.19
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: ping-uin.exe
+    PortableCommandAlias: ping-uin
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/altosaxplayer/ping-uin/releases/download/v0.1.19/ping-uin-windows-x86_64.zip
+    InstallerSha256: 01552D01EDCC8691A3EB469DAE174E1F56C745BC9EF240F773C1EFED98EB5887
+ManifestType: installer
+ManifestVersion: 1.6.0
