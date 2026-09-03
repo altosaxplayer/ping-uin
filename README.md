@@ -18,8 +18,8 @@ A pink little penguin face ((•O•)) watches over your network.
 
 ## What it is
 
-`ping-uin` is a lightweight TUI that pings your devices on **per-host intervals**
-and shows the results in a rolling, btop-style interface:
+`ping-uin` is a lightweight TUI that pings (or TCP-checks) your devices on
+**per-host intervals** and shows the results in a rolling, btop-style interface:
 
 * **Per-host intervals** — `30s`, `5m`, or `2h` per host, down to 5 seconds
 * **Ping or TCP** — ICMP ping by default, or set a port (`db.internal:5432`) for a connect check
@@ -60,7 +60,7 @@ gateway (`192.168.1.1`), and `google.com`.
 | `↑` / `↓` | move selection |
 | `Space` / `p` | ping selected host now |
 | `a` | add a host (single form) |
-| `e` | edit the selected host — name/IP/group/alias in one form |
+| `e` | edit the selected host — name/IP/interval/group/alias/port in one form |
 | `d` | delete the selected host (confirmation popup) |
 | `h` | per-host history (8h / 24h / 7d) |
 | `c` | clear stats for selected host |
@@ -116,7 +116,9 @@ edit it by hand and import.
 
 ## Data & privacy
 
-Everything **stays local**, never sent anywhere.
+Everything **stays local** by default. Two features intentionally talk to
+the network: the release checker (GitHub API, every 15 min) and the optional
+`webhook_url` you configure yourself for transition alerts.
 
 ### Default location
 
@@ -143,7 +145,7 @@ touch ping-uin.portable
 New-Item -ItemType File -Name ping-uin.portable
 ```
 
-On the next launch, `ip-top.json`, `hosts.csv`, and `uptime-log.csv` will be
+On the next launch, `ping-uin.json`, `hosts.csv`, and `uptime-log.csv` will be
 read from and written to that same directory instead of the system config path.
 
 ### In-place updates

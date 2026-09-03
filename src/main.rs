@@ -986,7 +986,7 @@ fn render_host_row(h: &HostState, is_selected: bool, theme: &Theme, graph_width:
     ]).style(row_style)
 }
 
-fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme, collapsed: bool, hidden: usize) -> Row<'static> {
+fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme, collapsed: bool, hidden: usize, show_counts: bool) -> Row<'static> {
     // In flat-sort-by-status mode the pseudo-group is "Down" / "Up".
     let is_status_label = group == "Down" || group == "Up";
     let indices: Vec<usize> = hosts.iter().enumerate()
@@ -1008,7 +1008,9 @@ fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme, collapse
         Span::styled(group.to_string(), Style::default().fg(label_fg).add_modifier(Modifier::BOLD)),
         Span::styled(" ── ", Style::default().fg(theme.divider)),
     ];
-    if !is_status_label {
+    // Group sort hides the up/down tallies — the ordering already groups
+    // them, so the counts are noise.
+    if !is_status_label && show_counts {
         if up > 0 {
             spans.push(Span::styled(format!("{} up", up), Style::default().fg(theme.status_good)));
             spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
@@ -1382,7 +1384,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         let visible_rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode, app.search.as_deref(), &app.collapsed);
         for row in visible_rows {
             match row.kind {
-                RowKind::GroupHeader { name, collapsed, hidden } => rows.push(render_group_header(&name, &app.hosts, &theme, collapsed, hidden)),
+                RowKind::GroupHeader { name, collapsed, hidden } => rows.push(render_group_header(&name, &app.hosts, &theme, collapsed, hidden, app.sort_mode != SortMode::Group)),
                 RowKind::Host => {
                     let idx = row.host_idx.unwrap();
                     rows.push(render_host_row(&app.hosts[idx], idx == app.selected_idx, &theme, app.config.graph_width));
