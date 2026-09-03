@@ -34,7 +34,7 @@ To submit or update the manifest in `microsoft/winget-pkgs`:
 
 ```powershell
 wingetcreate new \
-    https://github.com/altosaxplayer/ping-uin/releases/download/v0.1.16/ping-uin-windows-x86_64.zip
+    https://github.com/altosaxplayer/ping-uin/releases/download/v0.1.17/ping-uin-windows-x86_64.zip
 ```
 
 Or use the pre-generated manifest files in `packaging/winget/manifests/`
