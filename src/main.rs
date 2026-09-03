@@ -1,6 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::time::SystemTime;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -115,11 +116,24 @@ impl HostConfig {
     }
 }
 
+fn default_theme_name() -> String { "btop".to_string() }
+fn default_down_streak() -> usize { 3 }
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Config {
     hosts: Vec<HostConfig>,
     timeout_ms: u64,
     graph_width: usize,
+    #[serde(default = "default_theme_name")]
+    theme: String,
+    #[serde(default)]
+    group_by: bool,
+    #[serde(default)]
+    sort_mode: SortMode,
+    #[serde(default)]
+    alerts: bool,
+    #[serde(default = "default_down_streak")]
+    down_streak: usize,
 }
 
 impl Default for Config {
@@ -133,6 +147,11 @@ impl Default for Config {
             ],
             timeout_ms: DEFAULT_TIMEOUT_MS,
             graph_width: DEFAULT_GRAPH_WIDTH,
+            theme: default_theme_name(),
+            group_by: false,
+            sort_mode: SortMode::None,
+            alerts: false,
+            down_streak: default_down_streak(),
         }
     }
 }
@@ -168,13 +187,32 @@ impl Config {
                 hosts,
                 timeout_ms: value.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_TIMEOUT_MS),
                 graph_width: value.get("graph_width").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_GRAPH_WIDTH as u64) as usize,
+                theme: value.get("theme").and_then(|v| v.as_str()).unwrap_or("btop").to_string(),
+                group_by: value.get("group_by").and_then(|v| v.as_bool()).unwrap_or(false),
+                sort_mode: value.get("sort_mode").and_then(|v| v.as_str()).and_then(|s| match s {
+                    "down_first" | "down first" | "down-first" => Some(SortMode::DownFirst),
+                    "up_first" | "up first" | "up-first" => Some(SortMode::UpFirst),
+                    "name" => Some(SortMode::Name),
+                    _ => Some(SortMode::None),
+                }).unwrap_or(SortMode::None),
+                alerts: value.get("alerts").and_then(|v| v.as_bool()).unwrap_or(false),
+                down_streak: value.get("down_streak").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
             };
         }
+        // Corrupt config: back it up instead of silently discarding user data.
+        let backup = paths().config.with_extension("json.corrupt");
+        let _ = fs::write(&backup, &text);
         Self::default()
     }
 
     fn save(&self) -> io::Result<()> {
-        fs::write(&paths().config, serde_json::to_string_pretty(self).unwrap())
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        // Atomic-ish write: temp file + rename so a crash can't truncate config.
+        let tmp = paths().config.with_extension("json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(&tmp, &paths().config)?;
+        Ok(())
     }
 }
 
@@ -313,6 +351,7 @@ fn build_themes() -> Vec<Theme> {
     ]
 }
 
+#[derive(Clone)]
 struct HostState {
     name: String,
     alias: Option<String>,
@@ -365,7 +404,7 @@ struct AddHostForm {
     focus: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 enum HistoryRange {
     Hours8,
     Hours24,
@@ -415,8 +454,9 @@ enum InputMode {
 }
 
 /// Sort applied within the host list (flat view) and inside each group (grouped view).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 enum SortMode {
+    #[default]
     None,
     DownFirst,
     UpFirst,
@@ -461,6 +501,7 @@ enum UpdateState {
     Downloading { version: String },
     Replacing { version: String },
     Error(String),
+    Info(String),
     Done { version: String, restart_required: bool },
 }
 
@@ -481,6 +522,8 @@ struct App {
     last_check: String,
     last_result_time: Option<Instant>,
     restart_after_exit: bool,
+    history_cache: HashMap<(String, HistoryRange), (Option<SystemTime>, HistorySummary)>,
+    last_trim: Instant,
 }
 
 impl App {
@@ -606,6 +649,39 @@ impl App {
             self.persist();
             if let Ok(mut h) = shared_hosts.write() {
                 *h = schedules_from_config(&self.config.hosts);
+            }
+        }
+    }
+
+    /// Copy runtime UI prefs into config and save (theme/group/sort/alerts).
+    fn save_prefs(&mut self) {
+        self.config.theme = self.themes.get(self.theme_idx).map(|t| t.name.to_string()).unwrap_or_else(|| "btop".to_string());
+        self.config.group_by = self.group_by;
+        self.config.sort_mode = self.sort_mode;
+        self.config.alerts = self.alerts;
+        let _ = self.config.save();
+    }
+
+    fn clear_selected_stats(&mut self) {
+        if let Some(h) = self.hosts.get_mut(self.selected_idx) {
+            h.total_checks = 0;
+            h.up_checks = 0;
+            h.history.clear();
+            h.up = false;
+            h.latency_ms = 0.0;
+        }
+        self.history_cache.clear();
+    }
+
+    /// Force the selected host to ping ASAP by resetting its schedule.
+    fn ping_selected_now(&self, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
+        let name = match self.hosts.get(self.selected_idx) {
+            Some(h) => h.name.clone(),
+            None => return,
+        };
+        if let Ok(mut list) = shared_hosts.write() {
+            if let Some(s) = list.iter_mut().find(|s| s.name == name) {
+                s.next_ping = Instant::now();
             }
         }
     }
@@ -804,6 +880,30 @@ fn history_summary(host: &str, range: HistoryRange) -> HistorySummary {
     }
 
     HistorySummary { total, up, down, uptime_pct, avg_latency_ms, last_down, buckets }
+}
+
+fn log_mtime() -> Option<SystemTime> {
+    fs::metadata(&paths().log).and_then(|m| m.modified()).ok()
+}
+
+/// Cached wrapper: only re-parses uptime-log.csv when the file changed.
+/// Called every frame while HistoryView is open, so caching avoids a full
+/// CSV scan + sort at 20fps.
+fn cached_history_summary(
+    cache: &mut HashMap<(String, HistoryRange), (Option<SystemTime>, HistorySummary)>,
+    host: &str,
+    range: HistoryRange,
+) -> HistorySummary {
+    let mtime = log_mtime();
+    let key = (host.to_string(), range);
+    if let Some((cached_mtime, summary)) = cache.get(&key) {
+        if *cached_mtime == mtime {
+            return summary.clone();
+        }
+    }
+    let summary = history_summary(host, range);
+    cache.insert(key, (mtime, summary.clone()));
+    summary
 }
 
 fn render_graph(history: &VecDeque<u64>, theme: &Theme, width: usize) -> Text<'static> {
@@ -1065,6 +1165,75 @@ fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme) -> Row<'
     ]).style(Style::default().bg(theme.main_bg))
 }
 
+/// Full footer menu. Always rendered in full — the layout wraps it to as
+/// many rows as the terminal width requires (see `build_footer_lines`).
+fn footer_hints(update_available: bool) -> Vec<(&'static str, &'static str)> {
+    let hints = vec![
+        ("↑/↓", "select"),
+        ("Space", "ping now"),
+        ("a", "add"),
+        ("d", "delete"),
+        ("e", "edit"),
+        ("h", "history"),
+        ("c", "clear stats"),
+        ("i", "import"),
+        ("E", "export"),
+        ("g", "group"),
+        ("f", "filter"),
+        ("s", "sort"),
+        ("x", "down box"),
+        ("t", "theme"),
+        ("u", "update"),
+        ("q", "quit"),
+    ];
+    let _ = update_available;
+    hints
+}
+
+fn hint_cell_width(key: &str, label: &str) -> usize {
+    // Rendered as `[key] label ` plus one leading space.
+    format!("[{}] {} ", key, label).chars().count() + 1
+}
+
+/// Greedy word-aware wrap: hints never split mid-hint, rows fill `max_width`.
+/// Guarantees every option stays visible at any window size.
+fn build_footer_lines(theme: &Theme, update_available: Option<&str>, max_width: usize) -> Vec<Line<'static>> {
+    let max_width = max_width.max(20);
+    let hints = footer_hints(update_available.is_some());
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = vec![
+        Span::styled(" menu ", Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
+    ];
+    let mut used = " menu ".chars().count();
+    for (k, l) in hints {
+        let w = hint_cell_width(k, l);
+        if used + w > max_width && used > 0 {
+            lines.push(Line::from(std::mem::replace(&mut current, Vec::new())));
+            current.push(Span::raw("  "));
+            used = 2;
+        } else {
+            current.push(Span::raw(" "));
+            used += 1;
+        }
+        let mut h = key_hint(k, l, theme);
+        used += w - 1;
+        current.append(&mut h);
+    }
+    // Trailing update badge stays on the last row, never truncated.
+    if let Some(version) = update_available {
+        let badge = format!(" ↑v{} ", version);
+        if used + badge.chars().count() > max_width {
+            lines.push(Line::from(std::mem::replace(&mut current, Vec::new())));
+            current.push(Span::raw("  "));
+        }
+        current.push(Span::styled(badge, Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)));
+    } else {
+        current.push(Span::styled(" [M] more ", Style::default().fg(theme.inactive_fg)));
+    }
+    lines.push(Line::from(current));
+    lines
+}
+
 fn ui(frame: &mut Frame, app: &mut App) {
     let theme = app.theme().clone();
     let area = frame.area();
@@ -1072,21 +1241,29 @@ fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Block::default().style(Style::default().bg(theme.main_bg)), area);
 
     // Layout: title / stats / optional alerts box / table / footer.
+    // Footer is pinned to the bottom and always shows ALL options: its height
+    // grows (1..=4 rows) as the window narrows instead of truncating.
     let up_count = app.hosts.iter().filter(|h| h.up).count();
     let total = app.hosts.len();
     let down_count = total.saturating_sub(up_count);
     let pct_up = if total > 0 { (up_count as f64 / total as f64 * 100.0).round() as u64 } else { 0 };
     let now = Local::now().format("%H:%M:%S").to_string();
-    let downs: Vec<&HostState> = app.hosts.iter().filter(|h| h.down_streak(3)).collect();
+    let streak = app.config.down_streak.max(1);
+    let downs: Vec<&HostState> = app.hosts.iter().filter(|h| h.down_streak(streak)).collect();
     let show_alerts = app.alerts;
     let alert_rows = if show_alerts { (downs.len().min(6).max(1) + if downs.len() > 6 { 1 } else { 0 }) as u16 } else { 0 };
+
+    let footer_width = area.width.saturating_sub(2) as usize;
+    let footer_lines = build_footer_lines(&theme, app.update_available.as_deref(), footer_width);
+    // Never truncate: footer grows to fit every hint, table shrinks instead.
+    let footer_h = (footer_lines.len().max(1)) as u16;
 
     let mut constraints = vec![Constraint::Length(5), Constraint::Length(3)];
     if show_alerts {
         constraints.push(Constraint::Length(alert_rows + 3));
     }
-    constraints.push(Constraint::Min(5));
-    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Min(0));
+    constraints.push(Constraint::Length(footer_h));
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1154,13 +1331,14 @@ fn ui(frame: &mut Frame, app: &mut App) {
         Span::styled(format!("  ·  {} hosts", total), Style::default().fg(theme.inactive_fg)),
     ]);
     let stats_right = Line::from(vec![
+        Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), Style::default().fg(theme.inactive_fg)),
         Span::styled(now, Style::default().fg(theme.inactive_fg)),
         Span::styled(" · ", Style::default().fg(theme.divider)),
         Span::styled(theme.name, Style::default().fg(theme.hi_fg)),
     ]);
     let stats_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(30), Constraint::Length(22)])
+        .constraints([Constraint::Min(30), Constraint::Length(30)])
         .split(stats_inner);
     frame.render_widget(Paragraph::new(Text::from(stats_line)), stats_layout[0]);
     frame.render_widget(Paragraph::new(Text::from(stats_right)).alignment(Alignment::Right), stats_layout[1]);
@@ -1265,41 +1443,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
     .block(table_block);
     frame.render_stateful_widget(table, table_area, &mut app.table_state);
 
-    // Render footer: fixed one-row compact menu so the host table always dominates.
+    // Render footer: pinned bottom bar, pre-wrapped so nothing truncates.
     match app.input_mode {
         InputMode::Normal => {
-            let mut hints = vec![
-                ("↑/↓", "select"),
-                ("a", "add"),
-                ("d", "delete"),
-                ("e", "edit"),
-                ("h", "history"),
-                ("i", "import csv"),
-                ("E", "export"),
-                ("g", "group"),
-                ("f", "filter group"),
-                ("s", "sort"),
-                ("x", "down box"),
-                ("t", "theme"),
-                ("q", "quit"),
-            ];
-            if portable_dir().is_some() && app.update_available.is_some() {
-                hints.push(("u", "update"));
-            }
-
-            let mut spans = vec![Span::styled(" menu ", Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD))];
-            for (_, (k, l)) in hints.iter().enumerate() {
-                spans.push(Span::raw(" "));
-                spans.extend(key_hint(k, l, &theme));
-            }
-            spans.push(Span::styled(" [M] more ", Style::default().fg(theme.inactive_fg)));
-            if let Some(ref version) = app.update_available {
-                spans.push(Span::styled(
-                    format!("↑v{} ", version),
-                    Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
-                ));
-            }
-            let footer = Paragraph::new(Text::from(Line::from(spans)))
+            let footer = Paragraph::new(Text::from(footer_lines))
                 .style(Style::default().bg(theme.popup_bg).fg(theme.main_fg));
             frame.render_widget(footer, footer_area);
         }
@@ -1376,7 +1523,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
             for i in 0..4 {
                 let focused = form.focus == i;
                 let marker = if focused { "▶ " } else { "  " };
-                let value = if values[i].is_empty() { placeholder[i].to_string() } else { values[i].clone() };
+                // Visible text cursor on the focused field so keyboard-first
+                // use is obvious even though editing is append-only.
+                let mut value = if values[i].is_empty() { placeholder[i].to_string() } else { values[i].clone() };
+                if focused {
+                    value.push('▌');
+                }
                 let style = if values[i].is_empty() {
                     Style::default().fg(theme.inactive_fg)
                 } else if focused {
@@ -1518,9 +1670,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
         }
         InputMode::HistoryView { host_idx, range } => {
             let popup_area = centered_rect(72, 46, area);
-            let host = &app.hosts[host_idx];
-            let name = host.display_name();
-            let summary = history_summary(&host.name, range);
+            let host_name = app.hosts.get(host_idx).map(|h| h.name.clone()).unwrap_or_default();
+            let name = app.hosts.get(host_idx).map(|h| h.display_name()).unwrap_or_default();
+            let summary = cached_history_summary(&mut app.history_cache, &host_name, range);
 
             let mut lines = vec![Line::from("")];
 
@@ -1638,12 +1790,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
             frame.render_widget(popup, popup_area);
         }
         InputMode::MenuModal => {
-            let mut menu_hints = vec![
+            let menu_hints = vec![
+                ("Space", "ping now"),
                 ("a", "add host"),
                 ("d", "delete host"),
                 ("e", "edit host"),
                 ("h", "history"),
-                ("r", "rename host"),
                 ("c", "clear stats"),
                 ("i", "import"),
                 ("E", "export"),
@@ -1652,11 +1804,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ("s", "sort"),
                 ("x", "down box"),
                 ("t", "theme"),
+                ("u", "update"),
                 ("q", "quit"),
             ];
-            if portable_dir().is_some() && app.update_available.is_some() {
-                menu_hints.push(("u", "update"));
-            }
             let rows = (menu_hints.len() + 1) / 2;
             let popup_height = ((rows + 5).min(area.height as usize).max(8)) as u16;
             let popup_area = centered_rect(60, popup_height, area);
@@ -1709,15 +1859,16 @@ fn ui(frame: &mut Frame, app: &mut App) {
         InputMode::Normal => {}
     }
 
-    // Update status overlay (shown on top of any input mode).
+    // Update / info overlay (shown on top of any input mode).
     if !matches!(app.update_state, UpdateState::Idle) {
-        let popup_area = centered_rect(50, 32, area);
+        let popup_area = centered_rect(56, 34, area);
         let (title, body, color) = match &app.update_state {
             UpdateState::Idle => unreachable!(),
             UpdateState::Checking => ("Update", vec![Line::from(""), Line::from("Checking latest release...")], theme.hi_fg),
             UpdateState::Downloading { version } => ("Update", vec![Line::from(""), Line::from(format!("Downloading v{}...", version))], theme.hi_fg),
             UpdateState::Replacing { version } => ("Update", vec![Line::from(""), Line::from(format!("Installing v{}...", version))], theme.hi_fg),
-            UpdateState::Error(e) => ("Update failed", vec![Line::from(""), Line::from(e.clone())], theme.status_danger),
+            UpdateState::Error(e) => ("Notice", vec![Line::from(""), Line::from(e.clone())], theme.status_danger),
+            UpdateState::Info(msg) => ("Notice", vec![Line::from(""), Line::from(msg.clone())], theme.hi_fg),
             UpdateState::Done { version, restart_required } => {
                 let msg = if *restart_required {
                     format!("Updated to v{}. Please restart.", version)
@@ -1840,7 +1991,38 @@ struct ReleaseAsset {
     sha256: Option<String>,
 }
 
-fn release_asset_info(version: &str) -> Option<ReleaseAsset> {
+fn dir_writable(dir: &std::path::Path) -> bool {
+    // Probe with a temp file so we fail fast with a clear message instead of
+    // downloading first and failing on replace.
+    let probe = dir.join(".ping-uin-write-test");
+    match fs::write(&probe, b"ok") {
+        Ok(_) => { let _ = fs::remove_file(&probe); true }
+        Err(_) => false,
+    }
+}
+
+fn parse_sha256_text(text: &str, asset_name: &str) -> Option<String> {
+    // Handles both `shasum` output ("<hash>  <file>") and bare-hash files
+    // (Windows .sha256 sidecars currently contain only the hash).
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if line.contains(asset_name) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if !parts.is_empty() {
+                let hash: String = parts[0].chars().filter(|c| c.is_ascii_hexdigit()).collect();
+                if hash.len() == 64 {
+                    return Some(hash.to_uppercase());
+                }
+            }
+        } else if line.len() == 64 && line.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(line.to_uppercase());
+        }
+    }
+    None
+}
+
+fn release_asset_info(expected_version: &str) -> Option<ReleaseAsset> {
     let url = "https://api.github.com/repos/altosaxplayer/ping-uin/releases/latest";
     let response = ureq::get(url)
         .set("User-Agent", "ping-uin-update")
@@ -1851,35 +2033,52 @@ fn release_asset_info(version: &str) -> Option<ReleaseAsset> {
     let value: serde_json::Value = serde_json::from_str(&body).ok()?;
     let tag = value.get("tag_name")?.as_str()?;
     let latest_version = tag.trim_start_matches('v').to_string();
-    if latest_version != version {
+    // Tolerate skew: if a newer release landed between check and install,
+    // install latest rather than failing on strict equality.
+    if latest_version != expected_version
+        && !is_newer_version(expected_version, &latest_version)
+        && !is_newer_version(env!("CARGO_PKG_VERSION"), &latest_version)
+    {
         return None;
     }
 
     let os = env::consts::OS;
     let asset_name = match os {
-        "windows" => format!("ping-uin-windows-x86_64.zip"),
+        "windows" => "ping-uin-windows-x86_64.zip".to_string(),
         "macos" => format!("ping-uin-macos-{}.tar.gz", env::consts::ARCH),
-        _ => format!("ping-uin-linux-x86_64.tar.gz"),
+        _ => "ping-uin-linux-x86_64.tar.gz".to_string(),
     };
 
     let assets = value.get("assets")?.as_array()?;
     let asset = assets.iter().find(|a| {
-        a.get("name").and_then(|n| n.as_str()) == Some(&asset_name)
+        a.get("name").and_then(|n| n.as_str()) == Some(asset_name.as_str())
     })?;
     let url = asset.get("browser_download_url")?.as_str()?.to_string();
 
-    // Try to parse checksum from release body.
-    let sha256 = value.get("body").and_then(|b| b.as_str()).and_then(|body| {
-        for line in body.lines() {
-            if line.contains(&asset_name) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    return Some(parts[0].to_uppercase());
+    // Prefer the dedicated `<asset>.sha256` sidecar uploaded by release.yml;
+    // fall back to parsing the release notes body.
+    let mut sha256: Option<String> = None;
+    let sidecar_name = format!("{}.sha256", asset_name);
+    if let Some(sidecar) = assets.iter().find(|a| {
+        a.get("name").and_then(|n| n.as_str()) == Some(sidecar_name.as_str())
+    }) {
+        if let Some(sidecar_url) = sidecar.get("browser_download_url").and_then(|u| u.as_str()) {
+            if let Ok(resp) = ureq::get(sidecar_url)
+                .set("User-Agent", "ping-uin-update")
+                .timeout(Duration::from_secs(15))
+                .call()
+            {
+                if let Ok(text) = resp.into_string() {
+                    sha256 = parse_sha256_text(&text, &asset_name);
                 }
             }
         }
-        None
-    });
+    }
+    if sha256.is_none() {
+        sha256 = value.get("body").and_then(|b| b.as_str()).and_then(|body| {
+            parse_sha256_text(body, &asset_name)
+        });
+    }
 
     Some(ReleaseAsset { url, sha256 })
 }
@@ -1951,6 +2150,25 @@ fn extract_unix_tar(tar_path: &std::path::Path, dest_dir: &std::path::Path) -> i
     Err(io::Error::new(io::ErrorKind::NotFound, "ping-uin not found in archive"))
 }
 
+/// One-shot latest-version check (manual `u` press). Reports back via Message.
+fn spawn_one_shot_update_check(tx: mpsc::Sender<Message>, current_version: String) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let _ = tx.send(Message::UpdateState(UpdateState::Checking));
+        match fetch_latest_release_version() {
+            Some(latest) if is_newer_version(&current_version, &latest) => {
+                let _ = tx.send(Message::UpdateAvailable { version: latest.clone() });
+                let _ = tx.send(Message::UpdateState(UpdateState::Info(format!("v{} available — press u again to install", latest))));
+            }
+            Some(_) => {
+                let _ = tx.send(Message::UpdateState(UpdateState::Info(format!("already on latest (v{})", current_version))));
+            }
+            None => {
+                let _ = tx.send(Message::UpdateState(UpdateState::Error("update check failed: no network or API error".to_string())));
+            }
+        }
+    })
+}
+
 /// Homebrew update for installs managed by brew. Runs in a background thread.
 fn spawn_homebrew_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -1959,19 +2177,30 @@ fn spawn_homebrew_updater(tx: mpsc::Sender<Message>, version: String) -> thread:
         }
 
         notify(&tx, UpdateState::Checking);
-        match Command::new("brew").args(["upgrade", "ping-uin"]).output() {
-            Ok(out) if out.status.success() => {
-                notify(&tx, UpdateState::Done { version, restart_required: true });
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                notify(&tx, UpdateState::Error(format!("brew upgrade failed:\n{}{}", stdout, stderr)));
-            }
-            Err(e) => {
-                notify(&tx, UpdateState::Error(format!("brew upgrade failed: {}", e)));
+        // Try short name first, then fully-qualified tap name.
+        let attempts: Vec<Vec<&str>> = vec![
+            vec!["upgrade", "ping-uin"],
+            vec!["upgrade", "altosaxplayer/tap/ping-uin"],
+        ];
+        let mut last_err = String::new();
+        for args in attempts {
+            match Command::new("brew").args(&args).output() {
+                Ok(out) if out.status.success() => {
+                    notify(&tx, UpdateState::Done { version: version.clone(), restart_required: true });
+                    return;
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    last_err = format!("brew {} failed:\n{}{}", args.join(" "), stdout, stderr);
+                }
+                Err(e) => {
+                    last_err = format!("brew {} failed: {}", args.join(" "), e);
+                    break;
+                }
             }
         }
+        notify(&tx, UpdateState::Error(last_err));
     })
 }
 
@@ -1991,10 +2220,15 @@ fn spawn_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHand
             None => { notify(&tx, UpdateState::Error("cannot find executable directory".to_string())); return; }
         };
 
+        if !dir_writable(&exe_dir) {
+            notify(&tx, UpdateState::Error("install dir not writable — use brew upgrade / cargo install, or run with write permission".to_string()));
+            return;
+        }
+
         notify(&tx, UpdateState::Checking);
         let asset = match release_asset_info(&version) {
             Some(a) => a,
-            None => { notify(&tx, UpdateState::Error("could not find release asset".to_string())); return; }
+            None => { notify(&tx, UpdateState::Error("could not find release asset for this OS/arch".to_string())); return; }
         };
 
         notify(&tx, UpdateState::Downloading { version: version.clone() });
@@ -2064,18 +2298,24 @@ fn spawn_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHand
 
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = &exe_dir; // used on Windows only
             let new_exe = match extract_unix_tar(&archive_path, &temp_dir) {
                 Ok(p) => p,
                 Err(e) => { notify(&tx, UpdateState::Error(format!("extract failed: {}", e))); return; }
             };
-            let backup = exe_path.with_extension("old");
+            // Keep the original file name (`ping-uin` has no extension, so
+            // with_extension() would mangle it). Backup is `<exe>.old`.
+            let backup = PathBuf::from(format!("{}.old", exe_path.display()));
             if let Err(e) = fs::rename(&exe_path, &backup) {
-                notify(&tx, UpdateState::Error(format!("backup failed: {}", e))); return;
+                notify(&tx, UpdateState::Error(format!("backup failed (check permissions): {}", e))); return;
             }
             if let Err(e) = fs::rename(&new_exe, &exe_path) {
                 let _ = fs::rename(&backup, &exe_path);
-                notify(&tx, UpdateState::Error(format!("replace failed: {}", e))); return;
+                notify(&tx, UpdateState::Error(format!("replace failed, restored backup: {}", e))); return;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&exe_path, fs::Permissions::from_mode(0o755));
             }
             let _ = fs::remove_file(&backup);
             let _ = fs::remove_dir_all(&temp_dir);
@@ -2093,14 +2333,13 @@ fn run_app<B: ratatui::backend::Backend>(
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let tick_rate = Duration::from_millis(50);
-    let mut frames_since_trim = 0;
 
     loop {
         terminal.draw(|f| ui(f, app))?;
         if event::poll(tick_rate)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    // Close update status popup with Esc regardless of input mode.
+                    // Close update/info popup with Esc regardless of input mode.
                     if !matches!(app.update_state, UpdateState::Idle) && key.code == KeyCode::Esc {
                         app.update_state = UpdateState::Idle;
                         continue;
@@ -2109,10 +2348,16 @@ fn run_app<B: ratatui::backend::Backend>(
                         InputMode::Normal => match key.code {
                             KeyCode::Char('q') | KeyCode::Char('Q') => { shutdown.store(true, Ordering::Relaxed); return Ok(()); }
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => { shutdown.store(true, Ordering::Relaxed); return Ok(()); }
+                            KeyCode::Char(' ') => { app.ping_selected_now(&shared_hosts); }
+                            KeyCode::Char('p') | KeyCode::Char('P') => { app.ping_selected_now(&shared_hosts); }
                             KeyCode::Char('a') | KeyCode::Char('A') => {
                                 app.input_mode = InputMode::AddHost(AddHostForm::default());
                             }
                             KeyCode::Char('d') | KeyCode::Char('D') => { if !app.hosts.is_empty() { app.input_mode = InputMode::ConfirmDelete; } }
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                app.clear_selected_stats();
+                                app.update_state = UpdateState::Info("stats cleared for selected host".to_string());
+                            }
                             KeyCode::Char('e') => {
                                 if let Some(h) = app.hosts.get(app.selected_idx) {
                                     app.input_mode = InputMode::EditEntry {
@@ -2141,8 +2386,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.input_mode = InputMode::ExportPath { path: default_dir };
                             }
                             KeyCode::Char('u') | KeyCode::Char('U') => {
-                                if let Some(ref version) = app.update_available {
-                                    if matches!(app.update_state, UpdateState::Idle | UpdateState::Error(_) | UpdateState::Done { .. }) {
+                                // No known update: manual check first. Known update: install it.
+                                if let Some(ref version) = app.update_available.clone() {
+                                    if matches!(app.update_state, UpdateState::Idle | UpdateState::Error(_) | UpdateState::Info(_) | UpdateState::Done { .. }) {
                                         let version = version.clone();
                                         app.update_state = UpdateState::Checking;
                                         if portable_dir().is_some() {
@@ -2150,18 +2396,21 @@ fn run_app<B: ratatui::backend::Backend>(
                                         } else if let Ok(exe) = env::current_exe() {
                                             if is_homebrew_install(&exe) {
                                                 spawn_homebrew_updater(tx.clone(), version);
+                                            } else if dir_writable(&exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))) {
+                                                // Generic fallback: binary dir is writable, do in-place replace.
+                                                spawn_updater(tx.clone(), version);
                                             } else {
-                                                app.update_state = UpdateState::Error("update only works in portable or homebrew mode".to_string());
+                                                app.update_state = UpdateState::Error("auto-update needs portable mode or Homebrew.\nUpdate with: brew upgrade ping-uin  /  cargo install --path .".to_string());
                                             }
                                         } else {
                                             app.update_state = UpdateState::Error("cannot determine install type".to_string());
                                         }
                                     }
-                                } else {
-                                    app.update_state = UpdateState::Error("no update available".to_string());
+                                } else if matches!(app.update_state, UpdateState::Idle | UpdateState::Error(_) | UpdateState::Info(_)) {
+                                    spawn_one_shot_update_check(tx.clone(), env!("CARGO_PKG_VERSION").to_string());
                                 }
                             }
-                            KeyCode::Char('g') => app.group_by = !app.group_by,
+                            KeyCode::Char('g') => { app.group_by = !app.group_by; app.save_prefs(); }
                             KeyCode::Char('f') | KeyCode::Char('F') => {
                                 let mut groups: Vec<String> = app.hosts.iter()
                                     .map(|h| if h.group.is_empty() { "default".to_string() } else { h.group.clone() })
@@ -2177,7 +2426,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('s') | KeyCode::Char('S') => {
                                 app.input_mode = InputMode::SortPicker { selected: app.sort_mode.index() };
                             }
-                            KeyCode::Char('x') | KeyCode::Char('X') => { app.alerts = !app.alerts; }
+                            KeyCode::Char('x') | KeyCode::Char('X') => { app.alerts = !app.alerts; app.save_prefs(); }
                             KeyCode::Char('t') | KeyCode::Char('T') => {
                                 app.input_mode = InputMode::ThemePicker { original: app.theme_idx, selected: app.theme_idx };
                             }
@@ -2196,11 +2445,21 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::BackTab | KeyCode::Up => { form.focus = (form.focus + 3) % 4; app.input_mode = InputMode::AddHost(form); }
                                 KeyCode::Enter => {
                                     let host = form.host.trim().to_string();
-                                    let interval = form.interval.trim().parse().unwrap_or(DEFAULT_INTERVAL_M);
+                                    if host.is_empty() {
+                                        app.update_state = UpdateState::Info("host/IP is required".to_string());
+                                        app.input_mode = InputMode::AddHost(form);
+                                        continue;
+                                    }
+                                    if app.config.hosts.iter().any(|h| h.name == host) {
+                                        app.update_state = UpdateState::Info("host already exists".to_string());
+                                        app.input_mode = InputMode::AddHost(form);
+                                        continue;
+                                    }
+                                    let interval = form.interval.trim().parse().unwrap_or(DEFAULT_INTERVAL_M).max(1);
                                     let group = form.group.trim().to_string();
                                     let alias = form.alias.trim().to_string();
                                     app.input_mode = InputMode::Normal;
-                                    if !host.is_empty() { app.add_host(host, interval, group, alias, &shared_hosts); }
+                                    app.add_host(host, interval, group, alias, &shared_hosts);
                                 }
                                 KeyCode::Backspace => {
                                     match form.focus {
@@ -2235,12 +2494,14 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             KeyCode::Enter => {
                                 app.sort_mode = SortMode::from_index(selected);
+                                app.save_prefs();
                                 app.input_mode = InputMode::Normal;
                             }
                             KeyCode::Char(c) if c.is_ascii_digit() => {
                                 let idx = (c as usize) - ('1' as usize);
                                 if idx < SortMode::ALL.len() {
                                     app.sort_mode = SortMode::from_index(idx);
+                                    app.save_prefs();
                                     app.input_mode = InputMode::Normal;
                                 }
                             }
@@ -2249,8 +2510,9 @@ fn run_app<B: ratatui::backend::Backend>(
                         InputMode::GroupFilterPicker { ref groups, selected } => {
                             let groups = groups.clone();
                             match key.code {
+                                // Esc cancels without touching the active filter.
+                                // Space clears it (hint in footer/popup).
                                 KeyCode::Esc => {
-                                    app.group_filter = None;
                                     app.input_mode = InputMode::Normal;
                                 }
                                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2301,7 +2563,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     if !path.trim().is_empty() {
                                         let dir = std::path::Path::new(&path).to_path_buf();
                                         match app.export_entries(&dir) {
-                                            Ok(dest) => app.update_state = UpdateState::Error(format!("exported to {}", dest.display())),
+                                            Ok(dest) => app.update_state = UpdateState::Info(format!("exported to {}", dest.display())),
                                             Err(e) => app.update_state = UpdateState::Error(format!("export failed: {}", e)),
                                         }
                                     }
@@ -2346,6 +2608,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.input_mode = InputMode::ThemePicker { original, selected: s };
                                 }
                                 KeyCode::Enter => {
+                                    app.save_prefs();
                                     app.input_mode = InputMode::Normal;
                                 }
                                 _ => {}
@@ -2353,8 +2616,60 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         InputMode::MenuModal => {
                             match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Char('m') | KeyCode::Char('M') => {
+                                KeyCode::Esc | KeyCode::Char('m') | KeyCode::Char('M') => {
                                     app.input_mode = InputMode::Normal;
+                                }
+                                // Make the "more" menu actionable, not view-only.
+                                KeyCode::Char(' ') | KeyCode::Char('p') | KeyCode::Char('P') => {
+                                    app.input_mode = InputMode::Normal;
+                                    app.ping_selected_now(&shared_hosts);
+                                }
+                                KeyCode::Char('a') | KeyCode::Char('A') => {
+                                    app.input_mode = InputMode::AddHost(AddHostForm::default());
+                                }
+                                KeyCode::Char('d') | KeyCode::Char('D') => {
+                                    app.input_mode = if app.hosts.is_empty() { InputMode::Normal } else { InputMode::ConfirmDelete };
+                                }
+                                KeyCode::Char('c') | KeyCode::Char('C') => {
+                                    app.input_mode = InputMode::Normal;
+                                    app.clear_selected_stats();
+                                }
+                                KeyCode::Char('e') => {
+                                    if let Some(h) = app.hosts.get(app.selected_idx).cloned() {
+                                        app.input_mode = InputMode::EditEntry {
+                                            original: h.name.clone(),
+                                            form: AddHostForm {
+                                                host: h.name.clone(),
+                                                interval: h.interval_m.to_string(),
+                                                group: h.group.clone(),
+                                                alias: h.alias.clone().unwrap_or_default(),
+                                                focus: 0,
+                                            },
+                                        };
+                                    } else {
+                                        app.input_mode = InputMode::Normal;
+                                    }
+                                }
+                                KeyCode::Char('h') | KeyCode::Char('H') => {
+                                    app.input_mode = if app.selected_idx < app.hosts.len() {
+                                        InputMode::HistoryView { host_idx: app.selected_idx, range: HistoryRange::Hours24 }
+                                    } else {
+                                        InputMode::Normal
+                                    };
+                                }
+                                KeyCode::Char('x') | KeyCode::Char('X') => {
+                                    app.input_mode = InputMode::Normal;
+                                    app.alerts = !app.alerts;
+                                    app.save_prefs();
+                                }
+                                KeyCode::Char('g') => {
+                                    app.input_mode = InputMode::Normal;
+                                    app.group_by = !app.group_by;
+                                    app.save_prefs();
+                                }
+                                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                    shutdown.store(true, Ordering::Relaxed);
+                                    return Ok(());
                                 }
                                 _ => {}
                             }
@@ -2367,6 +2682,17 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Tab | KeyCode::Down => { form.focus = (form.focus + 1) % 4; app.input_mode = InputMode::EditEntry { original, form }; }
                                 KeyCode::BackTab | KeyCode::Up => { form.focus = (form.focus + 3) % 4; app.input_mode = InputMode::EditEntry { original, form }; }
                                 KeyCode::Enter => {
+                                    if form.host.trim().is_empty() {
+                                        app.update_state = UpdateState::Info("host/IP is required".to_string());
+                                        app.input_mode = InputMode::EditEntry { original, form };
+                                        continue;
+                                    }
+                                    let new_name = form.host.trim().to_string();
+                                    if new_name != original && app.config.hosts.iter().any(|h| h.name == new_name) {
+                                        app.update_state = UpdateState::Info("another host already uses that name".to_string());
+                                        app.input_mode = InputMode::EditEntry { original, form };
+                                        continue;
+                                    }
                                     let form2 = form.clone();
                                     app.input_mode = InputMode::Normal;
                                     app.edit_entry(original, form2, &shared_hosts);
@@ -2440,10 +2766,11 @@ fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
-        frames_since_trim += 1;
-        if frames_since_trim >= 100 {
-            frames_since_trim = 0;
+        // Time-based log trim (was every ~100 frames doing a full file read).
+        if app.last_trim.elapsed() > Duration::from_secs(300) {
+            app.last_trim = Instant::now();
             let _ = trim_log(&mut app.hosts, app.config.graph_width);
+            app.history_cache.clear();
         }
     }
 }
@@ -2468,23 +2795,27 @@ fn main() -> io::Result<()> {
     let worker = spawn_worker(tx.clone(), shared_hosts.clone(), config.timeout_ms, shutdown.clone());
     let update_checker = spawn_update_checker(tx.clone(), env!("CARGO_PKG_VERSION").to_string(), shutdown.clone());
 
+    let themes = build_themes();
+    let theme_idx = themes.iter().position(|t| t.name == config.theme).unwrap_or(0);
     let mut app = App {
-        themes: build_themes(),
-        theme_idx: 0,
+        themes,
+        theme_idx,
+        group_by: config.group_by,
+        sort_mode: config.sort_mode,
+        alerts: config.alerts,
         config,
         hosts,
         selected_idx: 0,
         table_state: TableState::default(),
-        group_by: false,
         group_filter: None,
-        sort_mode: SortMode::None,
-        alerts: false,
         input_mode: InputMode::Normal,
         update_available: None,
         update_state: UpdateState::Idle,
         last_check: "—".to_string(),
         last_result_time: None,
         restart_after_exit: false,
+        history_cache: HashMap::new(),
+        last_trim: Instant::now(),
     };
 
     let result = run_app(&mut terminal, &mut app, tx, rx, shared_hosts, shutdown.clone());

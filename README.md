@@ -53,15 +53,25 @@ before you add any config. The starter set ships with a few public IP records
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` | move selection |
+| `Space` / `p` | ping selected host now |
 | `a` | add a host (single form) |
 | `e` | edit the selected host — name/IP/group/alias in one form |
 | `d` | delete the selected host (confirmation popup) |
+| `h` | per-host history (8h / 24h / 7d) |
+| `c` | clear stats for selected host |
 | `i` | **import from `hosts.csv`** — merge in bulk, new rows added, existing rows updated |
+| `E` | export host list to timestamped CSV |
 | `g` | toggle grouped/flat view |
+| `f` | filter by group (`Space` = show all, `Esc` = cancel) |
 | `s` | sort picker — `off` / down-first / up-first / by-name |
 | `x` | toggle the **down box** (hosts down for the last 3 checks) |
-| `t` | cycle themes |
+| `t` | theme picker (live preview, persists) |
+| `u` | check for updates / install when available |
+| `M` | full menu (actionable) |
 | `q` / `Ctrl+C` | quit (cleanly!) |
+
+> The bottom menu always shows every option — it wraps to extra rows on
+> narrow windows instead of truncating, and stays pinned to the bottom.
 
 ---
 
@@ -115,15 +125,24 @@ New-Item -ItemType File -Name ping-uin.portable
 On the next launch, `ip-top.json`, `hosts.csv`, and `uptime-log.csv` will be
 read from and written to that same directory instead of the system config path.
 
-### In-place updates (portable mode only)
+### In-place updates
 
-When a newer release is available, the footer shows `↑ vX.Y.Z available`.
-In portable mode, press **`u`** to download and install the update automatically:
+Press **`u`** any time to check GitHub releases. When a newer release is
+available, the footer shows `↑ vX.Y.Z` — press **`u`** again to install:
 
-- **macOS / Linux:** the running binary is replaced in place; restart to run the new version.
-- **Windows:** the app exits, a small PowerShell updater replaces `ping-uin.exe`, and you restart manually.
+- **Portable mode** (marker file or data files next to the binary): the
+  running binary is replaced in place (checksum-verified, backup + restore
+  on failure). macOS/Linux restart automatically; Windows exits and a small
+  PowerShell updater swaps `ping-uin.exe`.
+- **Homebrew** (`/Cellar/ping-uin/`): runs `brew upgrade ping-uin`
+  (falls back to `altosaxplayer/tap/ping-uin`) in the background.
+- **Anywhere else writable** (e.g. `~/.cargo/bin` you own): same in-place
+  flow as portable. If the install dir isn't writable you'll get a clear
+  message instead of a late failure — update with
+  `brew upgrade ping-uin` / `cargo install --path .` / winget.
 
-Package-manager installs (Homebrew, winget, AUR) should use their normal update commands instead.
+Theme, group, sort, and down-box prefs persist in `ip-top.json`. A corrupt
+config is backed up to `ip-top.json.corrupt` instead of being discarded.
 
 ---
 
