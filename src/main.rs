@@ -1,16 +1,13 @@
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::hash::{Hash, Hasher};
-use std::time::SystemTime;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::process::Command;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, OnceLock, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{Local, TimeZone};
 use crossterm::cursor::{Hide, Show};
@@ -26,188 +23,16 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 
-/// Where the config/csv/log live. Resolved once at startup.
-///
-/// Portable mode: if the directory containing the running executable has a
-/// `ping-uin.portable` marker file, or already contains one of the data files,
-/// that directory is used instead of the system config dir.
-///
-/// Otherwise falls back to the user config dir
-/// (`~/.config/ping-uin` on Linux/macOS, `%APPDATA%\ping-uin` on Windows).
-struct Paths {
-    config: PathBuf,
-    csv: PathBuf,
-    log: PathBuf,
-}
+mod config;
+mod net;
 
-static PATHS: OnceLock<Paths> = OnceLock::new();
-
-fn portable_dir() -> Option<PathBuf> {
-    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    // Don't treat Cargo build directories as portable installs.
-    if exe_dir.components().any(|c| c.as_os_str() == "target") {
-        return None;
-    }
-    let marker = exe_dir.join("ping-uin.portable");
-    let has_marker = marker.exists();
-    let has_data = ["ip-top.json", "hosts.csv", "uptime-log.csv"]
-        .iter()
-        .any(|name| exe_dir.join(name).exists());
-    if has_marker || has_data {
-        Some(exe_dir)
-    } else {
-        None
-    }
-}
-
-fn is_homebrew_install(exe: &std::path::Path) -> bool {
-    exe.to_string_lossy().contains("/Cellar/ping-uin/")
-}
-
-fn homebrew_bin_path() -> Option<PathBuf> {
-    for path in ["/opt/homebrew/bin/ping-uin", "/usr/local/bin/ping-uin"] {
-        if std::path::Path::new(path).exists() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
-}
-
-fn resolve_paths() -> Paths {
-    let dir = portable_dir()
-        .unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("ping-uin"));
-    let _ = fs::create_dir_all(&dir);
-    Paths {
-        config: dir.join("ip-top.json"),
-        csv: dir.join("hosts.csv"),
-        log: dir.join("uptime-log.csv"),
-    }
-}
-
-fn paths() -> &'static Paths {
-    PATHS.get_or_init(resolve_paths)
-}
-
-const DEFAULT_INTERVAL_M: u64 = 2;
-const DEFAULT_TIMEOUT_MS: u64 = 1000;
-const DEFAULT_GRAPH_WIDTH: usize = 20;
-const MAX_HISTORY: usize = 10000;
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct HostConfig {
-    name: String,
-    interval_m: u64,
-    group: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    alias: Option<String>,
-}
-
-impl HostConfig {
-    fn new(name: impl Into<String>, interval_m: u64, group: impl Into<String>, alias: Option<String>) -> Self {
-        let alias = alias.filter(|a| !a.trim().is_empty());
-        HostConfig {
-            name: name.into(),
-            interval_m,
-            group: group.into(),
-            alias,
-        }
-    }
-}
-
-fn default_theme_name() -> String { "btop".to_string() }
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct Config {
-    hosts: Vec<HostConfig>,
-    timeout_ms: u64,
-    graph_width: usize,
-    #[serde(default = "default_theme_name")]
-    theme: String,
-    #[serde(default)]
-    group_by: bool,
-    #[serde(default)]
-    sort_mode: SortMode,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            hosts: vec![
-                HostConfig::new("8.8.8.8", 1, "external", None),
-                HostConfig::new("1.1.1.1", 2, "external", Some("Cloudflare".to_string())),
-                HostConfig::new("192.168.1.1", 2, "router", None),
-                HostConfig::new("google.com", 2, "external", None),
-            ],
-            timeout_ms: DEFAULT_TIMEOUT_MS,
-            graph_width: DEFAULT_GRAPH_WIDTH,
-            theme: default_theme_name(),
-            group_by: false,
-            sort_mode: SortMode::None,
-        }
-    }
-}
-
-impl Config {
-    fn load() -> Self {
-        let text = match fs::read_to_string(&paths().config) {
-            Ok(t) => t,
-            Err(_) => return Self::default(),
-        };
-        if let Ok(cfg) = serde_json::from_str::<Config>(&text) {
-            return cfg;
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-            let mut hosts = Vec::new();
-            if let Some(arr) = value.get("hosts").and_then(|v| v.as_array()) {
-                for v in arr {
-                    if let Some(name) = v.as_str() {
-                        hosts.push(HostConfig::new(name, DEFAULT_INTERVAL_M, "default", None));
-                    } else if let Some(obj) = v.as_object() {
-                        let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        let interval = obj.get("interval_m")
-                            .and_then(|v| v.as_u64())
-                            .or_else(|| obj.get("interval_s").and_then(|v| v.as_u64().map(|s| s / 60)))
-                            .unwrap_or(DEFAULT_INTERVAL_M);
-                        let group = obj.get("group").and_then(|v| v.as_str()).unwrap_or("default").to_string();
-                        let alias = obj.get("alias").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        hosts.push(HostConfig::new(name, interval, group, alias));
-                    }
-                }
-            }
-            return Config {
-                hosts,
-                timeout_ms: value.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_TIMEOUT_MS),
-                graph_width: value.get("graph_width").and_then(|v| v.as_u64()).unwrap_or(DEFAULT_GRAPH_WIDTH as u64) as usize,
-                theme: value.get("theme").and_then(|v| v.as_str()).unwrap_or("btop").to_string(),
-                group_by: value.get("group_by").and_then(|v| v.as_bool()).unwrap_or(false),
-                sort_mode: value.get("sort_mode").and_then(|v| v.as_str()).and_then(|s| match s {
-                    "DownFirst" | "down_first" | "down first" | "down-first" => Some(SortMode::DownFirst),
-                    "UpFirst" | "up_first" | "up first" | "up-first" => Some(SortMode::UpFirst),
-                    "Name" | "name" => Some(SortMode::Name),
-                    "Group" | "group" => Some(SortMode::Group),
-                    "DownOnly" | "down_only" | "down only" | "down-only" => Some(SortMode::DownOnly),
-                    _ => Some(SortMode::None),
-                }).unwrap_or(SortMode::None),
-            };
-        }
-        // Corrupt config: back it up instead of silently discarding user data.
-        let backup = paths().config.with_extension("json.corrupt");
-        let _ = fs::write(&backup, &text);
-        Self::default()
-    }
-
-    fn save(&self) -> io::Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-        // Atomic-ish write: temp file + rename so a crash can't truncate config.
-        let tmp = paths().config.with_extension("json.tmp");
-        fs::write(&tmp, json)?;
-        fs::rename(&tmp, &paths().config)?;
-        Ok(())
-    }
-}
+use config::{
+    format_interval, homebrew_bin_path, is_homebrew_install, parse_interval, paths,
+    portable_dir, read_entries_csv, Config, HostConfig, SortMode, DEFAULT_INTERVAL_SECS,
+    MAX_HISTORY,
+};
+use net::{check_host, host_jitter, post_webhook, schedules_from_config, HostSchedule};
 
 #[derive(Clone)]
 struct Theme {
@@ -349,36 +174,73 @@ struct HostState {
     name: String,
     alias: Option<String>,
     group: String,
-    interval_m: u64,
+    interval_secs: u64,
+    port: Option<u16>,
     next_ping: Instant,
     history: VecDeque<u64>,
     up: bool,
     latency_ms: f64,
     total_checks: u64,
     up_checks: u64,
+    /// When the up/down state last changed. Drives the transition flash.
+    last_change: Option<Instant>,
+    /// Recent state-change timestamps (pruned to 10 min). 3+ = flapping.
+    flaps: VecDeque<Instant>,
 }
 
 impl HostState {
-    fn new(name: &str, interval_m: u64, group: &str, alias: Option<String>) -> Self {
+    fn new(name: &str, interval_secs: u64, group: &str, alias: Option<String>, port: Option<u16>) -> Self {
         HostState {
             name: name.to_string(),
             alias: alias.filter(|a| !a.trim().is_empty()),
             group: group.to_string(),
-            interval_m,
+            interval_secs,
+            port,
             next_ping: Instant::now(),
-            history: VecDeque::with_capacity(DEFAULT_GRAPH_WIDTH),
+            history: VecDeque::with_capacity(config::DEFAULT_GRAPH_WIDTH),
             up: false,
             latency_ms: 0.0,
             total_checks: 0,
             up_checks: 0,
+            last_change: None,
+            flaps: VecDeque::new(),
         }
     }
 
     /// Name shown in the UI: alias if set, else the target IP/hostname.
     fn display_name(&self) -> String {
-        self.alias.clone().unwrap_or_else(|| self.name.clone())
+        self.alias.clone().unwrap_or_else(|| self.target())
     }
 
+    /// `db.internal:5432`-style target for display and TCP checks.
+    fn target(&self) -> String {
+        match self.port {
+            Some(p) => format!("{}:{}", self.name, p),
+            None => self.name.clone(),
+        }
+    }
+
+    /// Record a state change; returns true when the host is flapping
+    /// (3+ transitions in the last 10 minutes).
+    fn note_result(&mut self, up: bool, now: Instant) -> bool {
+        if up != self.up {
+            self.last_change = Some(now);
+            self.flaps.push_back(now);
+        }
+        while self.flaps.front().map_or(false, |t| now.duration_since(*t) > Duration::from_secs(600)) {
+            self.flaps.pop_front();
+        }
+        self.flaps.len() >= 3
+    }
+
+    fn flapping(&self) -> bool {
+        self.flaps.len() >= 3
+    }
+
+    /// True when the state changed within the flash window.
+    fn just_changed(&self) -> bool {
+        self.last_change.map_or(false, |t| t.elapsed() < Duration::from_secs(15))
+    }
 }
 
 /// All-in-one add-host form state (focused field editable).
@@ -388,7 +250,23 @@ struct AddHostForm {
     interval: String,
     group: String,
     alias: String,
+    port: String,
     focus: usize,
+}
+
+impl AddHostForm {
+    const FIELDS: usize = 5;
+
+    fn for_host(h: &HostState) -> Self {
+        AddHostForm {
+            host: h.name.clone(),
+            interval: format_interval(h.interval_secs),
+            group: h.group.clone(),
+            alias: h.alias.clone().unwrap_or_default(),
+            port: h.port.map(|p| p.to_string()).unwrap_or_default(),
+            focus: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -437,57 +315,9 @@ enum InputMode {
     HistoryView { host_idx: usize, range: HistoryRange },
     ThemePicker { original: usize, selected: usize },
     MenuModal,
+    KeysHelp,
+    Search { query: String },
     ConfirmDelete,
-}
-
-/// View applied to the host list. Combines ordering (flat view and inside
-/// each group) with the down-only filter that replaces the old down box.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
-enum SortMode {
-    #[default]
-    None,
-    DownFirst,
-    UpFirst,
-    Name,
-    Group,
-    DownOnly,
-}
-
-impl SortMode {
-    const ALL: [SortMode; 6] = [SortMode::None, SortMode::DownFirst, SortMode::UpFirst, SortMode::Name, SortMode::Group, SortMode::DownOnly];
-
-    fn index(&self) -> usize {
-        match self {
-            SortMode::None => 0,
-            SortMode::DownFirst => 1,
-            SortMode::UpFirst => 2,
-            SortMode::Name => 3,
-            SortMode::Group => 4,
-            SortMode::DownOnly => 5,
-        }
-    }
-
-    fn from_index(i: usize) -> Self {
-        match i {
-            1 => SortMode::DownFirst,
-            2 => SortMode::UpFirst,
-            3 => SortMode::Name,
-            4 => SortMode::Group,
-            5 => SortMode::DownOnly,
-            _ => SortMode::None,
-        }
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            SortMode::None => "off",
-            SortMode::DownFirst => "down first",
-            SortMode::UpFirst => "up first",
-            SortMode::Name => "name",
-            SortMode::Group => "group",
-            SortMode::DownOnly => "down only",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -511,6 +341,8 @@ struct App {
     group_by: bool,
     group_filter: Option<String>,
     sort_mode: SortMode,
+    collapsed: HashSet<String>,
+    search: Option<String>,
     input_mode: InputMode,
     update_available: Option<String>,
     update_state: UpdateState,
@@ -524,15 +356,15 @@ struct App {
 impl App {
     fn theme(&self) -> &Theme { &self.themes[self.theme_idx] }
 
-    fn add_host(&mut self, name: String, interval_m: u64, group: String, alias: String, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
+    fn add_host(&mut self, name: String, interval_secs: u64, group: String, alias: String, port: Option<u16>, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
         let name = name.trim().to_string();
         if name.is_empty() || self.config.hosts.iter().any(|h| h.name == name) { return; }
-        let interval_m = if interval_m == 0 { DEFAULT_INTERVAL_M } else { interval_m };
+        let interval_secs = interval_secs.clamp(config::MIN_INTERVAL_SECS, config::MAX_INTERVAL_SECS);
         let group = if group.trim().is_empty() { "default".to_string() } else { group.trim().to_string() };
         let alias = if alias.trim().is_empty() { None } else { Some(alias.trim().to_string()) };
-        self.config.hosts.push(HostConfig::new(&name, interval_m, &group, alias.clone()));
+        self.config.hosts.push(HostConfig::new(&name, interval_secs, &group, alias.clone(), port));
         self.persist();
-        self.hosts.push(HostState::new(&name, interval_m, &group, alias));
+        self.hosts.push(HostState::new(&name, interval_secs, &group, alias, port));
         if let Ok(mut h) = shared_hosts.write() {
             *h = schedules_from_config(&self.config.hosts);
         }
@@ -543,6 +375,8 @@ impl App {
         if self.selected_idx < self.hosts.len() {
             self.hosts.remove(self.selected_idx);
             self.config.hosts.remove(self.selected_idx);
+            // Drop cached history so removed hosts free their summaries.
+            self.history_cache.clear();
             self.persist();
             if self.selected_idx >= self.hosts.len() {
                 self.selected_idx = self.hosts.len().saturating_sub(1);
@@ -559,20 +393,25 @@ impl App {
         self.write_entries_csv().ok();
     }
 
-    /// Write all entries to hosts.csv for bulk editing/import.
-    fn write_entries_csv(&self) -> io::Result<()> {
-        let mut wtr = csv::Writer::from_path(&paths().csv)?;
-        wtr.write_record(["name", "interval_m", "group", "alias"])?;
-        for h in &self.config.hosts {
+    fn write_host_records(wtr: &mut csv::Writer<std::fs::File>, hosts: &[HostConfig]) -> io::Result<()> {
+        wtr.write_record(["name", "interval", "group", "alias", "port"])?;
+        for h in hosts {
             wtr.write_record([
                 h.name.clone(),
-                h.interval_m.to_string(),
+                format_interval(h.effective_interval_secs()),
                 h.group.clone(),
                 h.alias.clone().unwrap_or_default(),
+                h.port.map(|p| p.to_string()).unwrap_or_default(),
             ])?;
         }
         wtr.flush()?;
         Ok(())
+    }
+
+    /// Write all entries to hosts.csv for bulk editing/import.
+    fn write_entries_csv(&self) -> io::Result<()> {
+        let mut wtr = csv::Writer::from_path(&paths().csv)?;
+        Self::write_host_records(&mut wtr, &self.config.hosts)
     }
 
     /// Export current host list to a timestamped CSV in the chosen directory.
@@ -581,25 +420,18 @@ impl App {
         let timestamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
         let dest = dir.join(format!("ping-uin-hosts-{}.csv", timestamp));
         let mut wtr = csv::Writer::from_path(&dest)?;
-        wtr.write_record(["name", "interval_m", "group", "alias"])?;
-        for h in &self.config.hosts {
-            wtr.write_record([
-                h.name.clone(),
-                h.interval_m.to_string(),
-                h.group.clone(),
-                h.alias.clone().unwrap_or_default(),
-            ])?;
-        }
-        wtr.flush()?;
+        Self::write_host_records(&mut wtr, &self.config.hosts)?;
         Ok(dest)
     }
 
     /// Apply one all-fields edit (from the EditEntry form) by original name.
     fn edit_entry(&mut self, original: String, form: AddHostForm, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
         let new_name = form.host.trim().to_string();
-        let interval: u64 = form.interval.trim().parse().unwrap_or(DEFAULT_INTERVAL_M).max(1);
+        let interval_secs = parse_interval(&form.interval).unwrap_or(DEFAULT_INTERVAL_SECS)
+            .clamp(config::MIN_INTERVAL_SECS, config::MAX_INTERVAL_SECS);
         let group = if form.group.trim().is_empty() { "default".to_string() } else { form.group.trim().to_string() };
         let alias = if form.alias.trim().is_empty() { None } else { Some(form.alias.trim().to_string()) };
+        let port = form.port.trim().parse::<u16>().ok().filter(|p| *p > 0);
         if let Some(idx) = self.config.hosts.iter().position(|h| h.name == original) {
             let renamed = !new_name.is_empty() && new_name != self.config.hosts[idx].name;
             if renamed && self.config.hosts.iter().any(|h| h.name == new_name) { return; }
@@ -607,14 +439,18 @@ impl App {
                 self.config.hosts[idx].name = new_name.clone();
                 if let Some(h) = self.hosts.get_mut(idx) { h.name = new_name.clone(); }
             }
-            self.config.hosts[idx].interval_m = interval;
+            self.config.hosts[idx].interval_secs = interval_secs;
+            self.config.hosts[idx].interval_m = 0;
             self.config.hosts[idx].group  = group.clone();
             self.config.hosts[idx].alias  = alias.clone();
+            self.config.hosts[idx].port   = port;
             if let Some(h) = self.hosts.get_mut(idx) {
-                h.interval_m = interval;
+                h.interval_secs = interval_secs;
                 h.group      = group;
                 h.alias      = alias;
+                h.port       = port;
             }
+            self.history_cache.clear();
             self.persist();
             if let Ok(mut h) = shared_hosts.write() {
                 *h = schedules_from_config(&self.config.hosts);
@@ -630,17 +466,19 @@ impl App {
                     Some(i) => {
                         self.config.hosts[i] = entry.clone();
                         if let Some(h) = self.hosts.get_mut(i) {
-                            h.interval_m = entry.interval_m;
+                            h.interval_secs = entry.effective_interval_secs();
                             h.group      = entry.group.clone();
                             h.alias      = entry.alias.clone();
+                            h.port       = entry.port;
                         }
                     }
                     None => {
                         self.config.hosts.push(entry.clone());
-                        self.hosts.push(HostState::new(&entry.name, entry.interval_m, &entry.group, entry.alias.clone()));
+                        self.hosts.push(HostState::new(&entry.name, entry.effective_interval_secs(), &entry.group, entry.alias.clone(), entry.port));
                     }
                 }
             }
+            self.history_cache.clear();
             self.persist();
             if let Ok(mut h) = shared_hosts.write() {
                 *h = schedules_from_config(&self.config.hosts);
@@ -648,13 +486,27 @@ impl App {
         }
     }
 
-    /// Copy runtime UI prefs into config and save (theme/group/sort).
+    /// Copy runtime UI prefs into config and save (theme/group/sort/collapsed).
     /// Reload-safe: theme + view prefs survive restarts.
     fn save_prefs(&mut self) {
         self.config.theme = self.themes.get(self.theme_idx).map(|t| t.name.to_string()).unwrap_or_else(|| "btop".to_string());
         self.config.group_by = self.group_by;
         self.config.sort_mode = self.sort_mode;
+        self.config.collapsed_groups = self.collapsed.iter().cloned().collect();
         let _ = self.config.save();
+    }
+
+    /// Collapse/expand the selected host's group (grouped view).
+    fn toggle_collapse_selected(&mut self) {
+        let group = match self.hosts.get(self.selected_idx) {
+            Some(h) if h.group.is_empty() => "default".to_string(),
+            Some(h) => h.group.clone(),
+            None => return,
+        };
+        if !self.collapsed.remove(&group) {
+            self.collapsed.insert(group);
+        }
+        self.save_prefs();
     }
 
     fn clear_selected_stats(&mut self) {
@@ -682,70 +534,10 @@ impl App {
     }
 }
 
-/// Read hosts.csv rows into HostConfig entries.
-fn read_entries_csv(path: &std::path::Path) -> io::Result<Vec<HostConfig>> {
-    let mut rdr = csv::Reader::from_path(path)?;
-    let mut out = Vec::new();
-    for record in rdr.records() {
-        let r = record?;
-        let name = r.get(0).unwrap_or("").trim().to_string();
-        if name.is_empty() { continue; }
-        let interval = r.get(1).and_then(|s| s.trim().parse().ok()).unwrap_or(DEFAULT_INTERVAL_M);
-        let group = r.get(2).unwrap_or("").trim();
-        let group = if group.is_empty() { "default".to_string() } else { group.to_string() };
-        let alias = r.get(3).map(|s| s.trim().to_string());
-        out.push(HostConfig::new(name, interval, group, alias));
-    }
-    Ok(out)
-}
-
-#[derive(Clone)]
-struct HostSchedule {
-    name: String,
-    interval_m: u64,
-    next_ping: Instant,
-}
-
-fn host_jitter(name: &str, interval_secs: u64) -> Duration {
-    let mut s = DefaultHasher::new();
-    name.hash(&mut s);
-    let hash = s.finish();
-    let max_jitter = (interval_secs / 2).min(30).max(1);
-    Duration::from_secs(hash % max_jitter)
-}
-
-fn schedules_from_config(hosts: &[HostConfig]) -> Vec<HostSchedule> {
-    let now = Instant::now();
-    hosts.iter().map(|h| HostSchedule {
-        name: h.name.clone(),
-        interval_m: h.interval_m,
-        next_ping: now + host_jitter(&h.name, h.interval_m * 60),
-    }).collect()
-}
-
 enum Message {
     Result { host: String, up: bool, latency_ms: f64, timestamp: String, next_ping: Instant },
     UpdateAvailable { version: String },
     UpdateState(UpdateState),
-}
-
-fn ping_host(host: &str, timeout_ms: u64, re: &Regex) -> (bool, f64) {
-    let os = env::consts::OS;
-    let output = match os {
-        "windows" => Command::new("ping").args(["-n", "1", "-w", &timeout_ms.to_string(), host]).output(),
-        "macos" => Command::new("ping").args(["-c", "1", "-W", &timeout_ms.to_string(), host]).output(),
-        _ => Command::new("ping").args(["-c", "1", "-W", &timeout_ms.div_ceil(1000).to_string(), host]).output(),
-    };
-    match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            if let Some(cap) = re.captures(&text) {
-                if let Ok(lat) = cap[1].parse::<f64>() { return (true, lat); }
-            }
-            (true, 0.0)
-        }
-        _ => (false, 0.0),
-    }
 }
 
 fn ensure_log() -> io::Result<()> {
@@ -965,7 +757,7 @@ fn accent_title(text: &str, theme: &Theme) -> Line<'static> {
 
 #[derive(Clone)]
 enum RowKind {
-    GroupHeader(String),
+    GroupHeader { name: String, collapsed: bool, hidden: usize },
     Host,
 }
 
@@ -998,14 +790,36 @@ fn sort_host_indices(indices: &mut Vec<usize>, hosts: &[HostState], sort_mode: S
     }
 }
 
-fn build_visible_rows(hosts: &[HostState], group_by: bool, group_filter: Option<&str>, sort_mode: SortMode) -> Vec<VisibleRow> {
+fn host_matches_search(h: &HostState, search: Option<&str>) -> bool {
+    match search {
+        None => true,
+        Some(q) if q.trim().is_empty() => true,
+        Some(q) => {
+            let q = q.to_lowercase();
+            h.name.to_lowercase().contains(&q)
+                || h.alias.as_ref().map_or(false, |a| a.to_lowercase().contains(&q))
+                || h.group.to_lowercase().contains(&q)
+        }
+    }
+}
+
+fn build_visible_rows(
+    hosts: &[HostState],
+    group_by: bool,
+    group_filter: Option<&str>,
+    sort_mode: SortMode,
+    search: Option<&str>,
+    collapsed: &HashSet<String>,
+) -> Vec<VisibleRow> {
     let in_group = |h: &HostState| {
         let g = if h.group.is_empty() { "default" } else { &h.group };
         group_filter.map_or(true, |f| g == f)
     };
     // Down-only (ex down box) hides up hosts everywhere, grouped or flat.
     let visible = |h: &HostState| {
-        in_group(h) && (sort_mode != SortMode::DownOnly || !h.up)
+        in_group(h)
+            && (sort_mode != SortMode::DownOnly || !h.up)
+            && host_matches_search(h, search)
     };
     if !group_by {
         let mut indices: Vec<usize> = hosts.iter().enumerate()
@@ -1021,7 +835,7 @@ fn build_visible_rows(hosts: &[HostState], group_by: bool, group_filter: Option<
                 let up = hosts[idx].up;
                 if last_up != Some(up) {
                     let label = if up { "Up".to_string() } else { "Down".to_string() };
-                    rows.push(VisibleRow { kind: RowKind::GroupHeader(label), host_idx: None });
+                    rows.push(VisibleRow { kind: RowKind::GroupHeader { name: label, collapsed: false, hidden: 0 }, host_idx: None });
                     last_up = Some(up);
                 }
                 rows.push(VisibleRow { kind: RowKind::Host, host_idx: Some(idx) });
@@ -1041,7 +855,7 @@ fn build_visible_rows(hosts: &[HostState], group_by: bool, group_filter: Option<
                     hosts[idx].group.clone()
                 };
                 if last_header.as_deref() != Some(&header) {
-                    rows.push(VisibleRow { kind: RowKind::GroupHeader(header.clone()), host_idx: None });
+                    rows.push(VisibleRow { kind: RowKind::GroupHeader { name: header.clone(), collapsed: false, hidden: 0 }, host_idx: None });
                     last_header = Some(header);
                 }
                 rows.push(VisibleRow { kind: RowKind::Host, host_idx: Some(idx) });
@@ -1066,11 +880,22 @@ fn build_visible_rows(hosts: &[HostState], group_by: bool, group_filter: Option<
     });
     let mut rows = Vec::new();
     for group in group_names {
-        rows.push(VisibleRow { kind: RowKind::GroupHeader(group.clone()), host_idx: None });
+        let is_collapsed = collapsed.contains(&group);
         let mut indices = groups[&group].clone();
         // Default grouped behavior is down-first per group; explicit sort overrides.
         let mode = if sort_mode == SortMode::None { SortMode::DownFirst } else { sort_mode };
         sort_host_indices(&mut indices, hosts, mode);
+        if is_collapsed {
+            rows.push(VisibleRow {
+                kind: RowKind::GroupHeader { name: group.clone(), collapsed: true, hidden: indices.len() },
+                host_idx: None,
+            });
+            continue;
+        }
+        rows.push(VisibleRow {
+            kind: RowKind::GroupHeader { name: group.clone(), collapsed: false, hidden: 0 },
+            host_idx: None,
+        });
         for idx in indices {
             rows.push(VisibleRow { kind: RowKind::Host, host_idx: Some(idx) });
         }
@@ -1083,7 +908,7 @@ fn selected_visible_position(rows: &[VisibleRow], selected_idx: usize) -> Option
 }
 
 fn move_selection_up(app: &mut App) {
-    let rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode);
+    let rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode, app.search.as_deref(), &app.collapsed);
     if let Some(pos) = selected_visible_position(&rows, app.selected_idx) {
         for i in (0..pos).rev() {
             if let Some(idx) = rows[i].host_idx {
@@ -1098,7 +923,7 @@ fn move_selection_up(app: &mut App) {
 }
 
 fn move_selection_down(app: &mut App) {
-    let rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode);
+    let rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode, app.search.as_deref(), &app.collapsed);
     if let Some(pos) = selected_visible_position(&rows, app.selected_idx) {
         for i in pos + 1..rows.len() {
             if let Some(idx) = rows[i].host_idx {
@@ -1113,8 +938,20 @@ fn move_selection_down(app: &mut App) {
 }
 
 fn render_host_row(h: &HostState, is_selected: bool, theme: &Theme, graph_width: usize) -> Row<'static> {
-    let status_color = if h.up { theme.status_good } else { theme.status_danger };
-    let status_label = if h.up { "UP" } else { "DOWN" };
+    let flapping = h.flapping();
+    let (status_color, status_label) = if flapping {
+        (theme.hi_fg, "FLAP")
+    } else if h.up {
+        (theme.status_good, "UP")
+    } else {
+        (theme.status_danger, "DOWN")
+    };
+    // Fresh transitions flash underlined for ~15s.
+    let status_style = if h.just_changed() {
+        Style::default().fg(status_color).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(status_color).add_modifier(Modifier::BOLD)
+    };
     let latency_str = if h.up { format!("{:.0} ms", h.latency_ms) } else { "—".to_string() };
     let uptime = if h.total_checks > 0 { h.up_checks as f64 / h.total_checks as f64 * 100.0 } else { 0.0 };
     let row_style = if is_selected {
@@ -1122,14 +959,14 @@ fn render_host_row(h: &HostState, is_selected: bool, theme: &Theme, graph_width:
     } else {
         Style::default().bg(theme.main_bg).fg(theme.main_fg)
     };
-    // Name cell: alias (title color) or the raw target.
+    // Name cell: alias, or the raw target (`host:port` for TCP checks).
     let name_line = match &h.alias {
         Some(alias) => Span::styled(alias.clone(), Style::default().fg(theme.title)),
-        None => Span::styled(h.name.clone(), Style::default().fg(theme.title)),
+        None => Span::styled(h.target(), Style::default().fg(theme.title)),
     };
-    // IP column shows the target only when an alias is set, otherwise empty.
+    // IP column shows the full target when an alias is set, otherwise empty.
     let ip_line = if h.alias.is_some() {
-        Span::styled(h.name.clone(), Style::default().fg(theme.inactive_fg))
+        Span::styled(h.target(), Style::default().fg(theme.inactive_fg))
     } else {
         Span::styled("", Style::default())
     };
@@ -1139,17 +976,17 @@ fn render_host_row(h: &HostState, is_selected: bool, theme: &Theme, graph_width:
         Cell::from(ip_line),
         Cell::from(Line::from(vec![
             Span::styled("● ", Style::default().fg(status_color)),
-            Span::styled(status_label, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+            Span::styled(status_label, status_style),
         ])),
         Cell::from(Span::styled(latency_str, Style::default().fg(theme.main_fg))),
-        Cell::from(Span::styled(format!("{}m", h.interval_m), Style::default().fg(theme.inactive_fg))),
+        Cell::from(Span::styled(format_interval(h.interval_secs), Style::default().fg(theme.inactive_fg))),
         Cell::from(Span::styled(format!("{:.1}%", uptime), Style::default().fg(theme.graph_text))),
         Cell::from(Span::styled(h.group.clone(), Style::default().fg(theme.inactive_fg))),
         Cell::from(render_graph(&h.history, theme, graph_width)),
     ]).style(row_style)
 }
 
-fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme) -> Row<'static> {
+fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme, collapsed: bool, hidden: usize) -> Row<'static> {
     // In flat-sort-by-status mode the pseudo-group is "Down" / "Up".
     let is_status_label = group == "Down" || group == "Up";
     let indices: Vec<usize> = hosts.iter().enumerate()
@@ -1184,6 +1021,13 @@ fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme) -> Row<'
         spans.push(Span::styled(format!("{} host(s)", indices.len()), Style::default().fg(theme.inactive_fg)));
         spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
     }
+    if collapsed {
+        spans.push(Span::styled(
+            format!("{} hidden — Enter to expand", hidden),
+            Style::default().fg(theme.hi_fg),
+        ));
+        spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
+    }
     spans.push(Span::styled("──────────", Style::default().fg(theme.divider)));
     Row::new(vec![
         Cell::from(Line::from(spans)),
@@ -1211,6 +1055,8 @@ fn footer_hints() -> Vec<(&'static str, &'static str)> {
         ("g", "group"),
         ("f", "filter"),
         ("s", "sort"),
+        ("/", "search"),
+        ("?", "keys"),
         ("t", "theme"),
         ("u", "update"),
         ("q", "quit"),
@@ -1232,10 +1078,39 @@ fn short_footer_hints() -> Vec<(&'static str, &'static str)> {
         ("g", "grp"),
         ("f", "flt"),
         ("s", "sort"),
+        ("/", "find"),
+        ("?", "keys"),
         ("t", "thm"),
         ("u", "upd"),
         ("q", "quit"),
     ]
+}
+
+/// Keys-only last resort: every binding as a bare key, packed into MENU_ROWS.
+fn keys_only_lines(theme: &Theme, max_width: usize) -> Vec<Line<'static>> {
+    let keys = ["↑↓", "Spc", "a", "d", "e", "h", "c", "i", "E", "g", "f", "s", "/", "?", "t", "u", "q", "Esc"];
+    let mut rows: Vec<Vec<Span<'static>>> = vec![vec![Span::raw("  ")]];
+    let mut used = 2usize;
+    for k in keys {
+        let w = k.chars().count() + 3; // " [k]"
+        if used + w > max_width {
+            if rows.len() >= MENU_ROWS {
+                break;
+            }
+            rows.push(vec![Span::raw("  ")]);
+            used = 2;
+        }
+        rows.last_mut().unwrap().push(Span::styled(
+            format!("[{}]", k),
+            Style::default().fg(theme.hi_fg),
+        ));
+        rows.last_mut().unwrap().push(Span::raw(" "));
+        used += w;
+    }
+    while rows.len() < MENU_ROWS {
+        rows.push(vec![Span::raw("")]);
+    }
+    rows.into_iter().map(Line::from).collect()
 }
 
 fn hint_cell_width(key: &str, label: &str) -> usize {
@@ -1298,6 +1173,9 @@ fn build_footer_lines(theme: &Theme, update_available: Option<&str>, max_width: 
     let short = short_footer_hints();
     if let Some(lines) = pack_menu_rows(theme, &short, badge.as_deref(), max_width) {
         return lines;
+    }
+    if badge.is_none() {
+        return keys_only_lines(theme, max_width);
     }
     // Very narrow: fill rows with short hints, put the rest behind [M].
     let mut rows: Vec<Vec<Span<'static>>> = vec![vec![Span::raw("  ")]];
@@ -1400,6 +1278,33 @@ fn ui(frame: &mut Frame, app: &mut App) {
         title_inner,
     );
 
+    // Update pill in the top-right corner: ambient "update ready" notice
+    // tied to the `u` key. Skipped on narrow windows where it would collide
+    // with the centered logo (the footer badge still shows there).
+    if let Some(ref version) = app.update_available {
+        let pill = format!(" ↑ v{} ready — u to update ", version);
+        let pill_w = pill.chars().count() as u16;
+        if title_inner.width >= 72 && pill_w + 2 < title_inner.width {
+            let pill_area = Rect {
+                x: title_inner.x + title_inner.width - pill_w - 1,
+                y: title_inner.y,
+                width: pill_w,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    pill,
+                    Style::default()
+                        .fg(theme.hi_fg)
+                        .add_modifier(Modifier::BOLD)
+                        .bg(theme.popup_bg),
+                )))
+                .alignment(Alignment::Right),
+                pill_area,
+            );
+        }
+    }
+
     // ── Stats box: dedicated box under header with up / down / % up ──
     let stats_title = Line::from(vec![
         Span::styled(" ▐ ", Style::default().fg(theme.hi_fg)),
@@ -1415,7 +1320,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .style(Style::default().bg(theme.main_bg));
     let stats_inner = stats_block.inner(stats_area);
     frame.render_widget(stats_block, stats_area);
-    let stats_line = Line::from(vec![
+    let flap_count = app.hosts.iter().filter(|h| h.flapping()).count();
+    let mut stats_spans = vec![
         Span::styled("● ", Style::default().fg(theme.status_good)),
         Span::styled(format!("{} up", up_count), Style::default().fg(theme.status_good).add_modifier(Modifier::BOLD)),
         Span::styled("   ", Style::default()),
@@ -1425,7 +1331,20 @@ fn ui(frame: &mut Frame, app: &mut App) {
         Span::styled("◐ ", Style::default().fg(theme.hi_fg)),
         Span::styled(format!("{}% up", pct_up), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
         Span::styled(format!("  ·  {} hosts", total), Style::default().fg(theme.inactive_fg)),
-    ]);
+    ];
+    if flap_count > 0 {
+        stats_spans.push(Span::styled(
+            format!("  ·  ~{} flapping", flap_count),
+            Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(q) = app.search.as_deref().filter(|q| !q.trim().is_empty()) {
+        stats_spans.push(Span::styled(
+            format!("  ·  /{}", q),
+            Style::default().fg(theme.hi_fg),
+        ));
+    }
+    let stats_line = Line::from(stats_spans);
     let stats_right = Line::from(vec![
         Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), Style::default().fg(theme.inactive_fg)),
         Span::styled(now, Style::default().fg(theme.inactive_fg)),
@@ -1460,10 +1379,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""), Cell::from(""),
         ]));
     } else {
-        let visible_rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode);
+        let visible_rows = build_visible_rows(&app.hosts, app.group_by, app.group_filter.as_deref(), app.sort_mode, app.search.as_deref(), &app.collapsed);
         for row in visible_rows {
             match row.kind {
-                RowKind::GroupHeader(group) => rows.push(render_group_header(&group, &app.hosts, &theme)),
+                RowKind::GroupHeader { name, collapsed, hidden } => rows.push(render_group_header(&name, &app.hosts, &theme, collapsed, hidden)),
                 RowKind::Host => {
                     let idx = row.host_idx.unwrap();
                     rows.push(render_host_row(&app.hosts[idx], idx == app.selected_idx, &theme, app.config.graph_width));
@@ -1517,7 +1436,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 InputMode::SortPicker { .. } => Text::from(Line::from(vec![
                     Span::styled("View", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
-                    Span::raw("[↑↓] pick   [1-6] quick   [Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                    Span::raw("[↑↓] pick   [1-6] quick   [Space] show all   [Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
                 ])),
                 InputMode::GroupFilterPicker { .. } => Text::from(Line::from(vec![
                     Span::styled("Filter group", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
@@ -1562,6 +1481,19 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     Span::raw("   "),
                     Span::raw("[Esc/M] close").style(Style::default().fg(theme.inactive_fg)),
                 ])),
+                InputMode::KeysHelp => Text::from(Line::from(vec![
+                    Span::styled("Keys", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[Esc/?] close").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::Search { ref query } => {
+                    let q = if query.is_empty() { " ".to_string() } else { format!("{}▌", query) };
+                    Text::from(Line::from(vec![
+                        Span::styled("Search ", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                        Span::styled(q, Style::default().fg(theme.hi_fg)),
+                        Span::styled("   [Enter] keep   [Esc] clear", Style::default().fg(theme.inactive_fg)),
+                    ]))
+                }
                 InputMode::Normal => unreachable!(),
             };
             // Same fixed-height box as the menu so the layout never shifts.
@@ -1576,6 +1508,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 InputMode::ExportPath { .. } => "export",
                 InputMode::ThemePicker { .. } => "theme",
                 InputMode::MenuModal => "menu",
+                InputMode::KeysHelp => "keys",
+                InputMode::Search { .. } => "search",
                 InputMode::Normal => unreachable!(),
             };
             let block = menu_box(accent_title(mode_title, &theme));
@@ -1589,12 +1523,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
     match app.input_mode {
         InputMode::AddHost(ref form) | InputMode::EditEntry { ref form, .. } => {
             let title_text = if matches!(app.input_mode, InputMode::AddHost(_)) { "Add host" } else { "Edit host" };
-            let popup_area = centered_rect(56, 40, area);
-            let labels = ["host (IP/name)", "interval (min)", "group", "display name"];
-            let values = [&form.host, &form.interval, &form.group, &form.alias];
-            let placeholder = ["e.g. 8.8.8.8", "2", "default", "optional"];
+            let popup_area = centered_rect(56, 48, area);
+            let labels = ["host (IP/name)", "interval (30s/5m)", "group", "display name", "TCP port"];
+            let values = [&form.host, &form.interval, &form.group, &form.alias, &form.port];
+            let placeholder = ["e.g. 8.8.8.8", "2m", "default", "optional", "blank = ping"];
             let mut lines: Vec<Line> = Vec::new();
-            for i in 0..4 {
+            for i in 0..AddHostForm::FIELDS {
                 let focused = form.focus == i;
                 let marker = if focused { "▶ " } else { "  " };
                 // Visible text cursor on the focused field so keyboard-first
@@ -1650,7 +1584,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ]));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from("[↑↓/1-6] pick   [Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)));
+            lines.push(Line::from("[↑↓/1-6] pick   [Space] show all   [Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)));
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
                     .title(accent_title("View: sort & filter", &theme))
@@ -1877,6 +1811,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ("g", "group"),
                 ("f", "filter group"),
                 ("s", "view/sort"),
+                ("/", "search"),
+                ("?", "keys"),
+                ("Enter", "collapse group"),
                 ("t", "theme"),
                 ("u", "update"),
                 ("q", "quit"),
@@ -1908,6 +1845,42 @@ fn ui(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
         }
+        InputMode::KeysHelp => {
+            let sections: Vec<(&str, Vec<(&str, &str)>)> = vec![
+                ("navigate", vec![("↑/↓", "select"), ("Enter", "collapse group"), ("g", "grouped/flat")]),
+                ("hosts", vec![("a", "add"), ("e", "edit"), ("d", "delete"), ("c", "clear stats")]),
+                ("inspect", vec![("h", "history"), ("s", "view/sort"), ("f", "filter group"), ("/", "search")]),
+                ("run", vec![("Space/p", "ping now"), ("i", "import csv"), ("E", "export csv")]),
+                ("app", vec![("t", "theme"), ("u", "update"), ("M", "menu"), ("?", "this help"), ("q", "quit"), ("Esc", "reset view")]),
+            ];
+            let popup_height = ((sections.len() + 6).min(area.height as usize).max(8)) as u16;
+            let popup_area = centered_rect(62, popup_height, area);
+            let mut lines = vec![Line::from("")];
+            for (title, items) in &sections {
+                let mut spans = vec![
+                    Span::styled(format!("  {:<9}", title), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                ];
+                for (i, (k, l)) in items.iter().enumerate() {
+                    if i > 0 {
+                        spans.push(Span::raw("  "));
+                    }
+                    spans.extend(key_hint(k, l, &theme));
+                }
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("[Esc/?] close").style(Style::default().fg(theme.inactive_fg)));
+            let popup = Paragraph::new(Text::from(lines))
+                .block(Block::default()
+                    .title(accent_title("key bindings", &theme))
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.box_color))
+                    .style(Style::default().bg(theme.popup_bg)));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(popup, popup_area);
+        }
         InputMode::ConfirmDelete => {
             let popup_area = centered_rect(45, 14, area);
             let name = app.hosts.get(app.selected_idx).map(|h| h.name.clone()).unwrap_or_default();
@@ -1930,7 +1903,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
         }
-        InputMode::Normal => {}
+        // Search renders in the footer box; KeysHelp above.
+        InputMode::Search { .. } | InputMode::Normal => {}
     }
 
     // Update / info overlay (shown on top of any input mode).
@@ -1979,8 +1953,8 @@ fn spawn_worker(tx: mpsc::Sender<Message>, hosts: Arc<RwLock<Vec<HostSchedule>>>
                 let wait = host.next_ping.saturating_duration_since(now);
                 if wait.is_zero() {
                     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                    let (up, latency_ms) = ping_host(&host.name, timeout_ms, &re);
-                    let interval_secs = host.interval_m * 60;
+                    let (up, latency_ms) = check_host(&host.name, host.port, timeout_ms, &re);
+                    let interval_secs = host.interval_secs;
                     let next_ping = Instant::now() + Duration::from_secs(interval_secs) + host_jitter(&host.name, interval_secs);
                     if let Ok(mut list) = hosts.write() {
                         if let Some(h) = list.iter_mut().find(|h| h.name == host.name) {
@@ -2478,13 +2452,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 if let Some(h) = app.hosts.get(app.selected_idx) {
                                     app.input_mode = InputMode::EditEntry {
                                         original: h.name.clone(),
-                                        form: AddHostForm {
-                                            host: h.name.clone(),
-                                            interval: h.interval_m.to_string(),
-                                            group: h.group.clone(),
-                                            alias: h.alias.clone().unwrap_or_default(),
-                                            focus: 0,
-                                        },
+                                        form: AddHostForm::for_host(h),
                                     };
                                 }
                             }
@@ -2551,6 +2519,26 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('m') | KeyCode::Char('M') => {
                                 app.input_mode = InputMode::MenuModal;
                             }
+                            KeyCode::Char('?') => {
+                                app.input_mode = InputMode::KeysHelp;
+                            }
+                            KeyCode::Char('/') => {
+                                let q = app.search.clone().unwrap_or_default();
+                                app.input_mode = InputMode::Search { query: q };
+                            }
+                            // Enter collapses/expands the selected host's group.
+                            KeyCode::Enter => {
+                                app.toggle_collapse_selected();
+                            }
+                            // Get out of any sort/filter: Esc restores the full host list.
+                            KeyCode::Esc => {
+                                if app.sort_mode != SortMode::None || app.group_filter.is_some() {
+                                    app.sort_mode = SortMode::None;
+                                    app.group_filter = None;
+                                    app.save_prefs();
+                                    app.update_state = UpdateState::Info("view reset — showing all hosts".to_string());
+                                }
+                            }
                             KeyCode::Up => move_selection_up(app),
                             KeyCode::Down => move_selection_down(app),
                             _ => {}
@@ -2559,8 +2547,8 @@ fn run_app<B: ratatui::backend::Backend>(
                             let mut form = form0.clone();
                             match key.code {
                                 KeyCode::Esc => { app.input_mode = InputMode::Normal; }
-                                KeyCode::Tab | KeyCode::Down => { form.focus = (form.focus + 1) % 4; app.input_mode = InputMode::AddHost(form); }
-                                KeyCode::BackTab | KeyCode::Up => { form.focus = (form.focus + 3) % 4; app.input_mode = InputMode::AddHost(form); }
+                                KeyCode::Tab | KeyCode::Down => { form.focus = (form.focus + 1) % AddHostForm::FIELDS; app.input_mode = InputMode::AddHost(form); }
+                                KeyCode::BackTab | KeyCode::Up => { form.focus = (form.focus + AddHostForm::FIELDS - 1) % AddHostForm::FIELDS; app.input_mode = InputMode::AddHost(form); }
                                 KeyCode::Enter => {
                                     let host = form.host.trim().to_string();
                                     if host.is_empty() {
@@ -2573,18 +2561,30 @@ fn run_app<B: ratatui::backend::Backend>(
                                         app.input_mode = InputMode::AddHost(form);
                                         continue;
                                     }
-                                    let interval = form.interval.trim().parse().unwrap_or(DEFAULT_INTERVAL_M).max(1);
+                                    let interval_secs = parse_interval(&form.interval).unwrap_or(DEFAULT_INTERVAL_SECS);
+                                    if interval_secs < config::MIN_INTERVAL_SECS {
+                                        app.update_state = UpdateState::Info(format!("minimum interval is {}s", config::MIN_INTERVAL_SECS));
+                                        app.input_mode = InputMode::AddHost(form);
+                                        continue;
+                                    }
                                     let group = form.group.trim().to_string();
                                     let alias = form.alias.trim().to_string();
+                                    let port = form.port.trim().parse::<u16>().ok().filter(|p| *p > 0);
+                                    if !form.port.trim().is_empty() && port.is_none() {
+                                        app.update_state = UpdateState::Info("port must be 1-65535 (blank = ping)".to_string());
+                                        app.input_mode = InputMode::AddHost(form);
+                                        continue;
+                                    }
                                     app.input_mode = InputMode::Normal;
-                                    app.add_host(host, interval, group, alias, &shared_hosts);
+                                    app.add_host(host, interval_secs, group, alias, port, &shared_hosts);
                                 }
                                 KeyCode::Backspace => {
                                     match form.focus {
                                         0 => { form.host.pop(); }
                                         1 => { form.interval.pop(); }
                                         2 => { form.group.pop(); }
-                                        _ => { form.alias.pop(); }
+                                        3 => { form.alias.pop(); }
+                                        _ => { form.port.pop(); }
                                     }
                                     app.input_mode = InputMode::AddHost(form);
                                 }
@@ -2593,7 +2593,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                         0 => form.host.push(c),
                                         1 => form.interval.push(c),
                                         2 => form.group.push(c),
-                                        _ => form.alias.push(c),
+                                        3 => form.alias.push(c),
+                                        _ => form.port.push(c),
                                     }
                                     app.input_mode = InputMode::AddHost(form);
                                 }
@@ -2612,6 +2613,12 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             KeyCode::Enter => {
                                 app.sort_mode = SortMode::from_index(selected);
+                                app.save_prefs();
+                                app.input_mode = InputMode::Normal;
+                            }
+                            // Space = show all: clears back to the unfiltered list.
+                            KeyCode::Char(' ') => {
+                                app.sort_mode = SortMode::None;
                                 app.save_prefs();
                                 app.input_mode = InputMode::Normal;
                             }
@@ -2753,16 +2760,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.clear_selected_stats();
                                 }
                                 KeyCode::Char('e') => {
-                                    if let Some(h) = app.hosts.get(app.selected_idx).cloned() {
+                                    if let Some(h) = app.hosts.get(app.selected_idx) {
                                         app.input_mode = InputMode::EditEntry {
                                             original: h.name.clone(),
-                                            form: AddHostForm {
-                                                host: h.name.clone(),
-                                                interval: h.interval_m.to_string(),
-                                                group: h.group.clone(),
-                                                alias: h.alias.clone().unwrap_or_default(),
-                                                focus: 0,
-                                            },
+                                            form: AddHostForm::for_host(h),
                                         };
                                     } else {
                                         app.input_mode = InputMode::Normal;
@@ -2778,6 +2779,17 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Char('s') | KeyCode::Char('S') => {
                                     app.input_mode = InputMode::SortPicker { selected: app.sort_mode.index() };
                                 }
+                                KeyCode::Char('/') => {
+                                    let q = app.search.clone().unwrap_or_default();
+                                    app.input_mode = InputMode::Search { query: q };
+                                }
+                                KeyCode::Char('?') => {
+                                    app.input_mode = InputMode::KeysHelp;
+                                }
+                                KeyCode::Enter => {
+                                    app.input_mode = InputMode::Normal;
+                                    app.toggle_collapse_selected();
+                                }
                                 KeyCode::Char('g') => {
                                     app.input_mode = InputMode::Normal;
                                     app.group_by = !app.group_by;
@@ -2790,13 +2802,44 @@ fn run_app<B: ratatui::backend::Backend>(
                                 _ => {}
                             }
                         }
+                        InputMode::KeysHelp => match key.code {
+                            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                                app.input_mode = InputMode::Normal;
+                            }
+                            _ => {}
+                        },
+                        InputMode::Search { ref query } => {
+                            let mut query = query.clone();
+                            match key.code {
+                                // Esc clears the filter entirely; Enter keeps it.
+                                KeyCode::Esc => {
+                                    query.clear();
+                                    app.search = None;
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Enter => {
+                                    app.input_mode = InputMode::Normal;
+                                }
+                                KeyCode::Backspace => {
+                                    query.pop();
+                                    app.search = if query.is_empty() { None } else { Some(query.clone()) };
+                                    app.input_mode = InputMode::Search { query };
+                                }
+                                KeyCode::Char(c) => {
+                                    query.push(c);
+                                    app.search = Some(query.clone());
+                                    app.input_mode = InputMode::Search { query };
+                                }
+                                _ => {}
+                            }
+                        }
                         InputMode::EditEntry { ref original, ref form } => {
                             let original = original.clone();
                             let mut form = form.clone();
                             match key.code {
                                 KeyCode::Esc => { app.input_mode = InputMode::Normal; }
-                                KeyCode::Tab | KeyCode::Down => { form.focus = (form.focus + 1) % 4; app.input_mode = InputMode::EditEntry { original, form }; }
-                                KeyCode::BackTab | KeyCode::Up => { form.focus = (form.focus + 3) % 4; app.input_mode = InputMode::EditEntry { original, form }; }
+                                KeyCode::Tab | KeyCode::Down => { form.focus = (form.focus + 1) % AddHostForm::FIELDS; app.input_mode = InputMode::EditEntry { original, form }; }
+                                KeyCode::BackTab | KeyCode::Up => { form.focus = (form.focus + AddHostForm::FIELDS - 1) % AddHostForm::FIELDS; app.input_mode = InputMode::EditEntry { original, form }; }
                                 KeyCode::Enter => {
                                     if form.host.trim().is_empty() {
                                         app.update_state = UpdateState::Info("host/IP is required".to_string());
@@ -2809,6 +2852,16 @@ fn run_app<B: ratatui::backend::Backend>(
                                         app.input_mode = InputMode::EditEntry { original, form };
                                         continue;
                                     }
+                                    if parse_interval(&form.interval).map_or(true, |s| s < config::MIN_INTERVAL_SECS) {
+                                        app.update_state = UpdateState::Info(format!("minimum interval is {}s", config::MIN_INTERVAL_SECS));
+                                        app.input_mode = InputMode::EditEntry { original, form };
+                                        continue;
+                                    }
+                                    if !form.port.trim().is_empty() && form.port.trim().parse::<u16>().ok().filter(|p| *p > 0).is_none() {
+                                        app.update_state = UpdateState::Info("port must be 1-65535 (blank = ping)".to_string());
+                                        app.input_mode = InputMode::EditEntry { original, form };
+                                        continue;
+                                    }
                                     let form2 = form.clone();
                                     app.input_mode = InputMode::Normal;
                                     app.edit_entry(original, form2, &shared_hosts);
@@ -2818,7 +2871,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                         0 => { form.host.pop(); }
                                         1 => { form.interval.pop(); }
                                         2 => { form.group.pop(); }
-                                        _ => { form.alias.pop(); }
+                                        3 => { form.alias.pop(); }
+                                        _ => { form.port.pop(); }
                                     }
                                     app.input_mode = InputMode::EditEntry { original, form };
                                 }
@@ -2827,7 +2881,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                         0 => form.host.push(c),
                                         1 => form.interval.push(c),
                                         2 => form.group.push(c),
-                                        _ => form.alias.push(c),
+                                        3 => form.alias.push(c),
+                                        _ => form.port.push(c),
                                     }
                                     app.input_mode = InputMode::EditEntry { original, form };
                                 }
@@ -2853,7 +2908,12 @@ fn run_app<B: ratatui::backend::Backend>(
                 Message::Result { host, up, latency_ms, timestamp, next_ping } => {
                     app.last_check = timestamp.clone();
                     app.last_result_time = Some(Instant::now());
+                    // Notify on transitions only (skip the very first result per host).
+                    let mut transition: Option<(String, bool, f64, String)> = None;
                     if let Some(h) = app.hosts.iter_mut().find(|h| h.name == host) {
+                        let first = h.total_checks == 0;
+                        let changed = !first && up != h.up;
+                        h.note_result(up, Instant::now());
                         h.up = up;
                         h.latency_ms = latency_ms;
                         h.next_ping = next_ping;
@@ -2866,6 +2926,18 @@ fn run_app<B: ratatui::backend::Backend>(
                         }
                         let status = if up { "UP" } else { "DOWN" };
                         let _ = log_result(&timestamp, &h.name, status, latency_ms);
+                        if changed {
+                            transition = Some((h.target(), up, latency_ms, timestamp.clone()));
+                        }
+                    }
+                    if let Some((target, up, latency_ms, timestamp)) = transition {
+                        if let Some(url) = app.config.webhook_url.clone() {
+                            post_webhook(url, target.clone(), up, latency_ms, timestamp);
+                        }
+                        if app.config.notify_bell && !up {
+                            print!("\x07");
+                            let _ = io::stdout().flush();
+                        }
                     }
                 }
                 Message::UpdateAvailable { version } => {
@@ -2891,7 +2963,96 @@ fn run_app<B: ratatui::backend::Backend>(
     }
 }
 
+/// Headless single pass: check every host once, print results, exit.
+/// Exit 0 = all up, 2 = any down, 1 = usage/config error. No files touched.
+fn run_once(format: &str) -> io::Result<()> {
+    let config = Config::load();
+    if config.hosts.is_empty() {
+        eprintln!("no hosts configured");
+        return Ok(());
+    }
+    let timeout_ms = config.timeout_ms;
+    let mut handles = Vec::new();
+    for h in config.hosts.clone() {
+        handles.push(thread::spawn(move || {
+            let re = Regex::new(r"time[<=]([\d.]+)\s*ms").unwrap();
+            let (up, latency_ms) = check_host(&h.name, h.port, timeout_ms, &re);
+            (h, up, latency_ms)
+        }));
+    }
+    let mut results = Vec::new();
+    for handle in handles {
+        if let Ok(r) = handle.join() {
+            results.push(r);
+        }
+    }
+    results.sort_by(|a, b| a.0.display_name().cmp(&b.0.display_name()));
+    let down = results.iter().filter(|(_, up, _)| !up).count();
+    if format == "json" {
+        let items: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(h, up, latency_ms)| {
+                serde_json::json!({
+                    "name": h.name,
+                    "alias": h.alias,
+                    "group": h.group,
+                    "port": h.port,
+                    "up": up,
+                    "latency_ms": if *up { serde_json::Value::from(*latency_ms) } else { serde_json::Value::Null },
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({ "hosts": items, "down": down }).to_string()
+        );
+    } else {
+        for (h, up, latency_ms) in &results {
+            let status = if *up {
+                format!("UP {:.0} ms", latency_ms)
+            } else {
+                "DOWN".to_string()
+            };
+            println!("{:<24} {:<16} {}", h.display_name(), h.target(), status);
+        }
+    }
+    // Exit code doubles as the probe result for cron/systemd.
+    std::process::exit(if down > 0 { 2 } else { 0 });
+}
+
+fn print_usage() {
+    println!("ping-uin — btop-style TUI for monitoring hosts");
+    println!();
+    println!("Usage:");
+    println!("  ping-uin                 run the TUI");
+    println!("  ping-uin --once [--format json|text]   check once, print, exit (0=all up, 2=any down)");
+    println!("  ping-uin --help          show this help");
+}
+
 fn main() -> io::Result<()> {
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        return Ok(());
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--once") {
+        let format = args
+            .get(pos + 1)
+            .and_then(|a| {
+                if a == "--format" {
+                    args.get(pos + 2).cloned()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "text".to_string());
+        if format != "text" && format != "json" {
+            eprintln!("--format must be text or json");
+            std::process::exit(1);
+        }
+        return run_once(&format);
+    }
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
@@ -2901,7 +3062,7 @@ fn main() -> io::Result<()> {
 
     let config = Config::load();
     let mut hosts: Vec<HostState> = config.hosts.iter()
-        .map(|h| HostState::new(&h.name, h.interval_m, &h.group, h.alias.clone()))
+        .map(|h| HostState::new(&h.name, h.effective_interval_secs(), &h.group, h.alias.clone(), h.port))
         .collect();
     seed_from_log(&mut hosts, config.graph_width)?;
 
@@ -2913,11 +3074,14 @@ fn main() -> io::Result<()> {
 
     let themes = build_themes();
     let theme_idx = themes.iter().position(|t| t.name == config.theme).unwrap_or(0);
+    let collapsed: HashSet<String> = config.collapsed_groups.iter().cloned().collect();
     let mut app = App {
         themes,
         theme_idx,
         group_by: config.group_by,
         sort_mode: config.sort_mode,
+        collapsed,
+        search: None,
         config,
         hosts,
         selected_idx: 0,

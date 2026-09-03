@@ -21,10 +21,15 @@ A pink little penguin face ((•O•)) watches over your network.
 `ping-uin` is a lightweight TUI that pings your devices on **per-host intervals**
 and shows the results in a rolling, btop-style interface:
 
-* **Per-host intervals** — one host can ping every minute, another every 30 minutes
+* **Per-host intervals** — `30s`, `5m`, or `2h` per host, down to 5 seconds
+* **Ping or TCP** — ICMP ping by default, or set a port (`db.internal:5432`) for a connect check
 * **Per-host history strip** — `■` green blocks for up, red `_` for down, newest on the left
-* **Grouped view** with down-first ordering inside each group
+* **Flap + flash** — flapping hosts read `FLAP`, fresh transitions flash underlined
+* **Grouped view** with collapsible groups (`Enter`) and down-first ordering
 * **View picker** — order by down-first / up-first / name / group, or filter to **down only**
+* **`/` search** across names, aliases, and groups
+* **Notifications** — generic webhook POST plus optional terminal bell on up/down transitions
+* **Headless `--once` mode** — one pass over all hosts as text or JSON, exit code doubles as the probe result
 * **Multiple themes** — `btop`, `dracula`, `nord`, `gruvbox-dark`, `ayu-light`, `archwave`
 * **CSV bulk import** — dump your host list in a spreadsheet, import in one press
 * **Alias your IPs** — turn `1.1.1.1` into `Cloudflare`, `server3.internal` into `DB host`
@@ -63,11 +68,18 @@ gateway (`192.168.1.1`), and `google.com`.
 | `E` | export host list to timestamped CSV |
 | `g` | toggle grouped/flat view |
 | `f` | filter by group (`Space` = show all, `Esc` = cancel) |
-| `s` | view picker — `off` / down-first / up-first / name / group / **down only** (`1-6` quick-pick) |
+| `s` | view picker — `off` / down-first / up-first / name / group / **down only** (`1-6` quick-pick, `Space` = show all) |
+| `Esc` | reset view — clear any sort/group filter and show all hosts |
+| `Enter` | collapse/expand the selected host's group |
+| `/` | search names, aliases, groups (`Enter` keeps, `Esc` clears) |
+| `?` | full key-binding cheat sheet |
 | `t` | theme picker (live preview, persists) |
 | `u` | check for updates / install when available |
 | `M` | full menu (actionable) |
 | `q` / `Ctrl+C` | quit (cleanly!) |
+
+> Intervals accept `30s`, `5m`, `2h`, or bare minutes (`2` = 2m), minimum `5s`.
+> Set a TCP port per host to check `host:port` connects instead of pinging.
 
 > The bottom menu lives in its own bordered box with a fixed height — it
 > never resizes or shifts the table. On narrow windows labels abbreviate,
@@ -84,12 +96,17 @@ Press `i` and the app prompts for a CSV path (defaulting to the `hosts.csv`
 in your config dir) and merges it — new rows added, existing rows updated:
 
 ```csv
-name,interval_m,group,alias
-8.8.8.8,1,public-dns,Google DNS
-1.1.1.1,2,public-dns,Cloudflare
-server3.internal,5,router,Server 3
-192.168.1.1,3,router,
+name,interval,group,alias,port
+8.8.8.8,1m,public-dns,Google DNS,
+1.1.1.1,2m,public-dns,Cloudflare,
+server3.internal,5m,router,Server 3,
+db.internal,30s,databases,Primary DB,5432
+192.168.1.1,3m,router,,
 ```
+
+Intervals accept `30s`/`5m`/`2h` (bare numbers mean minutes); a `port`
+turns the row into a TCP connect check instead of a ping. Legacy 4-column
+files without `port` still import fine.
 
 New rows become new pings; existing rows get updated. Sync round-trips both
 ways — `hosts.csv` is also rewritten on every in-TUI change, so you can always
@@ -108,7 +125,7 @@ On Windows: `%APPDATA%\ping-uin\` (usually `C:\Users\<you>\AppData\Roaming\ping-
 
 | File | Purpose |
 |------|---------|
-| `ip-top.json` | full config (gitignored by default — your IPs are yours) |
+| `ping-uin.json` | full config (gitignored by default — your IPs are yours; an old `ip-top.json` is migrated automatically) |
 | `hosts.csv` | bulk-import/export mirror |
 | `uptime-log.csv` | rolling ping history (last ~10k events) |
 
@@ -132,8 +149,9 @@ read from and written to that same directory instead of the system config path.
 ### In-place updates
 
 The app checks GitHub releases at startup and then **every 15 minutes**,
-so the footer `↑ vX.Y.Z` badge shows up without restarting. Press **`u`**
-any time to check manually — press **`u`** again to install:
+so the `↑ vX.Y.Z ready — u to update` pill appears in the **top-right corner**
+(plus a badge in the menu box) without restarting. Press **`u`** any time to
+check manually — press **`u`** again to install:
 
 - **Portable mode** (marker file or data files next to the binary): the
   running binary is replaced in place (checksum-verified, backup + restore
@@ -149,8 +167,37 @@ any time to check manually — press **`u`** again to install:
   `brew upgrade ping-uin` / `winget upgrade altosaxplayer.ping-uin` /
   `cargo install --path .`.
 
-Theme, group, and sort/view prefs persist in `ip-top.json`. A corrupt
-config is backed up to `ip-top.json.corrupt` instead of being discarded.
+Theme, group, sort/view, and collapsed-group prefs persist in `ping-uin.json`.
+A corrupt config is backed up to `ping-uin.json.corrupt` instead of being
+discarded.
+
+### Notifications
+
+`ping-uin` can shout when hosts change state. Both live in `ping-uin.json`
+(next to the other settings — no UI yet, edit the file directly):
+
+```json
+{
+  "webhook_url": "https://hooks.slack.com/services/…",
+  "notify_bell": true
+}
+```
+
+- `webhook_url` — POSTs `{app, host, status, latency_ms, timestamp}` JSON
+  on every up/down transition (Slack-compatible shape).
+- `notify_bell` — rings the terminal bell on down-transitions.
+
+### Headless mode
+
+For cron, systemd timers, or quick checks without the TUI:
+
+```bash
+ping-uin --once                  # text table, exit 0 = all up, 2 = any down
+ping-uin --once --format json    # {"hosts": […], "down": 0} for scripts
+```
+
+Checks run in parallel (ICMP and TCP alike), touch no files, and the exit
+code doubles as the probe result.
 
 ---
 
