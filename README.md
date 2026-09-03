@@ -24,7 +24,7 @@ and shows the results in a rolling, btop-style interface:
 * **Per-host intervals** — one host can ping every minute, another every 30
 * **Per-host history strip** — `■` green blocks for up, red `_` for down
 * **Grouped view** with collapse/expand + down-first ordering
-* **"Down box"** — a red-framed panel for anything that has been down the last 3 checks
+* **View picker** — order by down-first / up-first / name / group, or filter to **down only**
 * **Multiple themes** — `btop`, `dracula`, `nord`, `gruvbox-dark`
 * **CSV bulk import** — dump your host list in a spreadsheet, import in one press
 * **Alias your IPs** — turn `1.1.1.1` into `Cloudflare`, `server3.internal` into `DB host`
@@ -63,15 +63,18 @@ before you add any config. The starter set ships with a few public IP records
 | `E` | export host list to timestamped CSV |
 | `g` | toggle grouped/flat view |
 | `f` | filter by group (`Space` = show all, `Esc` = cancel) |
-| `s` | sort picker — `off` / down-first / up-first / by-name |
-| `x` | toggle the **down box** (hosts down for the last 3 checks) |
+| `s` | view picker — `off` / down-first / up-first / name / group / **down only** |
 | `t` | theme picker (live preview, persists) |
 | `u` | check for updates / install when available |
 | `M` | full menu (actionable) |
 | `q` / `Ctrl+C` | quit (cleanly!) |
 
-> The bottom menu always shows every option — it wraps to extra rows on
-> narrow windows instead of truncating, and stays pinned to the bottom.
+> The bottom menu lives in its own bordered box with a fixed height — it
+> never resizes or shifts the table. On narrow windows labels abbreviate,
+> and anything left over collapses into a `+N more [M]` marker.
+>
+> History strips read newest-first: the most recent ping is always the
+> leftmost block, and the strip grows left-to-right.
 
 ---
 
@@ -127,8 +130,9 @@ read from and written to that same directory instead of the system config path.
 
 ### In-place updates
 
-Press **`u`** any time to check GitHub releases. When a newer release is
-available, the footer shows `↑ vX.Y.Z` — press **`u`** again to install:
+The app checks GitHub releases at startup and then **every 15 minutes**,
+so the footer `↑ vX.Y.Z` badge shows up without restarting. Press **`u`**
+any time to check manually — press **`u`** again to install:
 
 - **Portable mode** (marker file or data files next to the binary): the
   running binary is replaced in place (checksum-verified, backup + restore
@@ -136,12 +140,15 @@ available, the footer shows `↑ vX.Y.Z` — press **`u`** again to install:
   PowerShell updater swaps `ping-uin.exe`.
 - **Homebrew** (`/Cellar/ping-uin/`): runs `brew upgrade ping-uin`
   (falls back to `altosaxplayer/tap/ping-uin`) in the background.
+- **Winget** (Windows): runs `winget upgrade altosaxplayer.ping-uin`
+  in place — just quit and relaunch when it completes.
 - **Anywhere else writable** (e.g. `~/.cargo/bin` you own): same in-place
   flow as portable. If the install dir isn't writable you'll get a clear
   message instead of a late failure — update with
-  `brew upgrade ping-uin` / `cargo install --path .` / winget.
+  `brew upgrade ping-uin` / `winget upgrade altosaxplayer.ping-uin` /
+  `cargo install --path .`.
 
-Theme, group, sort, and down-box prefs persist in `ip-top.json`. A corrupt
+Theme, group, and sort/view prefs persist in `ip-top.json`. A corrupt
 config is backed up to `ip-top.json.corrupt` instead of being discarded.
 
 ---

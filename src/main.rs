@@ -117,7 +117,6 @@ impl HostConfig {
 }
 
 fn default_theme_name() -> String { "btop".to_string() }
-fn default_down_streak() -> usize { 3 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct Config {
@@ -130,10 +129,6 @@ struct Config {
     group_by: bool,
     #[serde(default)]
     sort_mode: SortMode,
-    #[serde(default)]
-    alerts: bool,
-    #[serde(default = "default_down_streak")]
-    down_streak: usize,
 }
 
 impl Default for Config {
@@ -150,8 +145,6 @@ impl Default for Config {
             theme: default_theme_name(),
             group_by: false,
             sort_mode: SortMode::None,
-            alerts: false,
-            down_streak: default_down_streak(),
         }
     }
 }
@@ -190,13 +183,13 @@ impl Config {
                 theme: value.get("theme").and_then(|v| v.as_str()).unwrap_or("btop").to_string(),
                 group_by: value.get("group_by").and_then(|v| v.as_bool()).unwrap_or(false),
                 sort_mode: value.get("sort_mode").and_then(|v| v.as_str()).and_then(|s| match s {
-                    "down_first" | "down first" | "down-first" => Some(SortMode::DownFirst),
-                    "up_first" | "up first" | "up-first" => Some(SortMode::UpFirst),
-                    "name" => Some(SortMode::Name),
+                    "DownFirst" | "down_first" | "down first" | "down-first" => Some(SortMode::DownFirst),
+                    "UpFirst" | "up_first" | "up first" | "up-first" => Some(SortMode::UpFirst),
+                    "Name" | "name" => Some(SortMode::Name),
+                    "Group" | "group" => Some(SortMode::Group),
+                    "DownOnly" | "down_only" | "down only" | "down-only" => Some(SortMode::DownOnly),
                     _ => Some(SortMode::None),
                 }).unwrap_or(SortMode::None),
-                alerts: value.get("alerts").and_then(|v| v.as_bool()).unwrap_or(false),
-                down_streak: value.get("down_streak").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
             };
         }
         // Corrupt config: back it up instead of silently discarding user data.
@@ -386,12 +379,6 @@ impl HostState {
         self.alias.clone().unwrap_or_else(|| self.name.clone())
     }
 
-    /// True only if the host currently reads down AND the last `streak` checks
-    /// (or all available history) are all down. Used for the alert box.
-    fn down_streak(&self, streak: usize) -> bool {
-        if self.up || self.history.is_empty() { return false; }
-        self.history.iter().rev().take(streak).all(|&lat| lat == 0)
-    }
 }
 
 /// All-in-one add-host form state (focused field editable).
@@ -453,7 +440,8 @@ enum InputMode {
     ConfirmDelete,
 }
 
-/// Sort applied within the host list (flat view) and inside each group (grouped view).
+/// View applied to the host list. Combines ordering (flat view and inside
+/// each group) with the down-only filter that replaces the old down box.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 enum SortMode {
     #[default]
@@ -461,10 +449,12 @@ enum SortMode {
     DownFirst,
     UpFirst,
     Name,
+    Group,
+    DownOnly,
 }
 
 impl SortMode {
-    const ALL: [SortMode; 4] = [SortMode::None, SortMode::DownFirst, SortMode::UpFirst, SortMode::Name];
+    const ALL: [SortMode; 6] = [SortMode::None, SortMode::DownFirst, SortMode::UpFirst, SortMode::Name, SortMode::Group, SortMode::DownOnly];
 
     fn index(&self) -> usize {
         match self {
@@ -472,6 +462,8 @@ impl SortMode {
             SortMode::DownFirst => 1,
             SortMode::UpFirst => 2,
             SortMode::Name => 3,
+            SortMode::Group => 4,
+            SortMode::DownOnly => 5,
         }
     }
 
@@ -480,6 +472,8 @@ impl SortMode {
             1 => SortMode::DownFirst,
             2 => SortMode::UpFirst,
             3 => SortMode::Name,
+            4 => SortMode::Group,
+            5 => SortMode::DownOnly,
             _ => SortMode::None,
         }
     }
@@ -490,6 +484,8 @@ impl SortMode {
             SortMode::DownFirst => "down first",
             SortMode::UpFirst => "up first",
             SortMode::Name => "name",
+            SortMode::Group => "group",
+            SortMode::DownOnly => "down only",
         }
     }
 }
@@ -515,7 +511,6 @@ struct App {
     group_by: bool,
     group_filter: Option<String>,
     sort_mode: SortMode,
-    alerts: bool,
     input_mode: InputMode,
     update_available: Option<String>,
     update_state: UpdateState,
@@ -653,12 +648,12 @@ impl App {
         }
     }
 
-    /// Copy runtime UI prefs into config and save (theme/group/sort/alerts).
+    /// Copy runtime UI prefs into config and save (theme/group/sort).
+    /// Reload-safe: theme + view prefs survive restarts.
     fn save_prefs(&mut self) {
         self.config.theme = self.themes.get(self.theme_idx).map(|t| t.name.to_string()).unwrap_or_else(|| "btop".to_string());
         self.config.group_by = self.group_by;
         self.config.sort_mode = self.sort_mode;
-        self.config.alerts = self.alerts;
         let _ = self.config.save();
     }
 
@@ -908,15 +903,12 @@ fn cached_history_summary(
 
 fn render_graph(history: &VecDeque<u64>, theme: &Theme, width: usize) -> Text<'static> {
     // btop-disks style: each ping is a block; green ■ if up, red bottom line _ if down.
-    // One space between blocks. Show the newest `width/2` samples with the newest on the left.
+    // One space between blocks. Newest sample on the LEFT; the strip fills
+    // left-to-right as history accumulates.
     let max_show = width / 2;
     let start = history.len().saturating_sub(max_show);
     let shown = history.len() - start;
     let mut spans: Vec<Span<'static>> = Vec::new();
-    // Prepend padding so older samples sit on the right.
-    let used = if shown > 0 { shown * 2 - 1 } else { 0 };
-    let pad = width.saturating_sub(used);
-    if pad > 0 { spans.push(Span::raw(" ".repeat(pad))); }
     for (i, &lat) in history.iter().skip(start).rev().enumerate() {
         if i > 0 { spans.push(Span::raw(" ")); }
         if lat > 0 {
@@ -926,6 +918,10 @@ fn render_graph(history: &VecDeque<u64>, theme: &Theme, width: usize) -> Text<'s
             spans.push(Span::styled("_", Style::default().fg(theme.status_danger)));
         }
     }
+    // Trailing pad so young histories hug the left edge.
+    let used = if shown > 0 { shown * 2 - 1 } else { 0 };
+    let pad = width.saturating_sub(used);
+    if pad > 0 { spans.push(Span::raw(" ".repeat(pad))); }
     Text::from(Line::from(spans))
 }
 
@@ -993,6 +989,12 @@ fn sort_host_indices(indices: &mut Vec<usize>, hosts: &[HostState], sort_mode: S
         SortMode::Name => indices.sort_by(|&a, &b| {
             hosts[a].display_name().cmp(&hosts[b].display_name())
         }),
+        SortMode::Group => indices.sort_by(|&a, &b| {
+            hosts[a].group.cmp(&hosts[b].group)
+                .then_with(|| hosts[a].display_name().cmp(&hosts[b].display_name()))
+        }),
+        // DownOnly is a filter, not an ordering: keep config order here.
+        SortMode::DownOnly => {}
     }
 }
 
@@ -1001,9 +1003,13 @@ fn build_visible_rows(hosts: &[HostState], group_by: bool, group_filter: Option<
         let g = if h.group.is_empty() { "default" } else { &h.group };
         group_filter.map_or(true, |f| g == f)
     };
+    // Down-only (ex down box) hides up hosts everywhere, grouped or flat.
+    let visible = |h: &HostState| {
+        in_group(h) && (sort_mode != SortMode::DownOnly || !h.up)
+    };
     if !group_by {
         let mut indices: Vec<usize> = hosts.iter().enumerate()
-            .filter(|(_, h)| in_group(h))
+            .filter(|(_, h)| visible(h))
             .map(|(i, _)| i)
             .collect();
         sort_host_indices(&mut indices, hosts, sort_mode);
@@ -1022,13 +1028,33 @@ fn build_visible_rows(hosts: &[HostState], group_by: bool, group_filter: Option<
             }
             return rows;
         }
+        // Group sort and down-only get group/status section headers in flat view.
+        if sort_mode == SortMode::Group || sort_mode == SortMode::DownOnly {
+            let mut rows = Vec::new();
+            let mut last_header: Option<String> = None;
+            for idx in indices {
+                let header = if sort_mode == SortMode::DownOnly {
+                    "Down".to_string()
+                } else if hosts[idx].group.is_empty() {
+                    "default".to_string()
+                } else {
+                    hosts[idx].group.clone()
+                };
+                if last_header.as_deref() != Some(&header) {
+                    rows.push(VisibleRow { kind: RowKind::GroupHeader(header.clone()), host_idx: None });
+                    last_header = Some(header);
+                }
+                rows.push(VisibleRow { kind: RowKind::Host, host_idx: Some(idx) });
+            }
+            return rows;
+        }
         return indices.into_iter()
             .map(|idx| VisibleRow { kind: RowKind::Host, host_idx: Some(idx) })
             .collect();
     }
     let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (idx, h) in hosts.iter().enumerate() {
-        if !in_group(h) { continue; }
+        if !visible(h) { continue; }
         let group = if h.group.is_empty() { "default".to_string() } else { h.group.clone() };
         groups.entry(group).or_default().push(idx);
     }
@@ -1165,10 +1191,14 @@ fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme) -> Row<'
     ]).style(Style::default().bg(theme.main_bg))
 }
 
-/// Full footer menu. Always rendered in full — the layout wraps it to as
-/// many rows as the terminal width requires (see `build_footer_lines`).
-fn footer_hints(update_available: bool) -> Vec<(&'static str, &'static str)> {
-    let hints = vec![
+/// Fixed-height menu box: exactly MENU_ROWS content rows + top/bottom
+/// borders. Height never changes, so the table above never jumps and the
+/// menu reads as one distinct bar pinned to the bottom.
+const MENU_BOX_H: u16 = 4;
+const MENU_ROWS: usize = 2;
+
+fn footer_hints() -> Vec<(&'static str, &'static str)> {
+    vec![
         ("↑/↓", "select"),
         ("Space", "ping now"),
         ("a", "add"),
@@ -1181,57 +1211,133 @@ fn footer_hints(update_available: bool) -> Vec<(&'static str, &'static str)> {
         ("g", "group"),
         ("f", "filter"),
         ("s", "sort"),
-        ("x", "down box"),
         ("t", "theme"),
         ("u", "update"),
         ("q", "quit"),
-    ];
-    let _ = update_available;
-    hints
+    ]
+}
+
+/// Abbreviated labels used when the full menu doesn't fit in MENU_ROWS.
+fn short_footer_hints() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("↑↓", "sel"),
+        ("Spc", "ping"),
+        ("a", "add"),
+        ("d", "del"),
+        ("e", "edit"),
+        ("h", "hist"),
+        ("c", "clear"),
+        ("i", "imp"),
+        ("E", "exp"),
+        ("g", "grp"),
+        ("f", "flt"),
+        ("s", "sort"),
+        ("t", "thm"),
+        ("u", "upd"),
+        ("q", "quit"),
+    ]
 }
 
 fn hint_cell_width(key: &str, label: &str) -> usize {
-    // Rendered as `[key] label ` plus one leading space.
-    format!("[{}] {} ", key, label).chars().count() + 1
+    // Rendered as ` [key] label`.
+    format!("[{}] {}", key, label).chars().count() + 1
 }
 
-/// Greedy word-aware wrap: hints never split mid-hint, rows fill `max_width`.
-/// Guarantees every option stays visible at any window size.
-fn build_footer_lines(theme: &Theme, update_available: Option<&str>, max_width: usize) -> Vec<Line<'static>> {
-    let max_width = max_width.max(20);
-    let hints = footer_hints(update_available.is_some());
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut current: Vec<Span<'static>> = vec![
-        Span::styled(" menu ", Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
-    ];
-    let mut used = " menu ".chars().count();
+/// Try to pack all hints (+ badge) into MENU_ROWS rows. Returns None when
+/// they don't fit, so the caller can fall back to shorter labels.
+fn pack_menu_rows(
+    theme: &Theme,
+    hints: &[(&'static str, &'static str)],
+    badge: Option<&str>,
+    max_width: usize,
+) -> Option<Vec<Line<'static>>> {
+    let mut rows: Vec<Vec<Span<'static>>> = vec![vec![Span::raw("  ")]];
+    let mut used = 2usize;
     for (k, l) in hints {
         let w = hint_cell_width(k, l);
-        if used + w > max_width && used > 0 {
-            lines.push(Line::from(std::mem::replace(&mut current, Vec::new())));
-            current.push(Span::raw("  "));
+        if used + w > max_width {
+            if rows.len() >= MENU_ROWS {
+                return None;
+            }
+            rows.push(vec![Span::raw("  ")]);
             used = 2;
-        } else {
-            current.push(Span::raw(" "));
-            used += 1;
         }
-        let mut h = key_hint(k, l, theme);
-        used += w - 1;
-        current.append(&mut h);
+        rows.last_mut().unwrap().push(Span::raw(" "));
+        rows.last_mut().unwrap().extend(key_hint(k, l, theme));
+        used += w;
     }
-    // Trailing update badge stays on the last row, never truncated.
-    if let Some(version) = update_available {
-        let badge = format!(" ↑v{} ", version);
-        if used + badge.chars().count() > max_width {
-            lines.push(Line::from(std::mem::replace(&mut current, Vec::new())));
-            current.push(Span::raw("  "));
+    if let Some(b) = badge {
+        let bw = b.chars().count() + 1;
+        if used + bw > max_width {
+            if rows.len() >= MENU_ROWS {
+                return None;
+            }
+            rows.push(vec![Span::raw("  ")]);
         }
-        current.push(Span::styled(badge, Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)));
+        rows.last_mut().unwrap().push(Span::raw(" "));
+        rows.last_mut().unwrap().push(
+            Span::styled(b.to_string(), Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
+        );
+    }
+    while rows.len() < MENU_ROWS {
+        rows.push(vec![Span::raw("")]);
+    }
+    Some(rows.into_iter().map(Line::from).collect())
+}
+
+/// Build the fixed MENU_ROWS content lines for the menu box: full labels,
+/// then abbreviated labels, then fill-what-fits plus a "+N more [M]"
+/// overflow marker so nothing silently vanishes on narrow windows.
+fn build_footer_lines(theme: &Theme, update_available: Option<&str>, max_width: usize) -> Vec<Line<'static>> {
+    let max_width = max_width.max(20);
+    let badge = update_available.map(|v| format!("↑v{}", v));
+    let full = footer_hints();
+    if let Some(lines) = pack_menu_rows(theme, &full, badge.as_deref(), max_width) {
+        return lines;
+    }
+    let short = short_footer_hints();
+    if let Some(lines) = pack_menu_rows(theme, &short, badge.as_deref(), max_width) {
+        return lines;
+    }
+    // Very narrow: fill rows with short hints, put the rest behind [M].
+    let mut rows: Vec<Vec<Span<'static>>> = vec![vec![Span::raw("  ")]];
+    let mut used = 2usize;
+    let mut placed = 0usize;
+    for (k, l) in &short {
+        let w = hint_cell_width(k, l);
+        if used + w > max_width {
+            if rows.len() >= MENU_ROWS {
+                break;
+            }
+            rows.push(vec![Span::raw("  ")]);
+            used = 2;
+            if used + w > max_width {
+                break;
+            }
+        }
+        rows.last_mut().unwrap().push(Span::raw(" "));
+        rows.last_mut().unwrap().extend(key_hint(k, l, theme));
+        used += w;
+        placed += 1;
+    }
+    let mut tail = String::new();
+    if let Some(v) = update_available {
+        tail.push_str(&format!("↑v{} · ", v));
+    }
+    tail.push_str(&format!("+{} more [M]", short.len() - placed));
+    let tail_style = Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD);
+    if used + tail.chars().count() + 1 > max_width {
+        // No room on the last row: overflow marker replaces it so the
+        // update badge / more-count always stays visible.
+        *rows.last_mut().unwrap() = vec![Span::raw("  "), Span::styled(tail, tail_style)];
     } else {
-        current.push(Span::styled(" [M] more ", Style::default().fg(theme.inactive_fg)));
+        rows.last_mut().unwrap().push(Span::raw(" "));
+        rows.last_mut().unwrap().push(Span::styled(tail, tail_style));
     }
-    lines.push(Line::from(current));
-    lines
+    while rows.len() < MENU_ROWS {
+        rows.push(vec![Span::raw("")]);
+    }
+    rows.into_iter().map(Line::from).collect()
 }
 
 fn ui(frame: &mut Frame, app: &mut App) {
@@ -1240,30 +1346,24 @@ fn ui(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(Block::default().style(Style::default().bg(theme.main_bg)), area);
 
-    // Layout: title / stats / optional alerts box / table / footer.
-    // Footer is pinned to the bottom and always shows ALL options: its height
-    // grows (1..=4 rows) as the window narrows instead of truncating.
+    // Layout: title / stats / table / fixed-height menu box.
+    // The menu box never changes height, so the table never jumps.
     let up_count = app.hosts.iter().filter(|h| h.up).count();
     let total = app.hosts.len();
     let down_count = total.saturating_sub(up_count);
     let pct_up = if total > 0 { (up_count as f64 / total as f64 * 100.0).round() as u64 } else { 0 };
     let now = Local::now().format("%H:%M:%S").to_string();
-    let streak = app.config.down_streak.max(1);
-    let downs: Vec<&HostState> = app.hosts.iter().filter(|h| h.down_streak(streak)).collect();
-    let show_alerts = app.alerts;
-    let alert_rows = if show_alerts { (downs.len().min(6).max(1) + if downs.len() > 6 { 1 } else { 0 }) as u16 } else { 0 };
 
-    let footer_width = area.width.saturating_sub(2) as usize;
+    // Inner width of the menu box: margin + box borders.
+    let footer_width = (area.width as usize).saturating_sub(2 + 2).saturating_sub(2);
     let footer_lines = build_footer_lines(&theme, app.update_available.as_deref(), footer_width);
-    // Never truncate: footer grows to fit every hint, table shrinks instead.
-    let footer_h = (footer_lines.len().max(1)) as u16;
 
-    let mut constraints = vec![Constraint::Length(5), Constraint::Length(3)];
-    if show_alerts {
-        constraints.push(Constraint::Length(alert_rows + 3));
-    }
-    constraints.push(Constraint::Min(0));
-    constraints.push(Constraint::Length(footer_h));
+    let constraints = vec![
+        Constraint::Length(5),
+        Constraint::Length(3),
+        Constraint::Min(0),
+        Constraint::Length(MENU_BOX_H),
+    ];
 
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -1271,11 +1371,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         .constraints(constraints)
         .split(area);
 
-    let (stats_area, alert_area, table_area, footer_area) = if show_alerts {
-        (main_layout[1], Some(main_layout[2]), main_layout[3], main_layout[4])
-    } else {
-        (main_layout[1], None, main_layout[2], main_layout[3])
-    };
+    let (stats_area, table_area, footer_area) = (main_layout[1], main_layout[2], main_layout[3]);
     let title_area = main_layout[0];
 
     // ── Title box: centered ping-uin with penguin face in its own border ──
@@ -1343,59 +1439,6 @@ fn ui(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(Text::from(stats_line)), stats_layout[0]);
     frame.render_widget(Paragraph::new(Text::from(stats_right)).alignment(Alignment::Right), stats_layout[1]);
 
-    // Down-hosts alert box (x to toggle): red-bordered, group-agnostic.
-    if let Some(alerts_rect) = alert_area {
-        let alert_title = Line::from(vec![
-            Span::styled(" ▐ ", Style::default().fg(theme.status_danger)),
-            Span::styled("down now", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
-            Span::styled(" ▌ ", Style::default().fg(theme.status_danger)),
-            Span::styled(format!("{} host(s) ", downs.len()), Style::default().fg(theme.status_danger)),
-        ]);
-        let alert_block = Block::default()
-            .title(alert_title)
-            .title_alignment(Alignment::Left)
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.status_danger))
-            .style(Style::default().bg(theme.main_bg));
-
-        let mut lines: Vec<Line> = Vec::new();
-        if downs.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("● ", Style::default().fg(theme.status_good)),
-                Span::styled("all hosts up", Style::default().fg(theme.inactive_fg)),
-            ]));
-        } else {
-            let shown = downs.len().min(6);
-            for h in downs.iter().take(shown) {
-                let name_display = h.alias.clone().unwrap_or_else(|| h.name.clone());
-                let ip_display = if h.alias.is_some() { h.name.clone() } else { "".to_string() };
-                let uptime = if h.total_checks > 0 { h.up_checks as f64 / h.total_checks as f64 * 100.0 } else { 0.0 };
-                let mut spans = vec![
-                    Span::styled("● ", Style::default().fg(theme.status_danger)),
-                    Span::styled(name_display, Style::default().fg(theme.title)),
-                ];
-                if !ip_display.is_empty() {
-                    spans.push(Span::styled(format!(" ({})", ip_display), Style::default().fg(theme.inactive_fg)));
-                }
-                spans.push(Span::styled("   ", Style::default()));
-                spans.push(Span::styled(h.group.clone(), Style::default().fg(theme.inactive_fg)));
-                spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
-                spans.push(Span::styled(format!("{}m", h.interval_m), Style::default().fg(theme.inactive_fg)));
-                spans.push(Span::styled(" · ", Style::default().fg(theme.divider)));
-                spans.push(Span::styled(format!("{:.1}% up", uptime), Style::default().fg(theme.graph_text)));
-                lines.push(Line::from(spans));
-            }
-            let extra = downs.len().saturating_sub(6);
-            if extra > 0 {
-                lines.push(Line::from(Span::styled(format!("… {} more down", extra), Style::default().fg(theme.inactive_fg))));
-            }
-        }
-
-        let alert_box = Paragraph::new(Text::from(lines)).block(alert_block);
-        frame.render_widget(alert_box, alerts_rect);
-    }
-
     let mut title_spans = accent_title("last check", &theme).spans;
     title_spans.push(Span::styled(if app.last_check.is_empty() { "—".to_string() } else { app.last_check.clone() }, Style::default().fg(theme.inactive_fg)));
     let table_block = Block::default()
@@ -1443,12 +1486,26 @@ fn ui(frame: &mut Frame, app: &mut App) {
     .block(table_block);
     frame.render_stateful_widget(table, table_area, &mut app.table_state);
 
-    // Render footer: pinned bottom bar, pre-wrapped so nothing truncates.
+    // Render footer: fixed-height bordered menu box — distinct bar that
+    // never changes height. Modal modes reuse the same box + height so the
+    // table above doesn't jump when popups open/close.
+    let menu_box = |title: Line<'static>| {
+        Block::default()
+            .title(title)
+            .title_alignment(Alignment::Left)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.box_color))
+            .style(Style::default().bg(theme.popup_bg))
+    };
     match app.input_mode {
         InputMode::Normal => {
+            let block = menu_box(accent_title("menu", &theme));
+            let inner = block.inner(footer_area);
+            frame.render_widget(block, footer_area);
             let footer = Paragraph::new(Text::from(footer_lines))
                 .style(Style::default().bg(theme.popup_bg).fg(theme.main_fg));
-            frame.render_widget(footer, footer_area);
+            frame.render_widget(footer, inner);
         }
         _ => {
             let footer_text = match app.input_mode {
@@ -1458,9 +1515,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     Span::raw("[Tab]/[↑↓] move field   [Enter] add   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
                 ])),
                 InputMode::SortPicker { .. } => Text::from(Line::from(vec![
-                    Span::styled("Sort hosts", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::styled("View", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
-                    Span::raw("[↑↓] pick   [Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                    Span::raw("[↑↓] pick   [1-6] quick   [Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
                 ])),
                 InputMode::GroupFilterPicker { .. } => Text::from(Line::from(vec![
                     Span::styled("Filter group", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
@@ -1507,8 +1564,25 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ])),
                 InputMode::Normal => unreachable!(),
             };
+            // Same fixed-height box as the menu so the layout never shifts.
+            let mode_title = match app.input_mode {
+                InputMode::AddHost(_) => "add host",
+                InputMode::SortPicker { .. } => "view",
+                InputMode::GroupFilterPicker { .. } => "filter",
+                InputMode::ImportPath { .. } => "import",
+                InputMode::EditEntry { .. } => "edit",
+                InputMode::ConfirmDelete => "delete",
+                InputMode::HistoryView { .. } => "history",
+                InputMode::ExportPath { .. } => "export",
+                InputMode::ThemePicker { .. } => "theme",
+                InputMode::MenuModal => "menu",
+                InputMode::Normal => unreachable!(),
+            };
+            let block = menu_box(accent_title(mode_title, &theme));
+            let inner = block.inner(footer_area);
+            frame.render_widget(block, footer_area);
             let footer = Paragraph::new(footer_text).wrap(Wrap { trim: true });
-            frame.render_widget(footer, footer_area);
+            frame.render_widget(footer, inner);
         }
     }
 
@@ -1557,7 +1631,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             frame.render_widget(popup, popup_area);
         }
         InputMode::SortPicker { selected } => {
-            let popup_area = centered_rect(30, 38, area);
+            let popup_area = centered_rect(34, 46, area);
             let mut lines: Vec<Line> = vec![Line::from("")];
             for (i, mode) in SortMode::ALL.iter().enumerate() {
                 let selected_here = i == selected;
@@ -1576,10 +1650,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ]));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from("[Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)));
+            lines.push(Line::from("[↑↓/1-6] pick   [Enter] apply   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)));
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
-                    .title(accent_title("Sort hosts", &theme))
+                    .title(accent_title("View: sort & filter", &theme))
                     .title_alignment(Alignment::Center)
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
@@ -1719,12 +1793,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
             }
             lines.push(Line::from(""));
 
-            // Timeline
+            // Timeline, newest bucket on the left to match the main strip.
             lines.push(Line::from(Span::styled("timeline (green = up, red = down)", Style::default().fg(theme.inactive_fg))));
             let timeline_width = (popup_area.width as usize).saturating_sub(6).min(summary.buckets.len());
             let start = summary.buckets.len().saturating_sub(timeline_width);
             let mut timeline_spans: Vec<Span> = Vec::new();
-            for (i, &up) in summary.buckets.iter().skip(start).enumerate() {
+            for (i, &up) in summary.buckets.iter().skip(start).rev().enumerate() {
                 if i > 0 { timeline_spans.push(Span::raw(" ")); }
                 if up {
                     timeline_spans.push(Span::styled("▓", Style::default().fg(theme.status_good)));
@@ -1733,12 +1807,13 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 }
             }
             lines.push(Line::from(timeline_spans));
+            let row_w = if timeline_width > 0 { timeline_width * 2 - 1 } else { 0 };
+            let ago_label = format!("{} ago", range.label());
+            let gap = row_w.saturating_sub(3 + ago_label.chars().count()).max(1);
             lines.push(Line::from(vec![
-                Span::styled("now →", Style::default().fg(theme.inactive_fg)),
-                Span::styled("".to_string(), Style::default()),
-                Span::styled("→ ", Style::default().fg(theme.inactive_fg)),
-                Span::styled(range.label(), Style::default().fg(theme.inactive_fg)),
-                Span::styled(" ago", Style::default().fg(theme.inactive_fg)),
+                Span::styled("now", Style::default().fg(theme.inactive_fg)),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(ago_label, Style::default().fg(theme.inactive_fg)),
             ]));
             lines.push(Line::from(""));
             lines.push(Line::from("[←/→] change range   [Esc/h] close").style(Style::default().fg(theme.inactive_fg)));
@@ -1801,8 +1876,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ("E", "export"),
                 ("g", "group"),
                 ("f", "filter group"),
-                ("s", "sort"),
-                ("x", "down box"),
+                ("s", "view/sort"),
                 ("t", "theme"),
                 ("u", "update"),
                 ("q", "quit"),
@@ -1958,8 +2032,10 @@ fn spawn_update_checker(tx: mpsc::Sender<Message>, current_version: String, shut
                     let _ = tx.send(Message::UpdateAvailable { version: latest });
                 }
             }
-            // Sleep in short chunks so shutdown is responsive.
-            for _ in 0..360 {
+            // Re-check every 15 minutes (4 API calls/hour, far below GitHub's
+            // 60/hour unauthenticated limit) so the ↑ badge appears promptly.
+            // Sleep in short chunks so shutdown stays responsive.
+            for _ in 0..90 {
                 if shutdown.load(Ordering::Relaxed) { break; }
                 thread::sleep(Duration::from_secs(10));
             }
@@ -2204,6 +2280,46 @@ fn spawn_homebrew_updater(tx: mpsc::Sender<Message>, version: String) -> thread:
     })
 }
 
+/// Winget update for Windows installs managed by winget. Runs in a background thread.
+/// Reports Done with restart_required=false: the files are already replaced,
+/// so the user just quits at their convenience (no forced restart).
+fn spawn_winget_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        fn notify(tx: &mpsc::Sender<Message>, state: UpdateState) {
+            let _ = tx.send(Message::UpdateState(state));
+        }
+
+        notify(&tx, UpdateState::Checking);
+        match Command::new("winget")
+            .args([
+                "upgrade", "--exact", "--id", "altosaxplayer.ping-uin",
+                "--silent", "--accept-package-agreements", "--accept-source-agreements",
+            ])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                notify(&tx, UpdateState::Done { version, restart_required: false });
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                notify(&tx, UpdateState::Error(format!("winget upgrade failed:\n{}{}", stdout, stderr)));
+            }
+            Err(e) => {
+                notify(&tx, UpdateState::Error(format!("winget upgrade failed: {}", e)));
+            }
+        }
+    })
+}
+
+fn winget_available() -> bool {
+    Command::new("winget")
+        .args(["--version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// In-place update for portable installs. Runs in a background thread.
 fn spawn_updater(tx: mpsc::Sender<Message>, version: String) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -2399,8 +2515,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                             } else if dir_writable(&exe.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))) {
                                                 // Generic fallback: binary dir is writable, do in-place replace.
                                                 spawn_updater(tx.clone(), version);
+                                            } else if cfg!(target_os = "windows") && winget_available() {
+                                                // Winget-managed install: let winget swap the files in place.
+                                                spawn_winget_updater(tx.clone(), version);
                                             } else {
-                                                app.update_state = UpdateState::Error("auto-update needs portable mode or Homebrew.\nUpdate with: brew upgrade ping-uin  /  cargo install --path .".to_string());
+                                                app.update_state = UpdateState::Error("auto-update needs portable mode, Homebrew, or winget.\nUpdate with: brew upgrade ping-uin  /  winget upgrade altosaxplayer.ping-uin  /  cargo install --path .".to_string());
                                             }
                                         } else {
                                             app.update_state = UpdateState::Error("cannot determine install type".to_string());
@@ -2426,7 +2545,6 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('s') | KeyCode::Char('S') => {
                                 app.input_mode = InputMode::SortPicker { selected: app.sort_mode.index() };
                             }
-                            KeyCode::Char('x') | KeyCode::Char('X') => { app.alerts = !app.alerts; app.save_prefs(); }
                             KeyCode::Char('t') | KeyCode::Char('T') => {
                                 app.input_mode = InputMode::ThemePicker { original: app.theme_idx, selected: app.theme_idx };
                             }
@@ -2657,10 +2775,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                         InputMode::Normal
                                     };
                                 }
-                                KeyCode::Char('x') | KeyCode::Char('X') => {
-                                    app.input_mode = InputMode::Normal;
-                                    app.alerts = !app.alerts;
-                                    app.save_prefs();
+                                KeyCode::Char('s') | KeyCode::Char('S') => {
+                                    app.input_mode = InputMode::SortPicker { selected: app.sort_mode.index() };
                                 }
                                 KeyCode::Char('g') => {
                                     app.input_mode = InputMode::Normal;
@@ -2802,7 +2918,6 @@ fn main() -> io::Result<()> {
         theme_idx,
         group_by: config.group_by,
         sort_mode: config.sort_mode,
-        alerts: config.alerts,
         config,
         hosts,
         selected_idx: 0,
