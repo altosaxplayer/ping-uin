@@ -1,8 +1,8 @@
 class PingUin < Formula
   desc "Btop-style TUI for monitoring IPs and hostnames"
   homepage "https://github.com/altosaxplayer/ping-uin"
-  url "https://github.com/altosaxplayer/ping-uin/archive/refs/tags/v0.1.15.tar.gz"
-  sha256 "04f1342fdbbe9e2749ab6079e7e37070c70b304076232370571b61faa564776e"
+  url "https://github.com/altosaxplayer/ping-uin/archive/refs/tags/v0.1.16.tar.gz"
+  sha256 "c2edc7c3901bcc146fa93ed31656de5d1abe6c1a5eed8a2b788bb693ab12e8c0"
   license "MIT"
 
   depends_on "rust" => :build
