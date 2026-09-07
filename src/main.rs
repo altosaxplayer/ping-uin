@@ -35,7 +35,7 @@ use config::{
     portable_dir, read_entries_csv, Config, HostConfig, SortMode, DEFAULT_INTERVAL_SECS,
     MAX_HISTORY,
 };
-use net::{check_host, host_jitter, post_webhook, schedules_from_config, HostSchedule};
+use net::{check_host, host_jitter, post_webhook, send_smtp_email, schedules_from_config, HostSchedule};
 
 #[derive(Clone)]
 struct Theme {
@@ -197,6 +197,12 @@ struct HostState {
     down_since: Option<Instant>,
     /// Escalation level reached: 0 none, 1 = 5min, 2 = 30min.
     escalation: u8,
+    /// Consecutive failed checks. Resets on any success. A down-email
+    /// fires when this reaches the configured smtp threshold (default 3).
+    consecutive_failures: u32,
+    /// True after a down-email was sent for the current outage; cleared
+    /// on recovery (which then sends the UP email).
+    down_email_sent: bool,
 }
 
 impl HostState {
@@ -221,6 +227,8 @@ impl HostState {
             flaps: VecDeque::new(),
             down_since: None,
             escalation: 0,
+            consecutive_failures: 0,
+            down_email_sent: false,
         }
     }
 
@@ -310,6 +318,241 @@ fn is_suppressed(hosts: &[HostState], name: &str) -> bool {
         .map_or(false, |u| !u.up)
 }
 
+/// Convert a ratatui `Color` to a `#rrggbb` CSS string. Named colors fall
+/// back to sensible defaults so emails always render.
+fn css_hex(c: Color) -> String {
+    match c {
+        Color::Rgb(r, g, b) => format!("#{:02x}{:02x}{:02x}", r, g, b),
+        Color::Black => "#000000".to_string(),
+        Color::White => "#ffffff".to_string(),
+        Color::Red => "#dc6d6d".to_string(),
+        Color::Green => "#a3be8c".to_string(),
+        Color::Yellow => "#e5c07b".to_string(),
+        Color::Blue => "#88c0d0".to_string(),
+        Color::Magenta => "#bd93f9".to_string(),
+        Color::Cyan => "#5ffbf1".to_string(),
+        Color::Gray | Color::DarkGray => "#5a6375".to_string(),
+        _ => "#c8ccd4".to_string(),
+    }
+}
+
+fn html_escape_owned(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Build a theme-styled (subject, plain-text, HTML) alert email.
+///
+/// The status is unmissable by design: a full-width banner in the theme's
+/// danger color (`DOWN`) or good color (`UP`), with the ● status dot, host
+/// name, and theme name carried through so the email visibly matches the
+/// TUI theme the user was running.
+#[allow(clippy::too_many_arguments)]
+fn build_alert_email(
+    theme: &Theme,
+    display_name: &str,
+    target: &str,
+    group: &str,
+    up: bool,
+    consecutive_failures: u32,
+    latency_ms: f64,
+    timestamp: &str,
+) -> (String, String, String) {
+    let state_word = if up { "UP" } else { "DOWN" };
+    let subject = if up {
+        format!("[ping-uin] {} is back UP ({})", display_name, target)
+    } else {
+        format!(
+            "[ping-uin] {} is DOWN ({} failures, {})",
+            display_name, consecutive_failures, target
+        )
+    };
+    let banner_bg = css_hex(if up { theme.status_good } else { theme.status_danger });
+    // Pick readable banner text: light themes get dark text, dark get white.
+    let banner_fg = if theme.name == "ayu-light" { "#1a1d21" } else { "#ffffff" };
+    let bg = css_hex(theme.main_bg);
+    let fg = css_hex(theme.main_fg);
+    let title_c = css_hex(theme.title);
+    let accent = css_hex(theme.hi_fg);
+    let muted = css_hex(theme.inactive_fg);
+    let divider = css_hex(theme.divider);
+    let card = css_hex(theme.popup_bg);
+    let status_c = css_hex(if up { theme.status_good } else { theme.status_danger });
+    let dot = if up { "●" } else { "●" };
+    let headline = if up {
+        "Back online — recovery confirmed"
+    } else {
+        &format!("Down for {} consecutive checks", consecutive_failures)
+    };
+    let detail_line = if up {
+        format!("Recovered at {} · last latency {:.0} ms", timestamp, latency_ms)
+    } else {
+        format!("Last seen failing at {} · {} consecutive failures", timestamp, consecutive_failures)
+    };
+    // Pre-escape user-controlled strings once for HTML.
+    let e_name = html_escape_owned(display_name);
+    let e_target = html_escape_owned(target);
+    let e_group = html_escape_owned(group);
+    let e_time = html_escape_owned(timestamp);
+    let e_theme = html_escape_owned(theme.name);
+
+    let text = format!(
+        "ping-uin [{theme}] {state} — {name} ({target})\n\
+         {headline}\n\
+         {detail}\n\
+         Group: {group}\n",
+        theme = theme.name,
+        state = state_word,
+        name = display_name,
+        target = target,
+        headline = headline,
+        detail = detail_line,
+        group = group,
+    );
+    let html = format!(
+        "<!DOCTYPE html><html><body style=\"margin:0;padding:0;background:{bg};color:{fg};font-family:monospace,monospace;\">\
+        <div style=\"background:{banner};color:{banner_fg};padding:20px 24px;text-align:center;\">\
+        <div style=\"font-size:28px;font-weight:bold;letter-spacing:2px;\">{dot} {state}</div>\
+        <div style=\"font-size:15px;margin-top:4px;\">{headline}</div>\
+        </div>\
+        <div style=\"padding:24px;max-width:560px;margin:0 auto;\">\
+        <h1 style=\"color:{title};margin:0 0 4px 0;font-size:22px;\">((&bull;O&bull;)) ping-uin alert</h1>\
+        <p style=\"color:{muted};font-size:12px;margin:0 0 16px 0;\">Theme: {etheme} &middot; {etime}</p>\
+        <div style=\"background:{card};border:1px solid {divider};border-radius:8px;padding:16px;\">\
+        <p style=\"font-size:16px;margin:0 0 8px 0;\"><span style=\"color:{status};font-weight:bold;\">{dot} {state}</span>\
+         &nbsp;<span style=\"color:{title};font-weight:bold;\">{ename}</span></p>\
+        <table style=\"font-size:13px;color:{fg};border-collapse:collapse;\">\
+        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Target</td><td>{etarget}</td></tr>\
+        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Group</td><td>{egroup}</td></tr>\
+        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">When</td><td>{etime}</td></tr>\
+        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Latency</td><td>{lat}</td></tr>\
+        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Streak</td><td>{streak} consecutive failures</td></tr>\
+        </table>\
+        </div>\
+        <p style=\"color:{accent};font-size:12px;margin:16px 0 0 0;\">Sent by ping-uin &middot; ((&bull;O&bull;)) watching over your network</p>\
+        </div></body></html>",
+        bg = bg,
+        fg = fg,
+        title = title_c,
+        muted = muted,
+        banner = banner_bg,
+        banner_fg = banner_fg,
+        dot = dot,
+        state = state_word,
+        headline = html_escape_owned(headline),
+        etheme = e_theme,
+        etime = e_time,
+        card = card,
+        divider = divider,
+        status = status_c,
+        ename = e_name,
+        etarget = e_target,
+        egroup = e_group,
+        lat = if up { format!("{:.0} ms", latency_ms) } else { "&mdash;".to_string() },
+        streak = consecutive_failures,
+        accent = accent,
+    );
+    (subject, text, html)
+}
+
+/// Theme-styled escalation email: same unmissable DOWN banner as the alert,
+/// but headlined "Still down after 5m/30m" so it reads as a reminder rather
+/// than a fresh outage. `level` is 1 (5m) or 2 (30m).
+fn build_escalation_email(
+    theme: &Theme,
+    display_name: &str,
+    target: &str,
+    group: &str,
+    level: u8,
+    consecutive_failures: u32,
+    latency_ms: f64,
+    timestamp: &str,
+) -> (String, String, String) {
+    let age = if level >= 2 { "30m" } else { "5m" };
+    let subject = format!(
+        "[ping-uin] {} still DOWN after {} ({})",
+        display_name, age, target
+    );
+    let banner_bg = css_hex(theme.status_danger);
+    let banner_fg = if theme.name == "ayu-light" { "#1a1d21" } else { "#ffffff" };
+    let bg = css_hex(theme.main_bg);
+    let fg = css_hex(theme.main_fg);
+    let title_c = css_hex(theme.title);
+    let accent = css_hex(theme.hi_fg);
+    let muted = css_hex(theme.inactive_fg);
+    let divider = css_hex(theme.divider);
+    let card = css_hex(theme.popup_bg);
+    let status_c = css_hex(theme.status_danger);
+    let headline = format!("Still down after {} — escalation", age);
+    let detail_line = format!(
+        "Failing since before {} · {} consecutive failures",
+        timestamp, consecutive_failures
+    );
+    let e_name = html_escape_owned(display_name);
+    let e_target = html_escape_owned(target);
+    let e_group = html_escape_owned(group);
+    let e_time = html_escape_owned(timestamp);
+    let e_theme = html_escape_owned(theme.name);
+    let _ = latency_ms;
+
+    let text = format!(
+        "ping-uin [{theme}] DOWN (still down after {age}) — {name} ({target})\n\
+         {headline}\n\
+         {detail}\n\
+         Group: {group}\n",
+        theme = theme.name,
+        age = age,
+        name = display_name,
+        target = target,
+        headline = headline,
+        detail = detail_line,
+        group = group,
+    );
+    let html = format!(
+        "<!DOCTYPE html><html><body style=\"margin:0;padding:0;background:{bg};color:{fg};font-family:monospace,monospace;\">\
+        <div style=\"background:{banner};color:{banner_fg};padding:20px 24px;text-align:center;\">\
+        <div style=\"font-size:28px;font-weight:bold;letter-spacing:2px;\">● DOWN — STILL DOWN {age}</div>\
+        <div style=\"font-size:15px;margin-top:4px;\">{headline}</div>\
+        </div>\
+        <div style=\"padding:24px;max-width:560px;margin:0 auto;\">\
+        <h1 style=\"color:{title};margin:0 0 4px 0;font-size:22px;\">((&bull;O&bull;)) ping-uin escalation</h1>\
+        <p style=\"color:{muted};font-size:12px;margin:0 0 16px 0;\">Theme: {etheme} &middot; {etime}</p>\
+        <div style=\"background:{card};border:1px solid {divider};border-radius:8px;padding:16px;\">\
+        <p style=\"font-size:16px;margin:0 0 8px 0;\"><span style=\"color:{status};font-weight:bold;\">● DOWN</span>\
+         &nbsp;<span style=\"color:{title};font-weight:bold;\">{ename}</span></p>\
+        <table style=\"font-size:13px;color:{fg};border-collapse:collapse;\">\
+        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Target</td><td>{etarget}</td></tr>\
+        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Group</td><td>{egroup}</td></tr>\
+        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">When</td><td>{etime}</td></tr>\
+        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Streak</td><td>{streak} consecutive failures</td></tr>\
+        </table>\
+        </div>\
+        <p style=\"color:{accent};font-size:12px;margin:16px 0 0 0;\">Sent by ping-uin &middot; ((&bull;O&bull;)) watching over your network</p>\
+        </div></body></html>",
+        bg = bg,
+        fg = fg,
+        title = title_c,
+        muted = muted,
+        banner = banner_bg,
+        banner_fg = banner_fg,
+        age = age,
+        headline = html_escape_owned(&headline),
+        etheme = e_theme,
+        etime = e_time,
+        card = card,
+        divider = divider,
+        status = status_c,
+        ename = e_name,
+        etarget = e_target,
+        egroup = e_group,
+        streak = consecutive_failures,
+        accent = accent,
+    );
+    (subject, text, html)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +583,29 @@ mod tests {
     }
 
     #[test]
+    fn timeline_bars_always_fit_popup() {
+        let theme = build_themes().into_iter().next().unwrap();
+        // 8h/24h/7d bucket counts across narrow and wide popups.
+        for buckets in [32usize, 48, 84] {
+            for popup_width in [40usize, 60, 120, 200] {
+                let summary = HistorySummary {
+                    buckets: vec![true; buckets],
+                    ..Default::default()
+                };
+                let lines = timeline_lines(&theme, &summary, HistoryRange::Days7, popup_width);
+                let bars_width = lines[1].width();
+                assert!(
+                    bars_width <= popup_width.saturating_sub(6),
+                    "buckets={} popup={} bars={}",
+                    buckets,
+                    popup_width,
+                    bars_width
+                );
+            }
+        }
+    }
+
+    #[test]
     fn warn_state_needs_up_and_slow() {
         let mut cfg = HostConfig::new("x", 60, "g", None, None);
         cfg.warn_latency_ms = Some(100);
@@ -352,6 +618,91 @@ mod tests {
         h.up = false;
         h.latency_ms = 250.0;
         assert!(!h.warn_active()); // down, not warn
+    }
+
+    #[test]
+    fn alert_email_banner_shows_status_and_theme() {
+        for theme in build_themes() {
+            let (subj_down, text_down, html_down) =
+                build_alert_email(&theme, "DB host", "db:5432", "databases", false, 3, 0.0, "2026-01-01 00:00:00");
+            assert!(subj_down.contains("DOWN"), "theme {}", theme.name);
+            assert!(text_down.contains("DOWN") && text_down.contains(theme.name));
+            assert!(html_down.contains("DOWN") && html_down.contains(theme.name));
+            // Banner uses the theme's own danger color.
+            assert!(html_down.contains(&css_hex(theme.status_danger)), "theme {}", theme.name);
+            let (subj_up, text_up, html_up) =
+                build_alert_email(&theme, "DB host", "db:5432", "databases", true, 0, 12.0, "2026-01-01 00:05:00");
+            assert!(subj_up.contains("UP"), "theme {}", theme.name);
+            assert!(text_up.contains("UP"));
+            assert!(html_up.contains("UP") && !html_up.contains("DOWN"));
+            assert!(html_up.contains(&css_hex(theme.status_good)), "theme {}", theme.name);
+        }
+    }
+
+    #[test]
+    fn alert_email_escapes_user_input() {
+        let theme = build_themes().into_iter().next().unwrap();
+        let (_, _, html) = build_alert_email(
+            &theme,
+            "<b>evil</b>",
+            "host\"><script>",
+            "g&g",
+            false,
+            3,
+            0.0,
+            "2026-01-01 00:00:00",
+        );
+        assert!(!html.contains("<b>evil</b>"));
+        assert!(html.contains("&lt;b&gt;evil&lt;/b&gt;"));
+    }
+
+    #[test]
+    fn escalation_email_banner_is_down_and_themed() {
+        for theme in build_themes() {
+            for level in [1u8, 2u8] {
+                let age = if level >= 2 { "30m" } else { "5m" };
+                let (subj, text, html) = build_escalation_email(
+                    &theme,
+                    "Web",
+                    "web.internal",
+                    "web",
+                    level,
+                    42,
+                    0.0,
+                    "2026-01-01 00:30:00",
+                );
+                assert!(subj.contains("still DOWN") && subj.contains(age), "theme {}", theme.name);
+                assert!(text.contains(age) && text.contains("DOWN"));
+                // Unmissable DOWN banner in the theme's danger color; never UP.
+                assert!(html.contains("STILL DOWN"), "theme {}", theme.name);
+                assert!(html.contains(&css_hex(theme.status_danger)), "theme {}", theme.name);
+                assert!(!html.contains("● UP"), "theme {}", theme.name);
+            }
+        }
+    }
+
+    #[test]
+    fn smtp_form_roundtrips_threshold_and_escalations() {
+        let cfg = config::SmtpConfig {
+            enabled: true,
+            host: "m".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            from: "f@x".to_string(),
+            to: "t@x".to_string(),
+            use_tls: true,
+            down_threshold: 5,
+            escalations: true,
+        };
+        let form = SmtpForm::from_config(Some(&cfg));
+        assert_eq!(form.threshold, "5");
+        assert_eq!(form.escalations, "y");
+        let mut out = Config::default();
+        form.apply(&mut out);
+        let saved = out.smtp.expect("saved");
+        assert_eq!(saved.effective_threshold(), 5);
+        assert!(saved.escalations);
     }
 }
 
@@ -378,6 +729,103 @@ impl AddHostForm {
             port: h.port.map(|p| p.to_string()).unwrap_or_default(),
             focus: 0,
         }
+    }
+}
+
+/// SMTP settings form (`o` key). y/n fields are toggles, the rest free text.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+struct SmtpForm {
+    enabled: String, // "y" / "n"
+    host: String,
+    port: String,
+    username: String,
+    password: String,
+    from: String,
+    to: String,
+    use_tls: String, // "y" / "n"
+    threshold: String, // consecutive failures before DOWN mail
+    escalations: String, // "y" / "n": also mail still_down_5m/30m
+    focus: usize,
+}
+
+impl SmtpForm {
+    const FIELDS: usize = 10;
+
+    fn from_config(cfg: Option<&config::SmtpConfig>) -> Self {
+        match cfg {
+            Some(s) => SmtpForm {
+                enabled: if s.enabled { "y".to_string() } else { "n".to_string() },
+                host: s.host.clone(),
+                port: s.port.to_string(),
+                username: s.username.clone().unwrap_or_default(),
+                password: s.password.clone().unwrap_or_default(),
+                from: s.from.clone(),
+                to: s.to.clone(),
+                use_tls: if s.use_tls { "y".to_string() } else { "n".to_string() },
+                threshold: s.effective_threshold().to_string(),
+                escalations: if s.escalations { "y".to_string() } else { "n".to_string() },
+                focus: 0,
+            },
+            None => SmtpForm {
+                enabled: "n".to_string(),
+                host: String::new(),
+                port: "587".to_string(),
+                username: String::new(),
+                password: String::new(),
+                from: String::new(),
+                to: String::new(),
+                use_tls: "y".to_string(),
+                threshold: config::SMTP_DOWN_THRESHOLD.to_string(),
+                escalations: "n".to_string(),
+                focus: 0,
+            },
+        }
+    }
+
+    fn yn(s: &str) -> bool {
+        matches!(s.trim().to_lowercase().as_str(), "y" | "yes" | "true" | "1")
+    }
+
+    fn apply(self, cfg: &mut Config) {
+        let enabled = Self::yn(&self.enabled);
+        // Disabled + everything blank => drop the section entirely.
+        if !enabled
+            && self.host.trim().is_empty()
+            && self.from.trim().is_empty()
+            && self.to.trim().is_empty()
+        {
+            cfg.smtp = None;
+            return;
+        }
+        let port = self.port.trim().parse::<u16>().unwrap_or(587);
+        let threshold = self
+            .threshold
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(config::SMTP_DOWN_THRESHOLD)
+            .clamp(1, 100);
+        let username = if self.username.trim().is_empty() {
+            None
+        } else {
+            Some(self.username.trim().to_string())
+        };
+        let password = if self.password.trim().is_empty() {
+            None
+        } else {
+            Some(self.password.trim().to_string())
+        };
+        cfg.smtp = Some(config::SmtpConfig {
+            enabled,
+            host: self.host.trim().to_string(),
+            port,
+            username,
+            password,
+            from: self.from.trim().to_string(),
+            to: self.to.trim().to_string(),
+            use_tls: Self::yn(&self.use_tls),
+            down_threshold: threshold,
+            escalations: Self::yn(&self.escalations),
+        });
     }
 }
 
@@ -420,6 +868,7 @@ enum InputMode {
     Normal,
     AddHost(AddHostForm),
     EditEntry { original: String, form: AddHostForm },
+    SmtpForm(SmtpForm),
     SortPicker { selected: usize },
     GroupFilterPicker { groups: Vec<String>, selected: usize },
     ImportPath { path: String },
@@ -703,6 +1152,49 @@ impl App {
         let _ = self.config.save();
     }
 
+    /// Persist the SMTP form into config (validates port, drops the section
+    /// when disabled + blank).
+    fn save_smtp_form(&mut self, form: SmtpForm) {
+        if !form.port.trim().is_empty() && form.port.trim().parse::<u16>().is_err() {
+            self.update_state =
+                UpdateState::Info("smtp port must be 1-65535".to_string());
+            self.input_mode = InputMode::SmtpForm(form);
+            return;
+        }
+        if !form.threshold.trim().is_empty()
+            && form
+                .threshold
+                .trim()
+                .parse::<u32>()
+                .map_or(true, |t| t < 1 || t > 100)
+        {
+            self.update_state =
+                UpdateState::Info("fail threshold must be 1-100".to_string());
+            self.input_mode = InputMode::SmtpForm(form);
+            return;
+        }
+        if SmtpForm::yn(&form.enabled)
+            && (form.host.trim().is_empty()
+                || form.from.trim().is_empty()
+                || form.to.trim().is_empty())
+        {
+            self.update_state = UpdateState::Info(
+                "smtp needs host, from, and to when enabled".to_string(),
+            );
+            self.input_mode = InputMode::SmtpForm(form);
+            return;
+        }
+        form.apply(&mut self.config);
+        self.persist();
+        self.input_mode = InputMode::Normal;
+        let msg = match &self.config.smtp {
+            Some(s) if s.is_configured() => "smtp email alerts saved",
+            Some(_) => "smtp saved (disabled — enable with y)",
+            None => "smtp email alerts disabled",
+        };
+        self.update_state = UpdateState::Info(msg.to_string());
+    }
+
     /// Mute/unmute the selected host for an hour (maintenance windows).
     fn toggle_mute_selected(&mut self, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
         let idx = self.selected_idx;
@@ -745,6 +1237,10 @@ impl App {
             h.history.clear();
             h.up = false;
             h.latency_ms = 0.0;
+            h.consecutive_failures = 0;
+            h.down_email_sent = false;
+            h.down_since = None;
+            h.escalation = 0;
         }
         self.history_cache.clear();
     }
@@ -990,7 +1486,9 @@ fn timeline_lines(theme: &Theme, summary: &HistorySummary, range: HistoryRange, 
         "timeline (green = up, red = down)",
         Style::default().fg(theme.inactive_fg),
     ))];
-    let timeline_width = popup_width.saturating_sub(6).min(summary.buckets.len());
+    // Buckets render 2 cells wide ("▓ "), so halve the available width —
+    // otherwise wide ranges (24h/7d) run off the popup edge.
+    let timeline_width = (popup_width.saturating_sub(6) / 2).min(summary.buckets.len());
     let start = summary.buckets.len().saturating_sub(timeline_width);
     let mut timeline_spans: Vec<Span> = Vec::new();
     for (i, &up) in summary.buckets.iter().skip(start).rev().enumerate() {
@@ -1408,6 +1906,7 @@ fn footer_hints() -> Vec<(&'static str, &'static str)> {
         ("/", "search"),
         ("?", "keys"),
         ("t", "theme"),
+        ("o", "email"),
         ("u", "update"),
         ("q", "quit"),
     ]
@@ -1431,6 +1930,7 @@ fn short_footer_hints() -> Vec<(&'static str, &'static str)> {
         ("/", "find"),
         ("?", "keys"),
         ("t", "thm"),
+        ("o", "mail"),
         ("u", "upd"),
         ("q", "quit"),
     ]
@@ -1438,7 +1938,7 @@ fn short_footer_hints() -> Vec<(&'static str, &'static str)> {
 
 /// Keys-only last resort: every binding as a bare key, packed into MENU_ROWS.
 fn keys_only_lines(theme: &Theme, max_width: usize) -> Vec<Line<'static>> {
-    let keys = ["↑↓", "Spc", "a", "d", "e", "h", "c", "i", "E", "g", "f", "s", "/", "?", "t", "u", "q", "Esc"];
+    let keys = ["↑↓", "Spc", "a", "d", "e", "h", "c", "i", "E", "g", "f", "s", "/", "?", "t", "o", "u", "q", "Esc"];
     let mut rows: Vec<Vec<Span<'static>>> = vec![vec![Span::raw("  ")]];
     let mut used = 2usize;
     for k in keys {
@@ -1879,6 +2379,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     Span::raw("   "),
                     Span::raw("[↑/↓] preview   [Enter] apply   [Esc/t] cancel").style(Style::default().fg(theme.inactive_fg)),
                 ])),
+                InputMode::SmtpForm(_) => Text::from(Line::from(vec![
+                    Span::styled("Email alerts", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[Tab]/[↑↓] move field   [Enter] save   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                ])),
                 InputMode::MenuModal => Text::from(Line::from(vec![
                     Span::styled("Menu", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
@@ -1910,6 +2415,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 InputMode::HistoryView { .. } => "history",
                 InputMode::ExportPath { .. } => "export",
                 InputMode::ThemePicker { .. } => "theme",
+                InputMode::SmtpForm(_) => "email",
                 InputMode::MenuModal => "menu",
                 InputMode::KeysHelp => "keys",
                 InputMode::Search { .. } => "search",
@@ -1964,6 +2470,95 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme.box_color))
                     .style(Style::default().bg(theme.popup_bg)));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(popup, popup_area);
+        }
+        InputMode::SmtpForm(ref form) => {
+            let popup_area = centered_rect(62, 62, area);
+            let labels = [
+                "enabled (y/n)",
+                "smtp host",
+                "port",
+                "username",
+                "password",
+                "from",
+                "to (comma-sep)",
+                "TLS (y/n)",
+                "fails for DOWN",
+                "escalations?",
+            ];
+            let values = [
+                &form.enabled,
+                &form.host,
+                &form.port,
+                &form.username,
+                &form.password,
+                &form.from,
+                &form.to,
+                &form.use_tls,
+                &form.threshold,
+                &form.escalations,
+            ];
+            let placeholder = [
+                "y",
+                "e.g. smtp.gmail.com",
+                "587",
+                "optional",
+                "optional",
+                "ping-uin@example.com",
+                "ops@example.com",
+                "y",
+                "3",
+                "y = 5m/30m mail",
+            ];
+            let mut lines: Vec<Line> = vec![
+                Line::from("DOWN after N fails + UP recovery, themed like this TUI.")
+                    .style(Style::default().fg(theme.inactive_fg)),
+                Line::from(""),
+            ];
+            for i in 0..SmtpForm::FIELDS {
+                let focused = form.focus == i;
+                let marker = if focused { "▶ " } else { "  " };
+                let shown = if i == 4 && !values[i].is_empty() {
+                    "*".repeat(values[i].chars().count().min(24))
+                } else if values[i].is_empty() {
+                    placeholder[i].to_string()
+                } else {
+                    values[i].clone()
+                };
+                let mut shown = shown;
+                if focused {
+                    shown.push('▌');
+                }
+                let style = if values[i].is_empty() {
+                    Style::default().fg(theme.inactive_fg)
+                } else if focused {
+                    Style::default().fg(theme.title).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.main_fg)
+                };
+                let label_style = if focused {
+                    Style::default().fg(theme.hi_fg)
+                } else {
+                    Style::default().fg(theme.inactive_fg)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(marker, Style::default().fg(theme.hi_fg)),
+                    Span::styled(format!("{:<16}", labels[i]), label_style),
+                    Span::styled(shown, style),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("[Enter] save   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)));
+            let popup = Paragraph::new(Text::from(lines)).block(
+                Block::default()
+                    .title(accent_title("Email alerts (SMTP)", &theme))
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.box_color))
+                    .style(Style::default().bg(theme.popup_bg)),
+            );
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
         }
@@ -2214,6 +2809,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ("!", "mute 1h"),
                 ("v", "compact"),
                 ("t", "theme"),
+                ("o", "email alerts"),
                 ("u", "update"),
                 ("q", "quit"),
             ];
@@ -2250,22 +2846,32 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ("hosts", vec![("a", "add"), ("e", "edit"), ("d", "delete"), ("c", "clear stats"), ("!", "mute 1h")]),
                 ("inspect", vec![("h", "history"), ("Tab", "compare"), ("s", "view/sort"), ("f", "filter group"), ("/", "search")]),
                 ("run", vec![("Space/p", "ping now"), ("i", "import csv"), ("E", "export csv")]),
-                ("app", vec![("t", "theme"), ("u", "update"), ("M", "menu"), ("?", "this help"), ("q", "quit"), ("Esc", "reset view")]),
+                ("app", vec![("t", "theme"), ("o", "email"), ("u", "update"), ("M", "menu"), ("?", "this help"), ("q", "quit"), ("Esc", "reset view")]),
             ];
-            let popup_height = ((sections.len() + 6).min(area.height as usize).max(8)) as u16;
-            let popup_area = centered_rect(62, popup_height, area);
+            // Fixed generous box; hint rows flow-pack to the actual width so
+            // nothing runs off the edge on narrow windows.
+            let popup_height = (area.height.saturating_sub(4).max(10).min(24)) as u16;
+            let popup_area = centered_rect(70, popup_height, area);
+            let max_width = (popup_area.width as usize).saturating_sub(4).max(20);
             let mut lines = vec![Line::from("")];
             for (title, items) in &sections {
-                let mut spans = vec![
+                let mut row: Vec<Span<'static>> = vec![
                     Span::styled(format!("  {:<9}", title), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                 ];
-                for (i, (k, l)) in items.iter().enumerate() {
-                    if i > 0 {
-                        spans.push(Span::raw("  "));
+                let mut used = 13usize;
+                for (k, l) in items.iter() {
+                    // key_hint renders `[k] l` — measure the same way.
+                    let w = format!("[{}] {}", k, l).chars().count() + 2;
+                    if used + w > max_width {
+                        lines.push(Line::from(std::mem::replace(&mut row, Vec::new())));
+                        row.push(Span::raw("             "));
+                        used = 13;
                     }
-                    spans.extend(key_hint(k, l, &theme));
+                    row.extend(key_hint(k, l, &theme));
+                    row.push(Span::raw("  "));
+                    used += w;
                 }
-                lines.push(Line::from(spans));
+                lines.push(Line::from(row));
             }
             lines.push(Line::from(""));
             lines.push(Line::from("[Esc/?] close").style(Style::default().fg(theme.inactive_fg)));
@@ -2302,7 +2908,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
         }
-        // Search renders in the footer box; KeysHelp above.
+        // Search renders in the footer box; SmtpForm has its own popup above.
         InputMode::Search { .. } | InputMode::Normal => {}
     }
 
@@ -2520,18 +3126,33 @@ fn spawn_update_checker(tx: mpsc::Sender<Message>, current_version: String, shut
         // Wait a few seconds so the UI starts immediately.
         thread::sleep(Duration::from_secs(3));
         let mut last_notified: Option<String> = None;
+        let mut consecutive_failures: u32 = 0;
         while !shutdown.load(Ordering::Relaxed) {
-            if let Some(latest) = fetch_latest_release_version() {
-                if is_newer_version(&current_version, &latest) && last_notified.as_deref() != Some(&latest) {
-                    last_notified = Some(latest.clone());
-                    let _ = tx.send(Message::UpdateAvailable { version: latest });
+            match fetch_latest_release_version() {
+                Some(latest) => {
+                    consecutive_failures = 0;
+                    if is_newer_version(&current_version, &latest)
+                        && last_notified.as_deref() != Some(&latest)
+                    {
+                        last_notified = Some(latest.clone());
+                        let _ = tx.send(Message::UpdateAvailable { version: latest });
+                    }
+                }
+                // A single failure used to cost a full 15-minute cycle, which
+                // made checks look broken (notably at launch before the
+                // network/VPN is up). Retry every minute while failing.
+                None => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
                 }
             }
-            // Re-check every 15 minutes (4 API calls/hour, far below GitHub's
-            // 60/hour unauthenticated limit) so the ↑ badge appears promptly.
+            // Normal cadence is 15 min (4 API calls/hour, far below GitHub's
+            // 60/hour unauthenticated limit); failures retry every minute.
             // Sleep in short chunks so shutdown stays responsive.
-            for _ in 0..90 {
-                if shutdown.load(Ordering::Relaxed) { break; }
+            let chunks = if consecutive_failures == 0 { 90 } else { 6 };
+            for _ in 0..chunks {
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
                 thread::sleep(Duration::from_secs(10));
             }
         }
@@ -3055,6 +3676,9 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('t') | KeyCode::Char('T') => {
                                 app.input_mode = InputMode::ThemePicker { original: app.theme_idx, selected: app.theme_idx };
                             }
+                            KeyCode::Char('o') | KeyCode::Char('O') => {
+                                app.input_mode = InputMode::SmtpForm(SmtpForm::from_config(app.config.smtp.as_ref()));
+                            }
                             KeyCode::Char('m') | KeyCode::Char('M') => {
                                 app.input_mode = InputMode::MenuModal;
                             }
@@ -3373,6 +3997,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Char('t') | KeyCode::Char('T') => {
                                     app.input_mode = InputMode::ThemePicker { original: app.theme_idx, selected: app.theme_idx };
                                 }
+                                KeyCode::Char('o') | KeyCode::Char('O') => {
+                                    app.input_mode = InputMode::SmtpForm(SmtpForm::from_config(app.config.smtp.as_ref()));
+                                }
                                 KeyCode::Char('u') | KeyCode::Char('U') => {
                                     app.input_mode = InputMode::Normal;
                                     if app.update_available.is_some() {
@@ -3485,6 +4112,54 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => { app.input_mode = InputMode::Normal; }
                             _ => {}
                         },
+                        InputMode::SmtpForm(ref form0) => {
+                            let mut form = form0.clone();
+                            match key.code {
+                                KeyCode::Esc => { app.input_mode = InputMode::Normal; }
+                                KeyCode::Tab | KeyCode::Down => {
+                                    form.focus = (form.focus + 1) % SmtpForm::FIELDS;
+                                    app.input_mode = InputMode::SmtpForm(form);
+                                }
+                                KeyCode::BackTab | KeyCode::Up => {
+                                    form.focus = (form.focus + SmtpForm::FIELDS - 1) % SmtpForm::FIELDS;
+                                    app.input_mode = InputMode::SmtpForm(form);
+                                }
+                                KeyCode::Enter => {
+                                    app.save_smtp_form(form);
+                                }
+                                KeyCode::Backspace => {
+                                    match form.focus {
+                                        0 => { form.enabled.pop(); }
+                                        1 => { form.host.pop(); }
+                                        2 => { form.port.pop(); }
+                                        3 => { form.username.pop(); }
+                                        4 => { form.password.pop(); }
+                                        5 => { form.from.pop(); }
+                                        6 => { form.to.pop(); }
+                                        7 => { form.use_tls.pop(); }
+                                        8 => { form.threshold.pop(); }
+                                        _ => { form.escalations.pop(); }
+                                    }
+                                    app.input_mode = InputMode::SmtpForm(form);
+                                }
+                                KeyCode::Char(c) => {
+                                    match form.focus {
+                                        0 => form.enabled.push(c),
+                                        1 => form.host.push(c),
+                                        2 => form.port.push(c),
+                                        3 => form.username.push(c),
+                                        4 => form.password.push(c),
+                                        5 => form.from.push(c),
+                                        6 => form.to.push(c),
+                                        7 => form.use_tls.push(c),
+                                        8 => form.threshold.push(c),
+                                        _ => form.escalations.push(c),
+                                    }
+                                    app.input_mode = InputMode::SmtpForm(form);
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 Event::Resize(_, _) => {
@@ -3528,7 +4203,18 @@ fn run_app<B: ratatui::backend::Backend>(
                     app.last_result_time = Some(Instant::now());
                     // Notify on transitions only (skip the very first result per host).
                     // Suppressed (downstream-of-down-upstream) hosts stay silent.
+                    // Emails: DOWN after the configured threshold of consecutive
+                    // failures (one per outage), plus UP recovery when a
+                    // notified host comes back.
                     let mut transition: Option<(String, String, bool, f64, String)> = None;
+                    // (display, target, group, up, streak, latency, timestamp)
+                    let mut email: Option<(String, String, String, bool, u32, f64, String)> = None;
+                    let smtp_threshold = app
+                        .config
+                        .smtp
+                        .as_ref()
+                        .map(|s| s.effective_threshold())
+                        .unwrap_or(config::SMTP_DOWN_THRESHOLD);
                     if let Some(h) = app.hosts.iter_mut().find(|h| h.name == host) {
                         let first = h.total_checks == 0;
                         let changed = !first && up != h.up;
@@ -3541,8 +4227,39 @@ fn run_app<B: ratatui::backend::Backend>(
                             h.up_checks += 1;
                             h.down_since = None;
                             h.escalation = 0;
-                        } else if h.down_since.is_none() {
-                            h.down_since = Some(Instant::now());
+                            h.consecutive_failures = 0;
+                            if h.down_email_sent {
+                                // Recovery: only after we actually sent a DOWN mail.
+                                h.down_email_sent = false;
+                                email = Some((
+                                    h.display_name(),
+                                    h.target(),
+                                    h.group.clone(),
+                                    true,
+                                    0,
+                                    latency_ms,
+                                    timestamp.clone(),
+                                ));
+                            }
+                        } else {
+                            h.consecutive_failures = h.consecutive_failures.saturating_add(1);
+                            if h.down_since.is_none() {
+                                h.down_since = Some(Instant::now());
+                            }
+                            if h.consecutive_failures == smtp_threshold
+                                && !h.down_email_sent
+                            {
+                                h.down_email_sent = true;
+                                email = Some((
+                                    h.display_name(),
+                                    h.target(),
+                                    h.group.clone(),
+                                    false,
+                                    h.consecutive_failures,
+                                    latency_ms,
+                                    timestamp.clone(),
+                                ));
+                            }
                         }
                         let lat_u64 = if up { latency_ms.round() as u64 } else { 0 };
                         h.history.push_back(lat_u64);
@@ -3565,6 +4282,44 @@ fn run_app<B: ratatui::backend::Backend>(
                                 print!("\x07");
                                 let _ = io::stdout().flush();
                             }
+                        }
+                    }
+                    // Emails respect mute + upstream suppression, like webhooks.
+                    // Recovery mails use the host name to re-check suppression.
+                    if let Some((display, target, group, up, streak, latency_ms, timestamp)) = email {
+                        let host_name = app
+                            .hosts
+                            .iter()
+                            .find(|h| h.display_name() == display && h.target() == target)
+                            .map(|h| h.name.clone());
+                        let silent = match host_name {
+                            Some(ref n) => {
+                                is_suppressed(&app.hosts, n)
+                                    || app.hosts.iter().find(|h| &h.name == n).map_or(false, |h| h.muted())
+                            }
+                            None => true,
+                        };
+                        // A muted/suppressed DOWN must not latch `down_email_sent`,
+                        // or the later recovery mail would fire with no DOWN mail.
+                        if silent && !up {
+                            if let Some(n) = host_name {
+                                if let Some(h) = app.hosts.iter_mut().find(|h| h.name == n) {
+                                    h.down_email_sent = false;
+                                }
+                            }
+                        } else if let Some(smtp) = app.config.smtp.clone().filter(|s| s.is_configured()) {
+                            let theme = app.theme().clone();
+                            let (subject, text, html) = build_alert_email(
+                                &theme,
+                                &display,
+                                &target,
+                                &group,
+                                up,
+                                if up { streak } else { smtp_threshold },
+                                latency_ms,
+                                &timestamp,
+                            );
+                            send_smtp_email(smtp, subject, text, html);
                         }
                     }
                 }
@@ -3591,11 +4346,12 @@ fn run_app<B: ratatui::backend::Backend>(
 
         // Escalation ladder, evaluated every ~5s: still down after 5 min →
         // `still_down_5m` webhook; after 30 min → bell + `still_down_30m`.
+        // Optional SMTP escalation emails ride the same ladder when enabled.
         // Muted and suppressed (downstream-of-down) hosts stay silent.
         if app.last_esc_check.elapsed() > Duration::from_secs(5) {
             app.last_esc_check = Instant::now();
             let now_ts = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let pending: Vec<(String, String, f64, u8)> = app
+            let pending: Vec<(String, String, String, String, u32, f64, u8)> = app
                 .hosts
                 .iter()
                 .filter(|h| !h.up && !h.muted() && h.total_checks > 0)
@@ -3603,23 +4359,50 @@ fn run_app<B: ratatui::backend::Backend>(
                     let mins = h.down_since.map(|t| t.elapsed().as_secs() / 60)?;
                     let level = if mins >= 30 { 2 } else if mins >= 5 { 1 } else { 0 };
                     if level > h.escalation && !is_suppressed(&app.hosts, &h.name) {
-                        Some((h.name.clone(), h.target(), h.latency_ms, level))
+                        Some((
+                            h.name.clone(),
+                            h.display_name(),
+                            h.target(),
+                            h.group.clone(),
+                            h.consecutive_failures,
+                            h.latency_ms,
+                            level,
+                        ))
                     } else {
                         None
                     }
                 })
                 .collect();
-            for (name, target, latency_ms, level) in pending {
+            for (name, display, target, group, streak, latency_ms, level) in pending {
                 if let Some(h) = app.hosts.iter_mut().find(|h| h.name == name) {
                     h.escalation = level;
                 }
                 let event = if level >= 2 { "still_down_30m" } else { "still_down_5m" };
                 if let Some(url) = app.config.webhook_url.clone() {
-                    post_webhook(url, target, false, latency_ms, now_ts.clone(), event);
+                    post_webhook(url, target.clone(), false, latency_ms, now_ts.clone(), event);
                 }
                 if app.config.notify_bell && level >= 2 {
                     print!("\x07");
                     let _ = io::stdout().flush();
+                }
+                if let Some(smtp) = app
+                    .config
+                    .smtp
+                    .clone()
+                    .filter(|s| s.is_configured() && s.escalations)
+                {
+                    let theme = app.theme().clone();
+                    let (subject, text, html) = build_escalation_email(
+                        &theme,
+                        &display,
+                        &target,
+                        &group,
+                        level,
+                        streak,
+                        latency_ms,
+                        &now_ts,
+                    );
+                    send_smtp_email(smtp, subject, text, html);
                 }
             }
         }

@@ -243,6 +243,83 @@ fn default_theme_name() -> String {
     "btop".to_string()
 }
 
+/// Optional SMTP settings for down/recovery email alerts.
+///
+/// `to` accepts a single address or a comma-separated list. `use_tls`
+/// selects encrypted transport (SMTPS on 465, STARTTLS otherwise);
+/// `false` sends plaintext (local relays only).
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SmtpConfig {
+    /// Master switch. `false` (or missing) disables all email alerts.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_smtp_port")]
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    /// Envelope sender, e.g. `ping-uin@example.com`.
+    #[serde(default)]
+    pub from: String,
+    /// Recipient(s), comma-separated, e.g. `ops@example.com, noc@example.com`.
+    #[serde(default)]
+    pub to: String,
+    #[serde(default = "default_true")]
+    pub use_tls: bool,
+    /// Consecutive failures before a DOWN email fires. Default 3.
+    #[serde(default = "default_smtp_threshold")]
+    pub down_threshold: u32,
+    /// Also email the `still_down_5m` / `still_down_30m` escalations.
+    /// Default false (DOWN + recovery only).
+    #[serde(default)]
+    pub escalations: bool,
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
+fn default_smtp_threshold() -> u32 {
+    SMTP_DOWN_THRESHOLD
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl SmtpConfig {
+    /// True when the config is complete enough to attempt delivery.
+    pub fn is_configured(&self) -> bool {
+        self.enabled && !self.host.trim().is_empty() && !self.from.trim().is_empty() && !self.to.trim().is_empty()
+    }
+
+    /// Effective DOWN threshold, clamped to 1..=100 so a stray 0 can't
+    /// either spam on first failure or never fire. Missing/legacy (0)
+    /// falls back to the default of 3.
+    pub fn effective_threshold(&self) -> u32 {
+        if self.down_threshold == 0 {
+            SMTP_DOWN_THRESHOLD
+        } else {
+            self.down_threshold.clamp(1, 100)
+        }
+    }
+
+    /// Parsed recipient list (trimmed, non-empty).
+    pub fn recipients(&self) -> Vec<String> {
+        self.to
+            .split([',', ';'])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+}
+
+/// Default consecutive failed checks before a down-email fires.
+pub const SMTP_DOWN_THRESHOLD: u32 = 3;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Config {
     pub hosts: Vec<HostConfig>,
@@ -262,6 +339,9 @@ pub struct Config {
     /// Terminal bell (`\x07`) on down-transitions.
     #[serde(default)]
     pub notify_bell: bool,
+    /// Optional SMTP settings for down/recovery emails. None = disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub smtp: Option<SmtpConfig>,
     /// Collapsed group names in grouped view.
     #[serde(default)]
     pub collapsed_groups: Vec<String>,
@@ -297,6 +377,7 @@ impl Default for Config {
             sort_mode: SortMode::None,
             webhook_url: None,
             notify_bell: false,
+            smtp: None,
             collapsed_groups: Vec::new(),
             compact: false,
             selected: None,
@@ -471,6 +552,7 @@ impl Config {
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| s.to_string()),
                 notify_bell: value.get("notify_bell").and_then(|v| v.as_bool()).unwrap_or(false),
+                smtp: value.get("smtp").and_then(|v| serde_json::from_value::<SmtpConfig>(v.clone()).ok()),
                 collapsed_groups: value
                     .get("collapsed_groups")
                     .and_then(|v| v.as_array())
@@ -639,5 +721,75 @@ mod tests {
         assert_eq!(h.target(), "db:5432");
         let p = HostConfig::new("db", 60, "g", None, None);
         assert_eq!(p.target(), "db");
+    }
+
+    #[test]
+    fn smtp_config_gating_and_recipients() {
+        let mut s = SmtpConfig {
+            enabled: true,
+            host: "smtp.example.com".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            from: "ping-uin@example.com".to_string(),
+            to: "ops@example.com, noc@example.com ; ".to_string(),
+            use_tls: true,
+            down_threshold: 3,
+            escalations: false,
+        };
+        assert!(s.is_configured());
+        assert_eq!(s.recipients(), vec!["ops@example.com", "noc@example.com"]);
+        s.enabled = false;
+        assert!(!s.is_configured());
+        s.enabled = true;
+        s.host.clear();
+        assert!(!s.is_configured());
+    }
+
+    #[test]
+    fn smtp_threshold_clamps_and_defaults() {
+        let mut s = SmtpConfig::default();
+        assert_eq!(s.effective_threshold(), SMTP_DOWN_THRESHOLD); // 0 -> default
+        s.down_threshold = 1;
+        assert_eq!(s.effective_threshold(), 1);
+        s.down_threshold = 10;
+        assert_eq!(s.effective_threshold(), 10);
+        s.down_threshold = 500;
+        assert_eq!(s.effective_threshold(), 100);
+        // Legacy JSON without the new keys falls back to defaults.
+        let legacy: SmtpConfig = serde_json::from_str(
+            r#"{"enabled":true,"host":"m","from":"f@x","to":"t@x"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.effective_threshold(), SMTP_DOWN_THRESHOLD);
+        assert!(!legacy.escalations);
+    }
+
+    #[test]
+    fn smtp_roundtrips_through_config_json() {
+        let mut cfg = Config::default();
+        cfg.smtp = Some(SmtpConfig {
+            enabled: true,
+            host: "mail.example.com".to_string(),
+            port: 465,
+            username: Some("user".to_string()),
+            password: Some("secret".to_string()),
+            from: "from@example.com".to_string(),
+            to: "to@example.com".to_string(),
+            use_tls: true,
+            down_threshold: 5,
+            escalations: true,
+        });
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        let smtp = back.smtp.expect("smtp survives round-trip");
+        assert_eq!(smtp.host, "mail.example.com");
+        assert_eq!(smtp.port, 465);
+        assert_eq!(smtp.effective_threshold(), 5);
+        assert!(smtp.escalations);
+        // Old configs without smtp still load with None.
+        let legacy: Config =
+            serde_json::from_str(r#"{"hosts":[],"timeout_ms":1000,"graph_width":20}"#).unwrap();
+        assert!(legacy.smtp.is_none());
     }
 }

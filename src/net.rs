@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
-use crate::config::HostConfig;
+use crate::config::{HostConfig, SmtpConfig};
 
 #[derive(Clone)]
 pub struct HostSchedule {
@@ -155,6 +155,73 @@ pub fn check_host(
         Some(p) => tcp_check(host, p, timeout_ms),
         None => ping_host(host, timeout_ms, re),
     }
+}
+
+/// Fire-and-forget SMTP email. Never blocks the UI; failures are silent
+/// (logged to stderr in debug builds only) so a bad mail relay can't stall
+/// pinging. `subject`, `text_body`, and `html_body` should already be built
+/// by the caller (see `build_alert_email` in main.rs for theme styling).
+pub fn send_smtp_email(cfg: SmtpConfig, subject: String, text_body: String, html_body: String) {
+    if !cfg.is_configured() {
+        return;
+    }
+    std::thread::spawn(move || {
+        if let Err(e) = send_smtp_email_blocking(&cfg, &subject, &text_body, &html_body) {
+            #[cfg(debug_assertions)]
+            eprintln!("smtp send failed: {}", e);
+        }
+    });
+}
+
+fn send_smtp_email_blocking(
+    cfg: &SmtpConfig,
+    subject: &str,
+    text_body: &str,
+    html_body: &str,
+) -> Result<(), String> {
+    use lettre::message::{header::ContentType, Mailbox, Message, MultiPart, SinglePart};
+    use lettre::transport::smtp::authentication::Credentials;
+    use lettre::{SmtpTransport, Transport};
+
+    let from: Mailbox = cfg
+        .from
+        .trim()
+        .parse()
+        .map_err(|e| format!("bad from address: {}", e))?;
+    let recipients = cfg.recipients();
+    if recipients.is_empty() {
+        return Err("no recipients".to_string());
+    }
+    let mut builder = Message::builder().from(from).subject(subject);
+    for r in &recipients {
+        let mb: Mailbox = r.parse().map_err(|e| format!("bad to address '{}': {}", r, e))?;
+        builder = builder.to(mb);
+    }
+    let msg = builder
+        .multipart(
+            MultiPart::alternative()
+                .singlepart(SinglePart::builder().header(ContentType::TEXT_PLAIN).body(text_body.to_string()))
+                .singlepart(SinglePart::builder().header(ContentType::TEXT_HTML).body(html_body.to_string())),
+        )
+        .map_err(|e| format!("build message: {}", e))?;
+
+    let base = if cfg.use_tls {
+        if cfg.port == 465 {
+            SmtpTransport::relay(&cfg.host).map_err(|e| format!("smtp relay: {}", e))?
+        } else {
+            SmtpTransport::starttls_relay(&cfg.host).map_err(|e| format!("smtp starttls: {}", e))?
+        }
+    } else {
+        SmtpTransport::builder_dangerous(&cfg.host)
+    };
+    let with_port = base.port(cfg.port).timeout(Some(Duration::from_secs(15)));
+    let transport = match (cfg.username.clone(), cfg.password.clone()) {
+        (Some(user), Some(pass)) if !user.trim().is_empty() => with_port
+            .credentials(Credentials::new(user, pass))
+            .build(),
+        _ => with_port.build(),
+    };
+    transport.send(&msg).map(|_| ()).map_err(|e| format!("send: {}", e))
 }
 
 /// Fire-and-forget webhook POST on transitions and escalations.

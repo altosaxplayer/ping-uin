@@ -55,7 +55,9 @@ cargo run --release      # or just run it straight
 
 A starter host set is built in on first launch, so it works even before you
 add any config: Google DNS (`8.8.8.8`), Cloudflare (`1.1.1.1`), your local
-gateway (`192.168.1.1`), and `google.com`.
+gateway (`192.168.1.1`), and `google.com`. Starting truly empty instead?
+A welcome popup offers CSV import, manual add, or the demo set — and the
+app re-selects last session's host on startup.
 
 ---
 
@@ -76,13 +78,14 @@ gateway (`192.168.1.1`), and `google.com`.
 | `E` | export timestamped CSV **plus** an HTML status page |
 | `g` | toggle grouped/flat view |
 | `f` | filter by group (`Space` = show all, `Esc` = cancel) |
-| `s` | view picker — `off` / down-first / up-first / name / group / **down only** (`1-6` quick-pick, `Space` = show all) |
+| `s` | view picker — `off` / down-first / up-first / name / group / **down only** (`1-6` quick-pick, `Space` = show all; group sort hides the per-group up/down tallies) |
 | `Esc` | reset view — clear any sort/group filter and show all hosts |
 | `Enter` | collapse/expand the selected host's group |
 | `/` | search names, aliases, groups (`Enter` keeps, `Esc` clears) |
 | `?` | full key-binding cheat sheet |
 | mouse | click to select, wheel to scroll |
 | `t` | theme picker (live preview, persists) |
+| `o` | email (SMTP) alert settings — threshold, escalations, themed like the TUI |
 | `u` | check for updates / install when available |
 | `M` | full menu (actionable) |
 | `q` / `Ctrl+C` | quit (cleanly!) |
@@ -162,10 +165,12 @@ read from and written to that same directory instead of the system config path.
 
 ### In-place updates
 
-The app checks GitHub releases at startup and then **every 15 minutes**,
-so the `↑ vX.Y.Z ready — u to update` pill appears in the **top-right corner**
-(plus a badge in the menu box) without restarting. Press **`u`** any time to
-check manually — press **`u`** again to install:
+The app checks GitHub releases at startup and then **every 15 minutes**
+(failed checks — e.g. launching before the VPN connects — retry every
+minute until one succeeds), so the `↑ vX.Y.Z ready — u to update` pill
+appears in the **top-right corner** (plus a badge in the menu box) without
+restarting. Press **`u`** any time to check manually — press **`u`** again
+to install:
 
 - **Portable mode** (marker file or data files next to the binary): the
   running binary is replaced in place (checksum-verified, backup + restore
@@ -187,13 +192,25 @@ discarded.
 
 ### Notifications
 
-`ping-uin` can shout when hosts change state. Both live in `ping-uin.json`
-(next to the other settings — no UI yet, edit the file directly):
+`ping-uin` can shout when hosts change state. Webhook + bell live in
+`ping-uin.json` (edit the file directly); email has a TUI form — press `o`:
 
 ```json
 {
   "webhook_url": "https://hooks.slack.com/services/…",
-  "notify_bell": true
+  "notify_bell": true,
+  "smtp": {
+    "enabled": true,
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "username": "you@gmail.com",
+    "password": "app-password",
+    "from": "ping-uin@gmail.com",
+    "to": "ops@example.com, noc@example.com",
+    "use_tls": true,
+    "down_threshold": 3,
+    "escalations": false
+  }
 }
 ```
 
@@ -202,6 +219,18 @@ discarded.
   `still_down_5m` / `still_down_30m` escalation events for long outages.
 - `notify_bell` — rings the terminal bell on down-transitions (and again
   at the 30-minute escalation).
+- `smtp` — sends **one DOWN email after `down_threshold` consecutive failures**
+  (default 3, 1–100, one mail per outage), plus a **recovery UP email** when
+  the host comes back. Set `"escalations": true` to also mail the
+  `still_down_5m` / `still_down_30m` reminders. Port 465 uses
+  SMTPS, other ports use STARTTLS; set `use_tls: false` only for local
+  plaintext relays. `to` accepts a comma-separated list. Delivery is
+  fire-and-forget so a slow relay never stalls pinging.
+
+Emails are styled with the **currently active theme**: page background,
+card, and text colors come from the theme, and the status is unmissable —
+a full-width banner in the theme's danger color (`● DOWN`) or good color
+(`● UP`), with host, target, group, timestamp, latency, and streak.
 
 Downstream hosts with `depends_on` pointing at a down upstream read `DEP`
 and stay silent — fix the upstream, not the noise. `!` mutes a host for an
