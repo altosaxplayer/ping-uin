@@ -29,6 +29,9 @@ use regex::Regex;
 
 mod config;
 mod net;
+mod startup;
+mod sync;
+mod web;
 
 use config::{
     format_interval, homebrew_bin_path, is_homebrew_install, parse_interval, paths,
@@ -183,6 +186,8 @@ struct HostState {
     check_cmd: Option<String>,
     depends_on: Option<String>,
     muted_until: Option<i64>,
+    /// Mirrors the config entry: drives sync last-write-wins.
+    updated_at: i64,
     next_ping: Instant,
     history: VecDeque<u64>,
     up: bool,
@@ -217,6 +222,7 @@ impl HostState {
             check_cmd: entry.check_cmd.clone(),
             depends_on: entry.depends_on.clone(),
             muted_until: entry.muted_until,
+            updated_at: entry.updated_at,
             next_ping: Instant::now(),
             history: VecDeque::with_capacity(config::DEFAULT_GRAPH_WIDTH),
             up: false,
@@ -232,7 +238,7 @@ impl HostState {
         }
     }
 
-    /// Refresh check parameters from the config entry (add/edit/import).
+    /// Refresh check parameters from the config entry (add/edit/import/sync).
     fn sync_config(&mut self, entry: &HostConfig) {
         self.interval_secs = entry.effective_interval_secs();
         self.group = entry.group.clone();
@@ -242,6 +248,7 @@ impl HostState {
         self.check_cmd = entry.check_cmd.clone();
         self.depends_on = entry.depends_on.clone();
         self.muted_until = entry.muted_until;
+        self.updated_at = entry.updated_at;
     }
 
     fn muted(&self) -> bool {
@@ -583,6 +590,27 @@ mod tests {
     }
 
     #[test]
+    fn popup_rect_fits_content_and_clamps_to_area() {
+        use ratatui::layout::Rect;
+        // Normal: centered box of the requested size.
+        let r = popup_rect(48, 18, Rect::new(0, 0, 80, 24));
+        assert_eq!((r.width, r.height), (48, 18));
+        assert_eq!((r.x, r.y), (16, 3));
+        // Small window: clamps instead of overflowing the area.
+        let r = popup_rect(48, 20, Rect::new(0, 0, 40, 12));
+        assert!(r.width <= 40 && r.height <= 12);
+        assert!(r.x + r.width <= 40 && r.y + r.height <= 12);
+        // Tiny window: never zero-sized, never outside.
+        let r = popup_rect(48, 20, Rect::new(0, 0, 10, 6));
+        assert_eq!((r.width, r.height), (10, 6));
+        assert_eq!((r.x, r.y), (0, 0));
+        // Offset areas stay inside.
+        let r = popup_rect(30, 10, Rect::new(5, 5, 80, 24));
+        assert!(r.x >= 5 && r.y >= 5);
+        assert!(r.x + r.width <= 85 && r.y + r.height <= 29);
+    }
+
+    #[test]
     fn timeline_bars_always_fit_popup() {
         let theme = build_themes().into_iter().next().unwrap();
         // 8h/24h/7d bucket counts across narrow and wide popups.
@@ -679,6 +707,16 @@ mod tests {
                 assert!(!html.contains("● UP"), "theme {}", theme.name);
             }
         }
+    }
+
+    #[test]
+    fn primary_web_url_takes_first_listing() {
+        assert_eq!(
+            primary_web_url("http://192.168.1.42:8080/ · http://127.0.0.1:8080/"),
+            "http://192.168.1.42:8080/"
+        );
+        assert_eq!(primary_web_url("http://127.0.0.1:8080/"), "http://127.0.0.1:8080/");
+        assert_eq!(primary_web_url(""), "");
     }
 
     #[test]
@@ -879,6 +917,10 @@ enum InputMode {
     KeysHelp,
     Search { query: String },
     ConfirmDelete,
+    /// Device sync menu (join code, peers with hostname/join/last-sync).
+    SyncMenu,
+    /// Join form: paste the other device's code.
+    SyncJoin { code: String },
 }
 
 #[derive(Clone, Debug)]
@@ -923,6 +965,14 @@ struct App {
     restart_after_exit: bool,
     history_cache: HashMap<(String, HistoryRange), (Option<SystemTime>, HistorySummary)>,
     last_trim: Instant,
+    /// Read-only LAN web server state (toggled with `W` in the TUI).
+    web_page: web::SharedPage,
+    web_url: Option<String>,
+    /// Gates the HTML page on the shared listener (sync routes stay live).
+    web_enabled: Arc<AtomicBool>,
+    /// True once the shared listener thread runs (page and/or sync).
+    server_running: bool,
+    web_last_publish: Instant,
 }
 
 impl App {
@@ -946,8 +996,16 @@ impl App {
     fn remove_selected(&mut self, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
         if self.hosts.len() <= 1 { return; }
         if self.selected_idx < self.hosts.len() {
-            self.hosts.remove(self.selected_idx);
+            let removed = self.hosts.remove(self.selected_idx);
             self.config.hosts.remove(self.selected_idx);
+            // Tombstone so the delete propagates to synced neighbors instead
+            // of being resurrected by their next push.
+            let now = config::now_epoch();
+            if let Some(d) = self.config.sync_deleted.iter_mut().find(|d| d.name == removed.name) {
+                d.at = now;
+            } else {
+                self.config.sync_deleted.push(config::SyncDeletion { name: removed.name, at: now });
+            }
             // Drop cached history so removed hosts free their summaries.
             self.history_cache.clear();
             self.persist();
@@ -1105,6 +1163,7 @@ impl App {
             self.config.hosts[idx].group  = group.clone();
             self.config.hosts[idx].alias  = alias.clone();
             self.config.hosts[idx].port   = port;
+            self.config.hosts[idx].touch();
             if let Some(h) = self.hosts.get_mut(idx) {
                 h.sync_config(&self.config.hosts[idx]);
             }
@@ -1117,9 +1176,11 @@ impl App {
     }
 
     /// Read and merge hosts.csv: new rows get added; existing rows get updated.
+    /// Every touched row is stamped so neighbor sync prefers this side.
     fn import_entries(&mut self, path: &std::path::Path, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
         if let Ok(entries) = read_entries_csv(path) {
-            for entry in entries {
+            for mut entry in entries {
+                entry.touch();
                 match self.config.hosts.iter().position(|h| h.name == entry.name) {
                     Some(i) => {
                         self.config.hosts[i] = entry.clone();
@@ -1210,6 +1271,7 @@ impl App {
             entry.muted_until = Some(now + 3600);
             self.update_state = UpdateState::Info("host muted for 1h".to_string());
         }
+        entry.touch();
         self.persist();
         if let Ok(mut h) = shared_hosts.write() {
             *h = schedules_from_config(&self.config.hosts);
@@ -1442,8 +1504,7 @@ fn render_graph(history: &VecDeque<u64>, theme: &Theme, width: usize) -> Text<'s
     Text::from(Line::from(spans))
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {    let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Percentage((100 - percent_y) / 2),
@@ -1459,6 +1520,26 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+/// Row-based centered popup: `width`/`height` are cells, clamped to `area`
+/// so content can never outgrow the box on small windows. Use this when the
+/// box must fit N lines of content; use `centered_rect` only for fixed
+/// proportional popups. Never returns a zero-sized rect on a non-empty area.
+fn popup_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.clamp(1, area.width.max(1));
+    let h = height.clamp(1, area.height.max(1));
+    Rect {
+        x: area.x.saturating_add(area.width.saturating_sub(w) / 2),
+        y: area.y.saturating_add(area.height.saturating_sub(h) / 2),
+        width: w,
+        height: h,
+    }
+}
+
+/// Width for a proportional popup in cells, clamped to `area`.
+fn popup_width(percent: u16, area: Rect) -> u16 {
+    (area.width.saturating_mul(percent) / 100).clamp(1, area.width.max(1))
 }
 
 /// btop-style hotkey hint: [ key ]  with divider brackets + hi_fg key
@@ -1900,6 +1981,9 @@ fn footer_hints() -> Vec<(&'static str, &'static str)> {
         ("c", "clear stats"),
         ("i", "import"),
         ("E", "export"),
+        ("W", "web page"),
+        ("B", "browser"),
+        ("Y", "sync"),
         ("g", "group"),
         ("f", "filter"),
         ("s", "sort"),
@@ -1924,6 +2008,9 @@ fn short_footer_hints() -> Vec<(&'static str, &'static str)> {
         ("c", "clear"),
         ("i", "imp"),
         ("E", "exp"),
+        ("W", "web"),
+        ("B", "browser"),
+        ("Y", "sync"),
         ("g", "grp"),
         ("f", "flt"),
         ("s", "sort"),
@@ -2402,6 +2489,19 @@ fn ui(frame: &mut Frame, app: &mut App) {
                         Span::styled("   [Enter] keep   [Esc] clear", Style::default().fg(theme.inactive_fg)),
                     ]))
                 }
+                InputMode::SyncMenu => Text::from(Line::from(vec![
+                    Span::styled("Device sync", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[g] new code   [j] join   [1-9] forget peer   [Esc] close").style(Style::default().fg(theme.inactive_fg)),
+                ])),
+                InputMode::SyncJoin { ref code } => {
+                    let q = if code.is_empty() { " ".to_string() } else { format!("{}▌", code) };
+                    Text::from(Line::from(vec![
+                        Span::styled("Join with code ", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                        Span::styled(q, Style::default().fg(theme.hi_fg)),
+                        Span::styled("   [Enter] join   [Esc] back", Style::default().fg(theme.inactive_fg)),
+                    ]))
+                }
                 InputMode::Normal => unreachable!(),
             };
             // Same fixed-height box as the menu so the layout never shifts.
@@ -2419,6 +2519,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 InputMode::MenuModal => "menu",
                 InputMode::KeysHelp => "keys",
                 InputMode::Search { .. } => "search",
+                InputMode::SyncMenu => "sync",
+                InputMode::SyncJoin { .. } => "join",
                 InputMode::Normal => unreachable!(),
             };
             let block = menu_box(accent_title(mode_title, &theme));
@@ -2800,6 +2902,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ("c", "clear stats"),
                 ("i", "import"),
                 ("E", "export"),
+                ("W", "web page on/off (opt-in)"),
+                ("B", "open page in browser"),
+                ("Y", "device sync"),
                 ("g", "group"),
                 ("f", "filter group"),
                 ("s", "view/sort"),
@@ -2814,9 +2919,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ("q", "quit"),
             ];
             let rows = (menu_hints.len() + 1) / 2;
-            let popup_height = ((rows + 5).min(area.height as usize).max(8)) as u16;
-            let popup_area = centered_rect(60, popup_height, area);
-            let mut lines = vec![Line::from("")];
+            // Row-based box sized from the actual content: `centered_rect`
+            // takes percentages, so passing row counts shrinks the box to a
+            // sliver on small windows and clips the menu (mac small-window
+            // bug). Clamp to the area and truncate leftovers as a last resort.
+            let mut lines: Vec<Line> = vec![Line::from("")];
             for chunk in menu_hints.chunks(2) {
                 let mut spans = vec![Span::raw("  ")];
                 for (i, (k, l)) in chunk.iter().enumerate() {
@@ -2827,8 +2934,32 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 }
                 lines.push(Line::from(spans));
             }
+            let _ = rows;
+            lines.push(Line::from(""));
+            // Live opt-in status: web serving is W-toggled, startup install
+            // is an explicit CLI action — neither ever happens on its own.
+            let web_line = match &app.web_url {
+                Some(urls) => format!("web: serving on {} — W hides it, B opens it in your browser", urls),
+                None => "web: off (opt-in) — W serves this session, B serves + opens it".to_string(),
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(web_line, Style::default().fg(theme.hi_fg)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} (opt-in CLI: --install-startup / --uninstall-startup)", startup::status_line()),
+                    Style::default().fg(theme.inactive_fg),
+                ),
+            ]));
             lines.push(Line::from(""));
             lines.push(Line::from("[Esc/M] close").style(Style::default().fg(theme.inactive_fg)));
+            let popup_area = popup_rect(popup_width(60, area), lines.len() as u16 + 2, area);
+            let max_lines = popup_area.height.saturating_sub(2) as usize;
+            if lines.len() > max_lines {
+                lines.truncate(max_lines);
+            }
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
                     .title(accent_title("menu", &theme))
@@ -2845,14 +2976,14 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 ("navigate", vec![("↑/↓", "select"), ("Enter", "collapse group"), ("g", "grouped/flat"), ("v", "compact")]),
                 ("hosts", vec![("a", "add"), ("e", "edit"), ("d", "delete"), ("c", "clear stats"), ("!", "mute 1h")]),
                 ("inspect", vec![("h", "history"), ("Tab", "compare"), ("s", "view/sort"), ("f", "filter group"), ("/", "search")]),
-                ("run", vec![("Space/p", "ping now"), ("i", "import csv"), ("E", "export csv")]),
+                ("run", vec![("Space/p", "ping now"), ("i", "import csv"), ("E", "export csv"), ("W", "web on/off"), ("B", "open page"), ("Y", "sync")]),
                 ("app", vec![("t", "theme"), ("o", "email"), ("u", "update"), ("M", "menu"), ("?", "this help"), ("q", "quit"), ("Esc", "reset view")]),
             ];
-            // Fixed generous box; hint rows flow-pack to the actual width so
-            // nothing runs off the edge on narrow windows.
-            let popup_height = (area.height.saturating_sub(4).max(10).min(24)) as u16;
-            let popup_area = centered_rect(70, popup_height, area);
-            let max_width = (popup_area.width as usize).saturating_sub(4).max(20);
+            // Row-based box like the menu: width first (rows flow-pack to it),
+            // then height from the packed line count. Same small-window bug
+            // as the menu had — row counts are not percentages.
+            let width = popup_width(70, area);
+            let max_width = (width as usize).saturating_sub(4).max(20);
             let mut lines = vec![Line::from("")];
             for (title, items) in &sections {
                 let mut row: Vec<Span<'static>> = vec![
@@ -2875,6 +3006,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from("[Esc/?] close").style(Style::default().fg(theme.inactive_fg)));
+            let popup_area = popup_rect(width, lines.len() as u16 + 2, area);
+            let max_lines = popup_area.height.saturating_sub(2) as usize;
+            if lines.len() > max_lines {
+                lines.truncate(max_lines);
+            }
             let popup = Paragraph::new(Text::from(lines))
                 .block(Block::default()
                     .title(accent_title("key bindings", &theme))
@@ -2907,6 +3043,72 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 .style(Style::default().bg(theme.popup_bg)));
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
+        }
+        InputMode::SyncMenu => {
+            let now = config::now_epoch();
+            let mut lines = vec![
+                Line::from(""),
+                Line::from("Pair devices with a join code — no discovery, no accounts.").style(Style::default().fg(theme.inactive_fg)),
+                Line::from("Adds, edits, and removals sync both ways about once a minute.").style(Style::default().fg(theme.inactive_fg)),
+                Line::from(""),
+            ];
+            match app.config.sync_token.as_deref().filter(|t| !t.is_empty()) {
+                Some(token) => {
+                    let code = sync::make_join_code(
+                        &sync::primary_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
+                        startup::DEFAULT_WEB_PORT,
+                        token,
+                    );
+                    lines.push(Line::from(vec![
+                        Span::styled("  this device: ", Style::default().fg(theme.inactive_fg)),
+                        Span::styled(sync::device_hostname(), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    ]));
+                    lines.push(Line::from(vec![
+                        Span::styled("  join code:   ", Style::default().fg(theme.inactive_fg)),
+                        Span::styled(code, Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
+                    ]));
+                }
+                None => {
+                    lines.push(Line::from("  no join code yet — press [g] to create one.").style(Style::default().fg(theme.hi_fg)));
+                }
+            }
+            lines.push(Line::from(""));
+            if app.config.sync_peers.is_empty() {
+                lines.push(Line::from("  no paired devices — press [j] and paste the other device's code.").style(Style::default().fg(theme.inactive_fg)));
+            } else {
+                lines.push(Line::from(format!("  paired devices ({})", app.config.sync_peers.len())).style(Style::default().fg(theme.title).add_modifier(Modifier::BOLD)));
+                for (i, p) in app.config.sync_peers.iter().enumerate() {
+                    let host = if p.hostname.is_empty() { p.addr.clone() } else { format!("{} ({})", p.hostname, p.addr) };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  [{}] ", i + 1), Style::default().fg(theme.hi_fg)),
+                        Span::styled(host, Style::default().fg(theme.main_fg)),
+                        Span::styled(
+                            format!("  · joined {} · last sync {}", sync::format_epoch(p.joined_at), sync::ago(p.last_sync, now)),
+                            Style::default().fg(theme.inactive_fg),
+                        ),
+                    ]));
+                }
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("[g] new code   [j] join with code   [1-9] forget peer   [Esc] close").style(Style::default().fg(theme.inactive_fg)));
+            let popup_area = popup_rect(popup_width(72, area), lines.len() as u16 + 2, area);
+            let max_lines = popup_area.height.saturating_sub(2) as usize;
+            if lines.len() > max_lines {
+                lines.truncate(max_lines);
+            }
+            let popup = Paragraph::new(Text::from(lines))
+                .block(Block::default()
+                    .title(accent_title("device sync", &theme))
+                    .title_alignment(Alignment::Center)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.box_color))
+                    .style(Style::default().bg(theme.popup_bg)));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(popup, popup_area);
+        }
+        InputMode::SyncJoin { .. } => {
+            // Text field lives in the footer box; the sync menu stays behind it.
         }
         // Search renders in the footer box; SmtpForm has its own popup above.
         InputMode::Search { .. } | InputMode::Normal => {}
@@ -3563,11 +3765,24 @@ fn run_app<B: ratatui::backend::Backend>(
     rx: mpsc::Receiver<Message>,
     shared_hosts: Arc<RwLock<Vec<HostSchedule>>>,
     shutdown: Arc<AtomicBool>,
+    sync_tx: std::sync::mpsc::SyncSender<sync::SyncEvent>,
+    sync_rx: std::sync::mpsc::Receiver<sync::SyncEvent>,
 ) -> io::Result<()> {
     let tick_rate = Duration::from_millis(50);
 
     loop {
         terminal.draw(|f| ui(f, app))?;
+        // Inbound neighbor sync (single config writer: this loop).
+        for ev in sync_rx.try_iter() {
+            let summary = apply_sync_event(&mut app.hosts, &mut app.config, &shared_hosts, &mut app.history_cache, ev);
+            app.persist();
+            publish_web_snapshot(app);
+            // Keep selection valid after removals.
+            if app.selected_idx >= app.hosts.len() {
+                app.selected_idx = app.hosts.len().saturating_sub(1);
+            }
+            app.update_state = UpdateState::Info(summary);
+        }
         if event::poll(tick_rate)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -3629,6 +3844,48 @@ fn run_app<B: ratatui::backend::Backend>(
                                 let default_dir = dirs::home_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
                                 app.input_mode = InputMode::ExportPath { path: default_dir };
                             }
+                            KeyCode::Char('w') | KeyCode::Char('W') => {
+                                // Opt-in toggle: W shows the read-only LAN
+                                // page, W again hides it. The sync listener
+                                // keeps running while pairing is configured.
+                                if app.web_url.is_some() {
+                                    app.web_enabled.store(false, Ordering::Relaxed);
+                                    app.web_url = None;
+                                    app.update_state = UpdateState::Info(
+                                        "web page hidden — press W to serve again".to_string(),
+                                    );
+                                } else {
+                                    let urls = ensure_tui_web_server(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT);
+                                    app.update_state = UpdateState::Info(format!(
+                                        "serving read-only page on {} (W hides it, B opens it in your browser)",
+                                        urls
+                                    ));
+                                }
+                            }
+                            KeyCode::Char('b') | KeyCode::Char('B') => {
+                                // Open the served page in the default browser.
+                                // Explicitly opt-in like W: starts serving first
+                                // when off, then opens the primary (LAN) URL.
+                                let urls = match app.web_url.clone() {
+                                    Some(line) => line,
+                                    None => ensure_tui_web_server(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT),
+                                };
+                                let url = primary_web_url(&urls).to_string();
+                                match open_in_browser(&url) {
+                                    Ok(()) => {
+                                        app.update_state = UpdateState::Info(format!(
+                                            "serving on {} — opened in browser (W hides it)",
+                                            urls
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        app.update_state = UpdateState::Info(format!(
+                                            "serving on {} — couldn't open browser ({}); paste the URL manually",
+                                            urls, e
+                                        ));
+                                    }
+                                }
+                            }
                             KeyCode::Char('u') | KeyCode::Char('U') => {
                                 // No known update: manual check first. Known update: install it.
                                 if let Some(ref version) = app.update_available.clone() {
@@ -3678,6 +3935,9 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             KeyCode::Char('o') | KeyCode::Char('O') => {
                                 app.input_mode = InputMode::SmtpForm(SmtpForm::from_config(app.config.smtp.as_ref()));
+                            }
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                app.input_mode = InputMode::SyncMenu;
                             }
                             KeyCode::Char('m') | KeyCode::Char('M') => {
                                 app.input_mode = InputMode::MenuModal;
@@ -4112,6 +4372,104 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => { app.input_mode = InputMode::Normal; }
                             _ => {}
                         },
+                        InputMode::SyncMenu => match key.code {
+                            KeyCode::Esc | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                app.input_mode = InputMode::Normal;
+                            }
+                            KeyCode::Char('g') | KeyCode::Char('G') => {
+                                // (Re)generate our pairing secret + join code.
+                                // Rotating invalidates previously shared codes.
+                                let token = sync::generate_token();
+                                app.config.sync_token = Some(token);
+                                app.persist();
+                                ensure_server_running(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT);
+                            }
+                            KeyCode::Char('j') | KeyCode::Char('J') => {
+                                app.input_mode = InputMode::SyncJoin { code: String::new() };
+                            }
+                            KeyCode::Char(c) if ('1'..='9').contains(&c) => {
+                                let idx = (c as usize) - ('1' as usize);
+                                if idx < app.config.sync_peers.len() {
+                                    let removed = app.config.sync_peers.remove(idx);
+                                    app.persist();
+                                    app.update_state = UpdateState::Info(format!(
+                                        "forgot {} — its hosts stay, future pushes stop",
+                                        if removed.hostname.is_empty() { removed.addr } else { removed.hostname }
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        },
+                        InputMode::SyncJoin { ref code } => {
+                            let mut code = code.clone();
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.input_mode = InputMode::SyncMenu;
+                                }
+                                KeyCode::Backspace => {
+                                    code.pop();
+                                    app.input_mode = InputMode::SyncJoin { code };
+                                }
+                                KeyCode::Enter => {
+                                    let code = code.trim().to_string();
+                                    if code.is_empty() {
+                                        app.input_mode = InputMode::SyncMenu;
+                                        continue;
+                                    }
+                                    match sync::parse_join_code(&code) {
+                                        Ok((peer_addr, peer_token)) => {
+                                            // Our callback identity (we listen
+                                            // for the peer's pushes too).
+                                            if app.config.sync_token.as_deref().map_or(true, |t| t.is_empty()) {
+                                                app.config.sync_token = Some(sync::generate_token());
+                                                app.persist();
+                                            }
+                                            let from_token = app.config.sync_token.clone().unwrap_or_default();
+                                            let from_addr = self_sync_addr(startup::DEFAULT_WEB_PORT);
+                                            let hostname = sync::device_hostname();
+                                            ensure_server_running(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT);
+                                            let sync_tx2 = sync_tx.clone();
+                                            let tx2 = tx.clone();
+                                            app.input_mode = InputMode::Normal;
+                                            app.update_state = UpdateState::Info(format!("joining {} …", peer_addr));
+                                            thread::spawn(move || {
+                                                match sync::join_with_code(&peer_addr, &peer_token, &from_addr, &from_token, &hostname) {
+                                                    Ok((hosts, deleted, peer_hostname)) => {
+                                                        let peer = config::SyncPeer {
+                                                            addr: peer_addr.clone(),
+                                                            token: peer_token,
+                                                            hostname: peer_hostname.clone(),
+                                                            joined_at: config::now_epoch(),
+                                                            last_sync: config::now_epoch(),
+                                                        };
+                                                        let _ = sync_tx2.try_send(sync::SyncEvent {
+                                                            hosts,
+                                                            deleted,
+                                                            from_addr: peer_addr,
+                                                            from_hostname: peer_hostname,
+                                                            new_peer: Some(peer),
+                                                            push_result: None,
+                                                        });
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx2.send(Message::UpdateState(UpdateState::Error(format!("sync join failed: {}", e))));
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            app.update_state = UpdateState::Info(e);
+                                            app.input_mode = InputMode::SyncJoin { code };
+                                        }
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    code.push(c);
+                                    app.input_mode = InputMode::SyncJoin { code };
+                                }
+                                _ => {}
+                            }
+                        }
                         InputMode::SmtpForm(ref form0) => {
                             let mut form = form0.clone();
                             match key.code {
@@ -4344,6 +4702,13 @@ fn run_app<B: ratatui::backend::Backend>(
             app.history_cache.clear();
         }
 
+        // Keep the read-only LAN snapshot fresh while the web server runs.
+        // Throttled to ~every 2s; SLA summaries are cached by log mtime.
+        if app.web_url.is_some() && app.web_last_publish.elapsed() > Duration::from_secs(2) {
+            app.web_last_publish = Instant::now();
+            publish_web_snapshot(app);
+        }
+
         // Escalation ladder, evaluated every ~5s: still down after 5 min →
         // `still_down_5m` webhook; after 30 min → bell + `still_down_30m`.
         // Optional SMTP escalation emails ride the same ladder when enabled.
@@ -4466,13 +4831,502 @@ fn run_once(format: &str) -> io::Result<()> {
     std::process::exit(if down > 0 { 2 } else { 0 });
 }
 
+/// Build a read-only web snapshot from live TUI/headless state, using the
+/// same status priority as the table: MUTED > FLAP > DOWN > WARN > UP,
+/// with DEP for down hosts whose upstream is down.
+fn build_web_snapshot(hosts: &[HostState], history_cache: &mut HashMap<(String, HistoryRange), (Option<SystemTime>, HistorySummary)>) -> Vec<web::HostSnapshot> {
+    hosts
+        .iter()
+        .map(|h| {
+            let muted = h.muted();
+            let suppressed = !h.up && is_suppressed(hosts, &h.name);
+            let status = if muted {
+                "MUTED"
+            } else if h.flapping() {
+                "FLAP"
+            } else if h.up && h.warn_active() {
+                "WARN"
+            } else if h.up {
+                "UP"
+            } else if suppressed {
+                "DEP"
+            } else {
+                "DOWN"
+            };
+            let uptime_pct = if h.total_checks > 0 {
+                h.up_checks as f64 / h.total_checks as f64 * 100.0
+            } else {
+                0.0
+            };
+            let sla_24h = {
+                let summary = cached_history_summary(history_cache, &h.name, HistoryRange::Hours24);
+                if summary.total == 0 { None } else { Some(summary.uptime_pct) }
+            };
+            web::HostSnapshot {
+                name: h.name.clone(),
+                display_name: h.display_name(),
+                target: h.target(),
+                group: h.group.clone(),
+                status: status.to_string(),
+                up: h.up,
+                latency_ms: h.latency_ms,
+                uptime_pct,
+                sla_24h,
+                history: h.history.iter().copied().collect(),
+                muted,
+                suppressed,
+                flapping: h.flapping(),
+                warn: h.warn_active(),
+                down_for_secs: h.down_for().map(|d| d.as_secs()),
+            }
+        })
+        .collect()
+}
+
+/// First URL of a `"url · url"` display line (the LAN URL). The line is
+/// built by `ensure_tui_web_server`, so this never fails — it just trims.
+fn primary_web_url(line: &str) -> &str {
+    line.split(" · ").next().unwrap_or(line).trim()
+}
+
+/// Open a URL in the default browser (best-effort, fire-and-forget).
+/// macOS `open`, Linux `xdg-open`, Windows `start`.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("open failed: {}", e))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("xdg-open failed (install xdg-utils?): {}", e))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("start failed: {}", e))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = url;
+        Err("unsupported OS".to_string())
+    }
+}
+
+/// Mirror a TUI theme into page colors so the website visibly matches the
+/// desktop instance serving it.
+fn theme_snapshot(theme: &Theme) -> web::SharedTheme {
+    web::SharedTheme {
+        name: theme.name.to_string(),
+        bg: css_hex(theme.main_bg),
+        fg: css_hex(theme.main_fg),
+        title: css_hex(theme.title),
+        accent: css_hex(theme.hi_fg),
+        muted: css_hex(theme.inactive_fg),
+        good: css_hex(theme.status_good),
+        danger: css_hex(theme.status_danger),
+        graph: css_hex(theme.graph_start),
+        divider: css_hex(theme.divider),
+        card: css_hex(theme.popup_bg),
+    }
+}
+
+/// Push the current host states + serving theme into the shared page.
+fn publish_web_snapshot(app: &mut App) {
+    let hosts = build_web_snapshot(&app.hosts, &mut app.history_cache);
+    let theme = theme_snapshot(app.theme());
+    if let Ok(mut page) = app.web_page.write() {
+        page.hosts = hosts;
+        page.theme = theme;
+    }
+}
+
+/// Our own listen address for sync callbacks (`lan-ip:port`).
+fn self_sync_addr(port: u16) -> String {
+    format!(
+        "{}:{}",
+        sync::primary_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
+        port
+    )
+}
+
+/// Start the shared listener if needed (page and/or sync). The page itself
+/// stays gated behind `web_enabled` — starting the listener for sync never
+/// auto-serves the website.
+fn ensure_server_running(
+    app: &mut App,
+    shutdown: &Arc<AtomicBool>,
+    sync_tx: &std::sync::mpsc::SyncSender<sync::SyncEvent>,
+    bind: &str,
+    port: u16,
+) {
+    if app.server_running {
+        return;
+    }
+    let sync_tx = sync_tx.clone();
+    web::start_in_background(
+        app.web_page.clone(),
+        bind.to_string(),
+        port,
+        shutdown.clone(),
+        app.web_enabled.clone(),
+        sync_tx,
+    );
+    app.server_running = true;
+    publish_web_snapshot(app);
+}
+
+/// Enable the read-only LAN page for a running TUI session (idempotent).
+/// Returns a human-readable "url [· url]" line with the real LAN IP + port.
+fn ensure_tui_web_server(
+    app: &mut App,
+    shutdown: &Arc<AtomicBool>,
+    sync_tx: &std::sync::mpsc::SyncSender<sync::SyncEvent>,
+    bind: &str,
+    port: u16,
+) -> String {
+    ensure_server_running(app, shutdown, sync_tx, bind, port);
+    app.web_enabled.store(true, Ordering::Relaxed);
+    publish_web_snapshot(app);
+    let line = web::lan_urls(bind, port).join(" · ");
+    app.web_url = Some(line.clone());
+    line
+}
+
+/// Apply one inbound sync event to live state + config (single writer).
+/// Returns a one-line summary for the UI / logs.
+fn apply_sync_event(
+    hosts: &mut Vec<HostState>,
+    config: &mut Config,
+    shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>,
+    history_cache: &mut HashMap<(String, HistoryRange), (Option<SystemTime>, HistorySummary)>,
+    ev: sync::SyncEvent,
+) -> String {
+    let now = config::now_epoch();
+    let stats = sync::merge_state(&mut config.hosts, &mut config.sync_deleted, &ev.hosts, &ev.deleted, now);
+    // Mirror into runtime state: drop tombstoned hosts, upsert the rest.
+    hosts.retain(|h| {
+        !config.sync_deleted.iter().any(|d| d.name == h.name && d.at > h.updated_at)
+    });
+    for entry in &config.hosts {
+        match hosts.iter_mut().find(|h| h.name == entry.name) {
+            Some(h) => h.sync_config(entry),
+            None => hosts.push(HostState::new(entry)),
+        }
+    }
+    history_cache.clear();
+    if let Some(peer) = ev.new_peer {
+        match config.sync_peers.iter_mut().find(|p| p.addr == peer.addr) {
+            Some(cur) => *cur = peer,
+            None => config.sync_peers.push(peer),
+        }
+    }
+    if !ev.from_addr.is_empty() {
+        // Push-loop results only count when the push actually landed.
+        let delivered = match ev.push_result {
+            Some((_, ok)) => ok,
+            None => true,
+        };
+        if delivered {
+            if let Some(p) = config.sync_peers.iter_mut().find(|p| p.addr == ev.from_addr) {
+                p.last_sync = now;
+                if !ev.from_hostname.is_empty() {
+                    p.hostname = ev.from_hostname.clone();
+                }
+            }
+        }
+    }
+    let _ = config.save();
+    if let Ok(mut h) = shared_hosts.write() {
+        *h = schedules_from_config(&config.hosts);
+    }
+    let mut parts = Vec::new();
+    if stats.added > 0 { parts.push(format!("+{}", stats.added)); }
+    if stats.updated > 0 { parts.push(format!("~{}", stats.updated)); }
+    if stats.removed > 0 { parts.push(format!("-{}", stats.removed)); }
+    if parts.is_empty() {
+        "sync: already up to date".to_string()
+    } else {
+        format!("sync: {} ({})", parts.join(" "), ev.from_addr)
+    }
+}
+
+/// `ping-uin --serve`: headless probing loop + read-only LAN page + sync.
+/// No TUI, no stdin needed — suited for startup services and LAN viewing.
+fn run_serve(bind: &str, port: u16) -> io::Result<()> {
+    let mut config = Config::load();
+    if config.hosts.is_empty() {
+        eprintln!("no hosts configured (add some in the TUI first)");
+        std::process::exit(1);
+    }
+    let mut hosts: Vec<HostState> = config.hosts.iter().map(HostState::new).collect();
+    // Seed session counters/history from the log so uptime starts warm.
+    let _ = seed_from_log(&mut hosts, config.graph_width);
+
+    let shared_hosts = Arc::new(RwLock::new(schedules_from_config(&config.hosts)));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let workers = spawn_worker_pool(tx, shared_hosts.clone(), config.timeout_ms, shutdown.clone());
+
+    let (sync_tx, sync_rx) = std::sync::mpsc::sync_channel::<sync::SyncEvent>(32);
+    let page = web::new_shared_page();
+    let web_enabled = Arc::new(AtomicBool::new(true));
+    {
+        let mut cache = HashMap::new();
+        let snap = build_web_snapshot(&hosts, &mut cache);
+        let theme = build_themes()
+            .into_iter()
+            .find(|t| t.name == config.theme)
+            .map(|t| theme_snapshot(&t))
+            .unwrap_or_default();
+        if let Ok(mut shared) = page.write() {
+            shared.hosts = snap;
+            shared.theme = theme;
+        }
+    }
+    web::start_in_background(page.clone(), bind.to_string(), port, shutdown.clone(), web_enabled, sync_tx.clone());
+    // Always run: zero peers = sleep; pairings made while running are picked
+    // up from disk each round.
+    let sync_pusher = sync::spawn_push_loop(shutdown.clone(), port, sync::device_hostname(), sync_tx);
+
+    let urls = web::lan_urls(bind, port);
+    println!("ping-uin serving {} hosts on {}  (click headers to sort; ?group=<label> filters)", config.hosts.len(), urls.join(" · "));
+    if config.sync_token.is_some() {
+        println!("sync on ({} peers) — bidirectional, ~1/min", config.sync_peers.len());
+    }
+    println!("press Ctrl+C to stop");
+
+    let mut history_cache: HashMap<(String, HistoryRange), (Option<SystemTime>, HistorySummary)> = HashMap::new();
+    let mut last_publish = Instant::now() - Duration::from_secs(60);
+    let mut last_trim = Instant::now();
+    // Headless loop: same probe handling as the TUI minus rendering.
+    loop {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(Message::Result { host, up, latency_ms, timestamp, next_ping }) => {
+                let mut transition: Option<(String, String, bool, f64, String)> = None;
+                if let Some(h) = hosts.iter_mut().find(|h| h.name == host) {
+                    let changed = h.note_result(up, Instant::now());
+                    let _ = changed;
+                    h.total_checks += 1;
+                    if up {
+                        h.up = true;
+                        h.up_checks += 1;
+                        h.latency_ms = latency_ms;
+                        h.consecutive_failures = 0;
+                        h.down_email_sent = false;
+                        h.down_since = None;
+                        h.escalation = 0;
+                    } else {
+                        h.up = false;
+                        h.latency_ms = 0.0;
+                        h.consecutive_failures = h.consecutive_failures.saturating_add(1);
+                        if h.down_since.is_none() {
+                            h.down_since = Some(Instant::now());
+                        }
+                    }
+                    let lat_u64 = if up { latency_ms.round() as u64 } else { 0 };
+                    h.history.push_back(lat_u64);
+                    while h.history.len() > config.graph_width {
+                        h.history.pop_front();
+                    }
+                    h.next_ping = next_ping;
+                    let status = if up { "UP" } else { "DOWN" };
+                    let _ = log_result(&timestamp, &h.name, status, latency_ms);
+                    if h.just_changed() {
+                        transition = Some((h.name.clone(), h.target(), up, latency_ms, timestamp.clone()));
+                    }
+                }
+                if let Some((name, target, up, latency_ms, timestamp)) = transition {
+                    if !is_suppressed(&hosts, &name) && !hosts.iter().find(|h| h.name == name).map_or(false, |h| h.muted()) {
+                        let event = if up { "up" } else { "down" };
+                        if let Some(url) = config.webhook_url.clone() {
+                            post_webhook(url, target, up, latency_ms, timestamp, event);
+                        }
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        for ev in sync_rx.try_iter() {
+            let summary = apply_sync_event(&mut hosts, &mut config, &shared_hosts, &mut history_cache, ev);
+            save_serve_config(&config);
+            println!("{}", summary);
+        }
+        if last_publish.elapsed() > Duration::from_secs(2) {
+            last_publish = Instant::now();
+            let snap = build_web_snapshot(&hosts, &mut history_cache);
+            let theme = build_themes()
+                .into_iter()
+                .find(|t| t.name == config.theme)
+                .map(|t| theme_snapshot(&t))
+                .unwrap_or_default();
+            if let Ok(mut shared) = page.write() {
+                shared.hosts = snap;
+                shared.theme = theme;
+            }
+        }
+        if last_trim.elapsed() > Duration::from_secs(300) {
+            last_trim = Instant::now();
+            let _ = trim_log(&mut hosts, config.graph_width);
+            history_cache.clear();
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    shutdown.store(true, Ordering::Relaxed);
+    for w in workers {
+        let _ = w.join();
+    }
+    let _ = sync_pusher.join();
+    Ok(())
+}
+
+/// Persist config + shadow CSV for headless `--serve` (mirrors App::persist).
+fn save_serve_config(config: &Config) {
+    let _ = config.save();
+    if let Ok(file) = std::fs::File::create(&paths().csv) {
+        let mut wtr = csv::Writer::from_writer(file);
+        let _ = App::write_host_records(&mut wtr, &config.hosts);
+    }
+}
+
+fn parse_flag_value(args: &[String], names: &[&str]) -> Option<String> {
+    for (i, a) in args.iter().enumerate() {
+        for name in names {
+            if a == name {
+                return args.get(i + 1).cloned();
+            }
+            if let Some(rest) = a.strip_prefix(&format!("{}=", name)) {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_web_bind(args: &[String]) -> String {
+    parse_flag_value(args, &["--bind"]).unwrap_or_else(|| startup::DEFAULT_WEB_BIND.to_string())
+}
+
+fn parse_web_port(args: &[String]) -> u16 {
+    parse_flag_value(args, &["--port"])
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(startup::DEFAULT_WEB_PORT)
+}
+
 fn print_usage() {
     println!("ping-uin — btop-style TUI for monitoring hosts");
     println!();
     println!("Usage:");
-    println!("  ping-uin                 run the TUI");
+    println!("  ping-uin                 run the TUI (W = LAN page, B = browser, Y = device sync)");
     println!("  ping-uin --once [--format json|text]   check once, print, exit (0=all up, 2=any down)");
+    println!("  ping-uin --serve [--bind 0.0.0.0] [--port 8080]");
+    println!("                         headless probing + read-only LAN page (+ sync when paired)");
+    println!("  ping-uin --sync-code [--port 8080]");
+    println!("                         print this device's join code (creates one if needed)");
+    println!("  ping-uin --sync-join <code>");
+    println!("                         pair with another device (one-time pull; ongoing sync needs TUI/--serve running)");
+    println!("  ping-uin --sync-peers     list paired devices (hostname, joined, last sync)");
+    println!("  ping-uin --sync-forget <ip:port>   unpair a device (its hosts stay)");
+    println!("  ping-uin --install-startup [--bind 0.0.0.0] [--port 8080]");
+    println!("                         start --serve automatically on login/boot");
+    println!("  ping-uin --uninstall-startup   remove the startup entry");
+    println!("  ping-uin --startup-status      show whether startup is installed");
     println!("  ping-uin --help          show this help");
+}
+
+/// One-shot CLI helpers. These touch the config file directly, so quit the
+/// TUI on this device first if it is running (it is the live writer).
+fn run_sync_code(port: u16) -> io::Result<()> {
+    let mut config = Config::load();
+    if config.sync_token.as_deref().map_or(true, |t| t.is_empty()) {
+        config.sync_token = Some(sync::generate_token());
+        config.save().map_err(|e| io::Error::other(format!("cannot save config: {}", e)))?;
+    }
+    let token = config.sync_token.clone().unwrap_or_default();
+    let host = sync::primary_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+    println!("{}", sync::make_join_code(&host, port, &token));
+    println!("share this code with the other device: ping-uin --sync-join <code>  (or Y → join in its TUI)");
+    println!("note: this device must be running (TUI or --serve) for the other side to reach it");
+    Ok(())
+}
+
+fn run_sync_join(code: &str, port: u16) -> io::Result<()> {
+    let (peer_addr, peer_token) = sync::parse_join_code(code).map_err(|e| io::Error::other(e))?;
+    let mut config = Config::load();
+    if config.sync_token.as_deref().map_or(true, |t| t.is_empty()) {
+        config.sync_token = Some(sync::generate_token());
+    }
+    let from_token = config.sync_token.clone().unwrap_or_default();
+    let from_addr = self_sync_addr(port);
+    let hostname = sync::device_hostname();
+    println!("joining {} …", peer_addr);
+    match sync::join_with_code(&peer_addr, &peer_token, &from_addr, &from_token, &hostname) {
+        Ok((hosts, deleted, peer_hostname)) => {
+            let now = config::now_epoch();
+            let stats = sync::merge_state(&mut config.hosts, &mut config.sync_deleted, &hosts, &deleted, now);
+            let peer = config::SyncPeer {
+                addr: peer_addr.clone(),
+                token: peer_token,
+                hostname: peer_hostname,
+                joined_at: now,
+                last_sync: now,
+            };
+            match config.sync_peers.iter_mut().find(|p| p.addr == peer.addr) {
+                Some(cur) => *cur = peer,
+                None => config.sync_peers.push(peer),
+            }
+            config.save().map_err(|e| io::Error::other(format!("cannot save config: {}", e)))?;
+            println!("paired with {}: +{} ~{} -{} hosts (bidirectional from here on while both run)", peer_addr, stats.added, stats.updated, stats.removed);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("sync join failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_sync_peers() -> io::Result<()> {
+    let config = Config::load();
+    let now = config::now_epoch();
+    println!("this device: {} {}", sync::device_hostname(), if config.sync_token.is_some() { "(sync on)" } else { "(sync off — see --sync-code)" });
+    if config.sync_peers.is_empty() {
+        println!("no paired devices");
+        return Ok(());
+    }
+    for (i, p) in config.sync_peers.iter().enumerate() {
+        let host = if p.hostname.is_empty() { p.addr.clone() } else { format!("{} ({})", p.hostname, p.addr) };
+        println!("{}. {} · joined {} · last sync {}", i + 1, host, sync::format_epoch(p.joined_at), sync::ago(p.last_sync, now));
+    }
+    Ok(())
+}
+
+fn run_sync_forget(addr: &str) -> io::Result<()> {
+    let mut config = Config::load();
+    let before = config.sync_peers.len();
+    config.sync_peers.retain(|p| p.addr != addr && p.hostname != addr);
+    if config.sync_peers.len() == before {
+        eprintln!("no peer matching '{}'", addr);
+        std::process::exit(1);
+    }
+    config.save().map_err(|e| io::Error::other(format!("cannot save config: {}", e)))?;
+    println!("forgot {} — its hosts stay, future pushes stop", addr);
+    Ok(())
 }
 
 fn main() -> io::Result<()> {
@@ -4480,6 +5334,65 @@ fn main() -> io::Result<()> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_usage();
         return Ok(());
+    }
+    if args.iter().any(|a| a == "--startup-status") {
+        println!("{}", startup::status_line());
+        println!("plan: {}", startup::describe(parse_web_port(&args), &parse_web_bind(&args)));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--install-startup") {
+        let port = parse_web_port(&args);
+        let bind = parse_web_bind(&args);
+        println!("installing startup: {}", startup::describe(port, &bind));
+        match startup::install(port, &bind) {
+            Ok(msg) => {
+                println!("{}", msg);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("startup install failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.iter().any(|a| a == "--uninstall-startup") {
+        match startup::uninstall() {
+            Ok(msg) => {
+                println!("{}", msg);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("startup uninstall failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    if args.iter().any(|a| a == "--serve") {
+        let bind = parse_web_bind(&args);
+        let port = parse_web_port(&args);
+        return run_serve(&bind, port);
+    }
+    if args.iter().any(|a| a == "--sync-code") {
+        return run_sync_code(parse_web_port(&args));
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--sync-join") {
+        let code = args.get(pos + 1).cloned().unwrap_or_default();
+        if code.is_empty() || code.starts_with("--") {
+            eprintln!("usage: ping-uin --sync-join <code>");
+            std::process::exit(1);
+        }
+        return run_sync_join(&code, parse_web_port(&args));
+    }
+    if args.iter().any(|a| a == "--sync-peers") {
+        return run_sync_peers();
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--sync-forget") {
+        let addr = args.get(pos + 1).cloned().unwrap_or_default();
+        if addr.is_empty() {
+            eprintln!("usage: ping-uin --sync-forget <ip:port>");
+            std::process::exit(1);
+        }
+        return run_sync_forget(&addr);
     }
     if let Some(pos) = args.iter().position(|a| a == "--once") {
         let format = args
@@ -4550,6 +5463,11 @@ fn main() -> io::Result<()> {
         restart_after_exit: false,
         history_cache: HashMap::new(),
         last_trim: Instant::now(),
+        web_page: web::new_shared_page(),
+        web_url: None,
+        web_enabled: Arc::new(AtomicBool::new(false)),
+        server_running: false,
+        web_last_publish: Instant::now(),
     };
     // Session restore: re-select last session's host.
     if let Some(sel) = app.config.selected.clone() {
@@ -4558,7 +5476,19 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let result = run_app(&mut terminal, &mut app, tx, rx, shared_hosts, shutdown.clone());
+    // Sync + web listener infrastructure (all opt-in at runtime, but the
+    // channel and flags exist from the start).
+    let (sync_tx, sync_rx) = std::sync::mpsc::sync_channel::<sync::SyncEvent>(32);
+    // A previously paired device keeps syncing without any keypress: the
+    // listener serves sync routes (the HTML page stays off until `W`).
+    if app.config.sync_token.is_some() {
+        ensure_server_running(&mut app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT);
+    }
+    // Always run: with zero peers it just sleeps, and it picks up pairings
+    // made while running (disk is re-read every round).
+    let sync_pusher = sync::spawn_push_loop(shutdown.clone(), startup::DEFAULT_WEB_PORT, sync::device_hostname(), sync_tx.clone());
+
+    let result = run_app(&mut terminal, &mut app, tx, rx, shared_hosts, shutdown.clone(), sync_tx, sync_rx);
     // Persist session selection for next startup.
     app.config.selected = app.hosts.get(app.selected_idx).map(|h| h.name.clone());
     let _ = app.config.save();
@@ -4567,6 +5497,7 @@ fn main() -> io::Result<()> {
         let _ = w.join();
     }
     let _ = update_checker.join();
+    let _ = sync_pusher.join();
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), DisableMouseCapture)?;

@@ -149,6 +149,10 @@ pub struct HostConfig {
     /// Mute maintenance window as unix epoch secs. None/expired = unmuted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub muted_until: Option<i64>,
+    /// Last local edit (epoch secs). Neighbor sync keeps the newer side per
+    /// host; 0 = legacy/unknown (loses to any dated edit).
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 fn default_group() -> String {
@@ -181,7 +185,13 @@ impl HostConfig {
             check_cmd: None,
             depends_on: None,
             muted_until: None,
+            updated_at: now_epoch(),
         }
+    }
+
+    /// Stamp a local edit so neighbor sync prefers this side afterwards.
+    pub fn touch(&mut self) {
+        self.updated_at = now_epoch();
     }
 
     /// Seconds of mute remaining, 0 when unmuted/expired.
@@ -351,6 +361,48 @@ pub struct Config {
     /// Selected host name restored on startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<String>,
+    /// Neighbor-sync pairing secret. None = sync never enabled (nothing
+    /// listens for sync). Set when this device generates a join code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_token: Option<String>,
+    /// Paired neighbors: pushes go out every minute, pushes come in anytime.
+    #[serde(default)]
+    pub sync_peers: Vec<SyncPeer>,
+    /// Propagated deletions (tombstones). See `SyncDeletion`.
+    #[serde(default)]
+    pub sync_deleted: Vec<SyncDeletion>,
+}
+
+/// One paired neighbor instance: where to push + which token it expects.
+/// Shown in the sync menu with hostname, join date, and last sync time.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncPeer {
+    /// `ip:port` of the neighbor's sync listener (shares its web port).
+    #[serde(default)]
+    pub addr: String,
+    /// Token the neighbor issued (presented on every push to it).
+    #[serde(default)]
+    pub token: String,
+    /// Neighbor's hostname at pairing time (`hostname` command).
+    #[serde(default)]
+    pub hostname: String,
+    /// When pairing happened (unix epoch secs).
+    #[serde(default)]
+    pub joined_at: i64,
+    /// Last successful sync either way (unix epoch secs, 0 = never).
+    #[serde(default)]
+    pub last_sync: i64,
+}
+
+/// A propagated host removal: name + when it was deleted (unix epoch).
+/// Tombstones stop a deleted host from being resurrected by the next push
+/// from a device that hasn't seen the delete yet. Pruned after 30 days.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncDeletion {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub at: i64,
 }
 
 fn default_timeout() -> u64 {
@@ -381,6 +433,9 @@ impl Default for Config {
             collapsed_groups: Vec::new(),
             compact: false,
             selected: None,
+            sync_token: None,
+            sync_peers: Vec::new(),
+            sync_deleted: Vec::new(),
         }
     }
 }
@@ -528,6 +583,7 @@ impl Config {
                             .filter(|s| !s.trim().is_empty())
                             .map(|s| s.to_string());
                         h.muted_until = obj.get("muted_until").and_then(|v| v.as_i64());
+                        h.updated_at = obj.get("updated_at").and_then(|v| v.as_i64()).unwrap_or(0);
                         hosts.push(h);
                     }
                 }
@@ -567,6 +623,19 @@ impl Config {
                     .get("selected")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
+                sync_token: value
+                    .get("sync_token")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string()),
+                sync_peers: value
+                    .get("sync_peers")
+                    .and_then(|v| serde_json::from_value::<Vec<SyncPeer>>(v.clone()).ok())
+                    .unwrap_or_default(),
+                sync_deleted: value
+                    .get("sync_deleted")
+                    .and_then(|v| serde_json::from_value::<Vec<SyncDeletion>>(v.clone()).ok())
+                    .unwrap_or_default(),
             };
         }
         // Corrupt config: back it up instead of silently discarding user data.

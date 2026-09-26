@@ -35,6 +35,8 @@ A pink little penguin face ((•O•)) watches over your network.
 * **Notifications** — generic webhook POST plus optional terminal bell on transitions
 * **Headless `--once` mode** — one pass over all hosts as text or JSON, exit code doubles as the probe result
 * **HTML status export** — one keypress renders a shareable status page
+* **Read-only LAN web page** — `W` serves the live table as a website (grouped by label, themed like the TUI), `--serve` runs it headless, `--install-startup` starts it on boot
+* **Device sync** — `Y` pairs instances with join codes; adds, edits, and removals converge both ways
 * **Mouse support**, compact density (`v`), session restore, first-run wizard
 * **Multiple themes** — `btop`, `dracula`, `nord`, `gruvbox-dark`, `ayu-light`, `archwave`
 * **CSV bulk import** — dump your host list in a spreadsheet, import in one press
@@ -76,6 +78,9 @@ app re-selects last session's host on startup.
 | `v` | compact table density (hides IP + Group columns) |
 | `i` | **import from `hosts.csv`** — merge in bulk, new rows added, existing rows updated |
 | `E` | export timestamped CSV **plus** an HTML status page |
+| `W` | serve read-only LAN web page on/off — `http://<LAN-IP>:8080/`, grouped + themed |
+| `Y` | device sync menu — join code, paired hostnames, join/last-sync times |
+| `B` | open the served page in the default browser (starts serving first if off) |
 | `g` | toggle grouped/flat view |
 | `f` | filter by group (`Space` = show all, `Esc` = cancel) |
 | `s` | view picker — `off` / down-first / up-first / name / group / **down only** (`1-6` quick-pick, `Space` = show all; group sort hides the per-group up/down tallies) |
@@ -248,6 +253,93 @@ ping-uin --once --format json    # {"hosts": […], "down": 0} for scripts
 Checks run in parallel (ICMP and TCP alike), touch no files, and the exit
 code doubles as the probe result.
 
+### Web status page (read-only, LAN-visible, opt-in)
+
+Nothing is served unless you ask. Press **`W`** in the TUI to start serving
+the live table as a website, press **`W`** again to stop it — or run it
+headless (no terminal needed) with `--serve`. Press **`B`** to open the
+page in your default browser (starts serving first when off). The `M` menu
+always shows whether the page is currently being served.
+
+```bash
+ping-uin --serve --bind 0.0.0.0 --port 8080
+# HTML:  http://<this-host>:8080/          (auto-refreshes every 15s)
+# Health: http://<this-host>:8080/health   ("ok", for supervisors/monitors)
+```
+
+* **Read-only by design** — `GET /` serves HTML and nothing else; there is
+  no ping-now, mute, or config surface, so no auth is needed on a trusted
+  LAN. Unknown paths get `404`, non-GET gets `405`.
+* **Bind `0.0.0.0`** (the default) to make it visible anywhere on the local
+  network; use `--bind 127.0.0.1` for local-only. The startup banner and the
+  `W` popup print the real LAN IP + port (e.g. `http://192.168.1.42:8080/`),
+  so you know exactly what to type from other devices.
+* **Grouped by label** — like the TUI grouped view: collapsible per-group
+  cards (no JS, native `<details>`), groups and hosts down-first, per-group
+  up/down tallies, plus one-click group filter chips. `?group=<label>`
+  filters to one group.
+* **Modern card UI, zero JS** — status summary pills, per-status badges,
+  sticky table headers, row hover, system fonts with monospace numerals,
+  and a responsive layout that stacks on phones. Auto-refresh keeps it live;
+  sorting, filtering, and collapsing are all plain links.
+* **Sorting** — click any table header (Host, Status, Latency, Group, Uptime,
+  SLA 24h) for a flat sorted table; clicking the active header toggles
+  asc/desc. Same thing directly: `/?sort=status&order=desc` accepts
+  `name|status|group|latency|uptime|sla` + `asc|desc` (`status` puts problems
+  first, like down-first view).
+* **Themed like the desktop** — the page uses the serving instance's active
+  TUI theme (or its configured theme headless), so the website visibly
+  matches the machine serving it. Switch themes in the TUI and the page
+  follows within seconds.
+* **Zero new dependencies** — plain-stdlib HTTP baked into the same single
+  binary. In the TUI, `W` serves the exact live session; `--serve` runs its
+  own probing loop with the same intervals, logging, and webhooks.
+
+### Device sync (bidirectional, join codes, opt-in)
+
+Keep two devices in two places on the same host list — no discovery, no
+accounts, no cloud. One side shows a join code, the other types it in:
+
+```bash
+# on device A (or press Y → g in its TUI)
+ping-uin --sync-code --port 8080
+# PUIN-192.168.1.42-8080-abcd-efgh-jklm
+
+# on device B (or press Y → j in its TUI and paste it)
+ping-uin --sync-join PUIN-192.168.1.42-8080-abcd-efgh-jklm --port 8080
+```
+
+* **Bidirectional** — adds, edits, *and* removals propagate both ways about
+  once a minute while both instances run (TUI or `--serve`). Last-write-wins
+  per host; deletes travel as tombstones so they can't be resurrected by a
+  stale peer. Probing, history, and logs stay local — only the host list
+  converges.
+* **Y menu** — press **`Y`** in the TUI: shows this device's hostname and
+  join code, plus every paired device with its hostname, join date/time, and
+  last sync time (`[g]` new code, `[j]` join, `[1-9]` forget a peer).
+* **CLI twins** — `--sync-peers` lists pairs, `--sync-forget <ip:port>`
+  unpairs (hosts stay, pushes stop). CLI commands edit the config file, so
+  quit the TUI on that device first if it's running.
+
+### Start on boot (opt-in)
+
+Nothing is installed automatically. Only `--install-startup` creates a boot
+entry, and `--uninstall-startup` removes it again. To start the status page
+each time the machine restarts:
+
+```bash
+ping-uin --install-startup --bind 0.0.0.0 --port 8080
+ping-uin --startup-status      # show whether it is installed
+ping-uin --uninstall-startup   # remove it again
+```
+
+* **macOS**: LaunchAgent `~/Library/LaunchAgents/com.ping-uin.plist`
+  (starts at login, kept alive, logs to `~/Library/Logs/ping-uin.log`).
+* **Linux**: systemd user service (`systemctl --user enable --now ping-uin`),
+  falling back to XDG autostart (`~/.config/autostart/ping-uin.desktop`)
+  where systemd isn't available.
+* **Windows**: Scheduled Task `ping-uin` (on logon).
+
 ---
 
 ## Why "ping-uin"?
@@ -279,4 +371,5 @@ company tooling. Just keep the copyright header.
 
 > **Pro tip for sysadmins:** point the CSV at your asset inventory export
 > every morning and keep `ping-uin` running in a tmux pane. Ships as a
-> single binary — no server, no web UI, no metrics endpoint. Just pinging.
+> single binary — no metrics endpoint, no mutable web UI. Just pinging,
+> plus an optional read-only status page (`W` / `--serve`) for the LAN.
