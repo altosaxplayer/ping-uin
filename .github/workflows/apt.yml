@@ -1,0 +1,146 @@
+# Build the Debian package and publish the apt repository.
+#
+# Triggers on every published GitHub release (attaches the .deb to the
+# release) and on demand (to backfill). The apt repo itself lives on the
+# `gh-pages` branch (created on first run) and is served at
+# https://altosaxplayer.github.io/ping-uin/apt :
+#
+#   curl -fsSL https://altosaxplayer.github.io/ping-uin/apt/key.asc \
+#     | sudo gpg --dearmor -o /usr/share/keyrings/ping-uin-archive-keyring.gpg
+#   echo "deb [signed-by=/usr/share/keyrings/ping-uin-archive-keyring.gpg] \
+#     https://altosaxplayer.github.io/ping-uin/apt stable main" \
+#     | sudo tee /etc/apt/sources.list.d/ping-uin.list
+#   sudo apt update && sudo apt install ping-uin
+#
+# Signing key: repository secret APT_GPG_PRIVATE_KEY (see packaging/apt/).
+
+name: apt
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to package (default: latest release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apt-repo
+  cancel-in-progress: false
+
+jobs:
+  deb-and-repo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="$(gh release view --json tagName --jq .tagName --repo ${{ github.repository }})"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Packaging $TAG"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb
+        run: cargo deb
+
+      - name: Attach .deb to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.tag }}" target/debian/*.deb \
+            --clobber --repo ${{ github.repository }}
+
+      - name: Update apt repo on gh-pages
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          DEB="$(echo target/debian/*.deb)"
+          test -f "$DEB"
+
+          # Import the archive signing key (created per packaging/apt/).
+          echo "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          KEYID="$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/{print substr($5, length($5)-15)}' | head -n1)"
+          test -n "$KEYID"
+
+          # Check out (or bootstrap) the gh-pages branch into /tmp/site.
+          rm -rf /tmp/site
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git clone --depth 1 --branch gh-pages "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" /tmp/site
+          else
+            mkdir -p /tmp/site
+            git -C /tmp/site init -b gh-pages
+            git -C /tmp/site remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          fi
+          mkdir -p /tmp/site/apt/pool/main/p/ping-uin /tmp/site/apt/dists/stable/main/binary-amd64
+          cp "$DEB" /tmp/site/apt/pool/main/p/ping-uin/
+          cp packaging/apt/key.asc /tmp/site/apt/key.asc
+          touch /tmp/site/.nojekyll
+          if [ ! -f /tmp/site/index.html ]; then
+            cp packaging/apt/index.html /tmp/site/index.html
+          fi
+
+          # Regenerate repository metadata (multi-version pool: keep history).
+          cd /tmp/site/apt
+          dpkg-scanpackages --arch amd64 pool /dev/null > dists/stable/main/binary-amd64/Packages
+          gzip -k -f dists/stable/main/binary-amd64/Packages
+          cat > /tmp/apt-release.conf <<'EOF'
+          APT::FTPArchive::Release::Origin "altosaxplayer";
+          APT::FTPArchive::Release::Label "ping-uin";
+          APT::FTPArchive::Release::Suite "stable";
+          APT::FTPArchive::Release::Codename "stable";
+          APT::FTPArchive::Release::Architectures "amd64";
+          APT::FTPArchive::Release::Components "main";
+          APT::FTPArchive::Release::Description "ping-uin apt archive";
+          EOF
+          apt-ftparchive -c /tmp/apt-release.conf release dists/stable > dists/stable/Release
+          gpg --batch --yes --pinentry-mode loopback --local-user "$KEYID" \
+            --clearsign -o dists/stable/InRelease dists/stable/Release
+          gpg --batch --yes --pinentry-mode loopback --local-user "$KEYID" \
+            -abs -o dists/stable/Release.gpg dists/stable/Release
+
+          # Prove the repo is installable before publishing: full apt round
+          # trip against a file:// copy with the real key, then an actual
+          # unpack into a throwaway root (no maintainer scripts in the .deb,
+          # so --force-not-root is safe).
+          gpg --dearmor /tmp/site/apt/key.asc > /tmp/ping-uin-archive-keyring.gpg
+          mkdir -p /tmp/aptverify/lists/partial /tmp/aptverify/cache/archives/partial
+          cat > /tmp/aptverify/sources.list <<EOF2
+          deb [signed-by=/tmp/ping-uin-archive-keyring.gpg] file:///tmp/site/apt stable main
+          EOF2
+          APT_OPTS="-o Dir::Etc::sourcelist=/tmp/aptverify/sources.list -o Dir::Etc::sourceparts=/dev/null -o Dir::State::lists=/tmp/aptverify/lists -o Dir::Cache=/tmp/aptverify/cache -o Debug::NoLocking=1"
+          # shellcheck disable=SC2086
+          sudo apt-get $APT_OPTS update
+          # shellcheck disable=SC2086
+          sudo apt-get $APT_OPTS install --download-only -y ping-uin
+          mkdir -p /tmp/fakeroot/var/lib/dpkg
+          sudo dpkg --force-not-root --root=/tmp/fakeroot --admindir=/tmp/fakeroot/var/lib/dpkg --log=/tmp/dpkg.log -i "$DEB"
+          test -x /tmp/fakeroot/usr/bin/ping-uin
+          echo "apt repo verification passed"
+
+          cd /tmp/site
+          git add -A apt .nojekyll index.html
+          git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" \
+            commit -m "apt repo: publish ${{ steps.tag.outputs.tag }}" || echo "nothing to commit"
+          git push origin gh-pages

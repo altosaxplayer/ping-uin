@@ -19,3 +19,16 @@ tar = "0.4"
 flate2 = "1"
 sha2 = "0.10"
 getrandom = "0.2"
+
+[package.metadata.deb]
+maintainer = "altosaxplayer <https://github.com/altosaxplayer>"
+copyright = "2026, altosaxplayer <https://github.com/altosaxplayer>"
+license-file = ["LICENSE", "0"]
+section = "net"
+priority = "optional"
+extended-description = """
+A btop-style terminal UI for monitoring hosts.
+Pings (or TCP-checks) your devices on per-host intervals and shows the
+results in a rolling terminal interface, with an optional read-only LAN
+status page and bidirectional sync between paired devices.
+"""

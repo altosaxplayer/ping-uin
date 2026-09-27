@@ -50,10 +50,21 @@ or anything else you'd rather not drop into a heavy dashboard for.
 ## Quick start
 
 ```bash
-# clone, build, run
+# Debian/Ubuntu (amd64) — signed apt repo
+curl -fsSL https://altosaxplayer.github.io/ping-uin/apt/key.asc | sudo gpg --dearmor -o /usr/share/keyrings/ping-uin-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/ping-uin-archive-keyring.gpg] https://altosaxplayer.github.io/ping-uin/apt stable main" | sudo tee /etc/apt/sources.list.d/ping-uin.list
+sudo apt update && sudo apt install ping-uin
+```
+
+```bash
+# anywhere else: clone, build, run
 cargo install --path .   # builds the 'ping-uin' binary
 cargo run --release      # or just run it straight
 ```
+Single `.deb` files are also attached to every
+[GitHub release](https://github.com/altosaxplayer/ping-uin/releases) for
+`dpkg -i`. Note: ICMP checks shell out to the system `ping` binary — on
+minimal distros install it first (`sudo apt install iputils-ping`).
 
 A starter host set is built in on first launch, so it works even before you
 add any config: Google DNS (`8.8.8.8`), Cloudflare (`1.1.1.1`), your local

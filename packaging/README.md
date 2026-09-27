@@ -40,6 +40,20 @@ wingetcreate new \
 Or use the pre-generated manifest files in `packaging/winget/manifests/`
 and open a PR against `microsoft/winget-pkgs`.
 
+## apt — repo is live
+
+Debian/Ubuntu (`amd64`) packages ship two ways:
+
+- A versioned `.deb` attached to every GitHub release (built by
+  `.github/workflows/apt.yml` via `cargo-deb`; metadata in
+  `Cargo.toml` `[package.metadata.deb]`).
+- A signed apt repository at `https://altosaxplayer.github.io/ping-uin/apt`
+  (same workflow regenerates `pool/` + signed `Release`/`InRelease` on the
+  `gh-pages` branch per release). Details, key fingerprint, and rotation
+  notes: `packaging/apt/README.md`. Signing key lives in the
+  `APT_GPG_PRIVATE_KEY` repo secret; the public half is
+  `packaging/apt/key.asc`.
+
 Once accepted, users install with:
 
 ```powershell
