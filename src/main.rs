@@ -3260,6 +3260,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
         lines.push(Line::from("[Esc] close").style(Style::default().fg(theme.inactive_fg)));
         let popup = Paragraph::new(Text::from(lines))
             .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
             .block(Block::default()
                 .title(accent_title(title, &theme))
                 .title_alignment(Alignment::Center)
@@ -4538,7 +4539,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                         });
                                                     }
                                                     Err(e) => {
-                                                        let _ = tx2.send(Message::UpdateState(UpdateState::Error(format!("sync join failed — {}", sync::join_error_hint(&e)))));
+                                                        let _ = tx2.send(Message::UpdateState(UpdateState::Error(format!("sync join failed: {} — {}", e, sync::join_error_hint(&e)))));
                                                     }
                                                 }
                                             });

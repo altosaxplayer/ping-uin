@@ -281,7 +281,13 @@ fn post_json(url: &str, body: &str) -> Result<String, String> {
         .set("User-Agent", "ping-uin-sync")
         .timeout(Duration::from_secs(10))
         .send_string(body)
-        .map_err(|e| format!("request failed: {}", e))?
+        .map_err(|e| match &e {
+            // Keep the HTTP status in the message: a 404 from /sync/* means
+            // the other side predates sync support (pre-v0.2.0), and the
+            // hint mapper + humans both need to see it.
+            ureq::Error::Status(code, _) => format!("request failed: HTTP {}: {}", code, e),
+            _ => format!("request failed: {}", e),
+        })?
         .into_string()
         .map_err(|e| format!("bad response: {}", e))
 }
