@@ -780,6 +780,54 @@ mod tests {
     }
 
     #[test]
+    fn entry_ip_rename_sync_removes_old_identity_and_adds_new() {
+        let mut edited = vec![HostConfig::new("172.16.5.100", 60, "servers", None, None)];
+        edited[0].updated_at = 100;
+        let old_updated_at = edited[0].updated_at;
+        let idx = apply_entry_edit(
+            &mut edited,
+            "172.16.5.100",
+            "172.16.5.101",
+            60,
+            "servers".to_string(),
+            None,
+            None,
+        ).unwrap();
+
+        let mut deleted = Vec::new();
+        record_host_rename_tombstone(
+            &mut deleted,
+            "172.16.5.100",
+            &edited[idx].name,
+            old_updated_at,
+            edited[idx].updated_at,
+        );
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0].at > old_updated_at);
+
+        // A peer has the old IP. The next sync must remove it and add the
+        // renamed entry, rather than leaving both identities behind.
+        let mut peer = vec![HostConfig::new("172.16.5.100", 60, "servers", None, None)];
+        peer[0].updated_at = old_updated_at;
+        let mut peer_deleted = Vec::new();
+        let stats = sync::merge_state(
+            &mut peer,
+            &mut peer_deleted,
+            &edited,
+            &deleted,
+            config::now_epoch().saturating_add(10),
+        );
+        assert_eq!((stats.added, stats.removed), (1, 1));
+        assert_eq!(peer.len(), 1);
+        assert_eq!(peer[0].name, "172.16.5.101");
+
+        // A case-only spelling change is the same sync identity.
+        let mut no_delete = Vec::new();
+        record_host_rename_tombstone(&mut no_delete, "Google.com", "google.com", 10, 20);
+        assert!(no_delete.is_empty());
+    }
+
+    #[test]
     fn menu_status_rows_show_on_off() {
         let theme = build_themes().into_iter().next().unwrap();
         let on = status_row(true, "web page", "on — x".to_string(), &theme);
@@ -1418,6 +1466,28 @@ fn apply_entry_edit(
     Some(idx)
 }
 
+/// Preserve an IP/name rename as a deletion of the old sync identity. Sync
+/// treats a renamed host as a new identity, so without this tombstone peers
+/// would keep both the old and new entries indefinitely.
+fn record_host_rename_tombstone(
+    deleted: &mut Vec<config::SyncDeletion>,
+    old_name: &str,
+    new_name: &str,
+    old_updated_at: i64,
+    edited_at: i64,
+) {
+    if config::names_equal(old_name, new_name) {
+        return;
+    }
+    // Tombstones win only when strictly newer than the old copy. Ensure
+    // same-second edits still remove the previous identity.
+    let at = edited_at.max(old_updated_at.saturating_add(1));
+    match deleted.iter_mut().find(|d| config::names_equal(&d.name, old_name)) {
+        Some(existing) => existing.at = existing.at.max(at),
+        None => deleted.push(config::SyncDeletion { name: old_name.to_string(), at }),
+    }
+}
+
 impl App {
     fn theme(&self) -> &Theme { &self.themes[self.theme_idx] }
 
@@ -1592,12 +1662,24 @@ impl App {
     /// Apply one all-fields edit (from the EditEntry form) by original name.
     fn edit_entry(&mut self, original: String, form: AddHostForm, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
         let new_name = form.host.trim().to_string();
+        let original_identity = self.config.hosts.iter()
+            .find(|h| config::names_equal(&h.name, &original))
+            .map(|h| (h.name.clone(), h.updated_at));
         let interval_secs = parse_interval(&form.interval).unwrap_or(DEFAULT_INTERVAL_SECS)
             .clamp(config::MIN_INTERVAL_SECS, config::MAX_INTERVAL_SECS);
         let group = if form.group.trim().is_empty() { "default".to_string() } else { form.group.trim().to_string() };
         let alias = if form.alias.trim().is_empty() { None } else { Some(form.alias.trim().to_string()) };
         let port = form.port.trim().parse::<u16>().ok().filter(|p| *p > 0);
         if let Some(idx) = apply_entry_edit(&mut self.config.hosts, &original, &new_name, interval_secs, group, alias, port) {
+            if let Some((old_name, old_updated_at)) = original_identity {
+                record_host_rename_tombstone(
+                    &mut self.config.sync_deleted,
+                    &old_name,
+                    &self.config.hosts[idx].name,
+                    old_updated_at,
+                    self.config.hosts[idx].updated_at,
+                );
+            }
             // Mirror into runtime state (sync_config covers everything but
             // the name, which is the host's identity).
             if let Some(h) = self.hosts.get_mut(idx) {
