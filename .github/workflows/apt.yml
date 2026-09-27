@@ -93,7 +93,7 @@ jobs:
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
         run: |
           set -euo pipefail
-          DEB="$(echo target/debian/*.deb)"
+          DEB="$(echo "$PWD"/target/debian/*.deb)"
           test -f "$DEB"
 
           # Import the archive signing key (created per packaging/apt/).
