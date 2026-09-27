@@ -4,38 +4,38 @@ Hash: SHA512
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Sun, 27 Sep 2026 14:45:35 +0000
+Date: Sun, 27 Sep 2026 15:47:02 +0000
 Description: ping-uin apt archive
 Label: ping-uin
 Origin: altosaxplayer
 Suite: stable
 MD5Sum:
- 39f92aec3eb01ffd101271ea7884a6ff              179 Release
- 6539742f9fd2124d37ac2b32305f6455              731 main/binary-amd64/Packages
- 2e855e708cf0395ea37008d7a5fe90f6              524 main/binary-amd64/Packages.gz
+ 4b36826fbabc27cb48857338bd47c774              179 Release
+ 75deae0ee1f8a52cf856c33a6cc3d11a              731 main/binary-amd64/Packages
+ 8c323f97c3bebf3b785e8c288eae3c74              523 main/binary-amd64/Packages.gz
 SHA1:
- 4bdd3971a63a9a0fdbfbcdc82e8279683543cca6              179 Release
- 3a82614c30fc16d5d5176e27451978a357316d3b              731 main/binary-amd64/Packages
- 312d9595467ad83cc73c24a3318236142c9f0ab5              524 main/binary-amd64/Packages.gz
+ 727436866e0001fd51583b5fcc38a8ec282892e7              179 Release
+ 1c266d6e2c39136d1610ec392e998daa9139d9a8              731 main/binary-amd64/Packages
+ 728043599695c047f00d52f28bb3b250276f75fd              523 main/binary-amd64/Packages.gz
 SHA256:
- bd0b007ddbaedd534d0f6cdaaa858fc5a8a8c28c43846d5a0d51b85849b5714a              179 Release
- 5f6664527b4b38e00cf576e8b4a293ea25a0acad176b4876e687c2f2a9e8f5fd              731 main/binary-amd64/Packages
- 9cb4476f868d80fbb5dccd3b81fd1f6db03dce4f94a85ec52f2df047c0edced4              524 main/binary-amd64/Packages.gz
+ f782195f8fa73aba5e64900631b3eb5b8f93d913ebb6fad547811e705b737869              179 Release
+ 6f2473ec3ebe1ae8ebf984f0462345dd3403c8e300160b825ddf65e5a581be5f              731 main/binary-amd64/Packages
+ f23d0020e7e80c28abab5b58b8a34b3a3e649ca6b1072b4b190f1e5e313929f0              523 main/binary-amd64/Packages.gz
 SHA512:
- 559e0c700eb3d8d93070dde6b989ca9acbc6129ec40a07e3cf7d83716f5672d92bfd570bee8f7f58699b8e84691c8bca810c3635e11ccdb7a849fed46d68cfb6              179 Release
- af9ea1023df489faaf4b59d806a3d56b366103f2aa3869b52917b9277c393164e6c28a3951efc9a63d4a5fdbeef179259d0f20a3c843e9f8068bd137f27d9184              731 main/binary-amd64/Packages
- fb1579c9145f1716695ef106a34db2c3c29cd03605be01da5778d45879fe6c0ca31521d0300c77d35c51ab5f22d7b7d0f9edbeb082cbfee15f62eec28f5b2faf              524 main/binary-amd64/Packages.gz
+ b3241ec4d339ab1133a18e780858a5a39c945e42fa650ed87f0b9c177ac1ca642884ae5106a9e4a4fbbe1e327424dbc74ce7a33700b4c7eaa6e28c5deb34a462              179 Release
+ 79eafd71fd22d24de3fb738f53d519bbf6bc449ebddff3551cd95db658af92b47140a803f7ab94ccb469ea4e6bec19faa83dcf0409611a3354c6ce8693407537              731 main/binary-amd64/Packages
+ c3110c3945dd92dd14607399c81af749167607d580eeabba69e90b1a3be66e9251e833a274428b0e92c374d5cf6b2f07440494c2108624628b517e7b1301ffe2              523 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iQGzBAEBCgAdFiEEM0yhKlnmeqKc8JFoPIusYB4DscoFAmq5LA8ACgkQPIusYB4D
-scrASAwAmUDYDyae7i+a7Xy+MLiTF7xsGZ2KpWrY4Bvt57dMaioAV2j/Vu6mGKEp
-Tv7tFahJ8y9YeuULiidgH3u88HZ6++NDXz3+zVGNGCk2i3sZDc8NcdcakTLAdrKu
-ThPnOL8oyYJOdFmUjSyF25cq/74AsTMsXNKbf/l5ZHxmC6d2EStWgPcaAaKXDAOV
-/xPFsUuRBQDSdm7VuaK7XSG8d/cWup3RvrPYt1LivVdzOLlWLw3mOyOMTk4duJGX
-R9NY6rm7gG3Sx54zKFr3bOCvbgf5tBdCTDLH9hL6DLCa4XlIuuqsudQe7WMjRoDh
-VDOB/xD13jofoB+WVakBT/rMELVq9RfHqBvN7qA0gy9UZ/Bc96L5Pj/aRhHkBQlu
-YuEyxLeNugoc5itv4MMSt+65M5Txdgf5M5gKfaxaPSCl5fiosYOq3DnORy9TyJJ4
-MXm4cKjU32g5F5wigNXNdYyiRIGotNm1yh6Xni1sNe4WUFjbAnn6B0YRJuwm3RPj
-dOTFho7g
-=FYpk
+iQGzBAEBCgAdFiEEM0yhKlnmeqKc8JFoPIusYB4DscoFAmq5OnYACgkQPIusYB4D
+scpRJwv/dVdjciJMI+gI4ZakOQpPPgux2Sj9r7XWLNpIIxAsRXjISvhpS+cLlrDH
+Ry0sjw5QXVWtgt1OCDVJPutjTLCEUX2w5PghoBYDNSY/T/RGoIBaMW5H/t6iQXY8
+E5Y/3XTyN+AvBVxXFrNbbEKikQP9QdCazIDxt6KeEb3hWMTxNhF9Fo3F01sLG6ED
+wvEXXBfc5wJRzI5KyZ6XFGnEftydlY5IKM30WJLy69ooOG7n2DyciOo8qjrQAXiM
+fD7vKDVepr47Yeovn7kkEtOm4lbsH3F059x6uG9VN7QU5GP3BB33LkJ50xVuuQJn
+IAWzY+viC6Ml1xdcno1XbdGOObDwjE8PPuoFWpfU2d1GL7d+948+eOcs++QfGzJc
+q61BxSQnZZ1M4TKy2MNU0gSRKJh6vwupDdR1MJSb4iKQV0fRJy1r0jD6FeQc2TLG
+e2D33TQabD8u3yu3/k3MROrxujOjNYSNNuajw3NCija8MxyPEomAziM1rrP13n10
+ltEef/Hh
+=pykW
 -----END PGP SIGNATURE-----
