@@ -285,6 +285,13 @@ ping-uin --serve --bind 0.0.0.0 --port 8080
 # Health: http://<this-host>:8080/health   ("ok", for supervisors/monitors)
 ```
 
+The TUI takes the same flags (`ping-uin --port 8090`) — its `W` page, `B`
+browser shortcut, join codes, and sync listener all follow the configured
+address, so a busy default port (or a second copy on the box) is escapable
+without touching anything else. And if the chosen port is busy anyway, the
+app takes the next free one automatically and tells you which (join codes
+carry the actual port).
+
 * **Read-only by design** — `GET /` serves HTML and nothing else; there is
   no ping-now, mute, or config surface, so no auth is needed on a trusted
   LAN. Unknown paths get `404`, non-GET gets `405`.
@@ -348,8 +355,10 @@ ping-uin --sync-join PUIN-192.168.1.42-8080-abcd-efgh-jklm --port 8080
   joining: `Y → j`, paste `PUIN-…-…`, add ` @ 192.168.1.42`, Enter
   (CLI: `--sync-join "CODE @ 192.168.1.42"` or `--sync-join CODE 192.168.1.42`).
   Even without that: if the code's address is unreachable, joining
-  automatically scans your subnet for the peer, so a stale IP usually
-  just works (wrong tokens and outdated peers are never scanned).
+  automatically scans your subnet for the peer, across the code's port and
+  the whole fallback window above it (so a peer that moved ports after its
+  code was generated is still found) — a stale IP usually just works
+  (wrong tokens and outdated peers are never scanned).
 
 ### Start on boot (opt-in)
 

@@ -741,6 +741,14 @@ mod tests {
     }
 
     #[test]
+    fn sync_scan_covers_full_fallback_window() {
+        // The discovery sweep must span the code port plus every port the
+        // peer could have fallen back to — otherwise a moved peer is
+        // invisible. Both constants live apart (web vs sync) so pin them.
+        assert_eq!(sync::SCAN_PORTS, web::FALLBACK_TRIES + 1);
+    }
+
+    #[test]
     fn primary_web_url_takes_first_listing() {
         assert_eq!(
             primary_web_url("http://192.168.1.42:8080/ · http://127.0.0.1:8080/"),
@@ -1034,6 +1042,13 @@ struct App {
     /// True once the shared listener thread runs (page and/or sync).
     server_running: bool,
     web_last_publish: Instant,
+    /// Listener address for this session (`--bind`/`--port`, default
+    /// 0.0.0.0:8080). A busy default port is why this is configurable.
+    web_bind: String,
+    web_port: u16,
+    /// Port actually won (first free at/after `web_port`). Everything
+    /// user-facing — page URLs, join codes, push callbacks — uses this.
+    web_port_live: Arc<std::sync::atomic::AtomicU16>,
 }
 
 impl App {
@@ -3122,7 +3137,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 Some(token) => {
                     let code = sync::make_join_code(
                         &sync::primary_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
-                        startup::DEFAULT_WEB_PORT,
+                        app.web_port_live.load(Ordering::Relaxed),
                         token,
                     );
                     lines.push(Line::from(vec![
@@ -3160,8 +3175,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
             lines.push(Line::from(if app.server_running {
                 format!(
                     "  listening on {}:{} (page {}) — joins reach this device here",
-                    startup::DEFAULT_WEB_BIND,
-                    startup::DEFAULT_WEB_PORT,
+                    &app.web_bind,
+                    app.web_port_live.load(Ordering::Relaxed),
                     if app.web_url.is_some() { "shown" } else { "off" }
                 )
             } else {
@@ -3948,7 +3963,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                         "web page hidden — press W to serve again".to_string(),
                                     );
                                 } else {
-                                    match ensure_tui_web_server(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT) {
+                                    let (bind, port) = (app.web_bind.clone(), app.web_port);
+                                    match ensure_tui_web_server(app, &shutdown, &sync_tx, &bind, port) {
                                         Some(urls) => {
                                             app.update_state = UpdateState::Info(format!(
                                                 "serving read-only page on {} (W hides it, B opens it in your browser)",
@@ -3966,7 +3982,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                 // when off, then opens the primary (LAN) URL.
                                 let urls = match app.web_url.clone() {
                                     Some(line) => Some(line),
-                                    None => ensure_tui_web_server(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT),
+                                    None => {
+                                        let (bind, port) = (app.web_bind.clone(), app.web_port);
+                                        ensure_tui_web_server(app, &shutdown, &sync_tx, &bind, port)
+                                    }
                                 };
                                 let Some(urls) = urls else {
                                     continue; // bind failure already shown
@@ -4483,7 +4502,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                 let token = sync::generate_token();
                                 app.config.sync_token = Some(token);
                                 app.persist();
-                                ensure_server_running(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT);
+                                let (bind, port) = (app.web_bind.clone(), app.web_port);
+                                ensure_server_running(app, &shutdown, &sync_tx, &bind, port);
                             }
                             KeyCode::Char('j') | KeyCode::Char('J') => {
                                 app.input_mode = InputMode::SyncJoin { code: String::new() };
@@ -4526,9 +4546,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                                 app.persist();
                                             }
                                             let from_token = app.config.sync_token.clone().unwrap_or_default();
-                                            let from_addr = self_sync_addr(startup::DEFAULT_WEB_PORT);
+                                            let listen_port = app.web_port_live.load(Ordering::Relaxed);
+                                            let from_addr = self_sync_addr(listen_port);
                                             let hostname = sync::device_hostname();
-                                            ensure_server_running(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT);
+                                            let (bind, port) = (app.web_bind.clone(), app.web_port);
+                                            ensure_server_running(app, &shutdown, &sync_tx, &bind, port);
                                             let sync_tx2 = sync_tx.clone();
                                             let tx2 = tx.clone();
                                             app.input_mode = InputMode::Normal;
@@ -5083,8 +5105,9 @@ fn self_sync_addr(port: u16) -> String {
 
 /// Start the shared listener if needed (page and/or sync). The page itself
 /// stays gated behind `web_enabled` — starting the listener for sync never
-/// auto-serves the website. Bind failures are shown in the UI (nothing
-/// listens silently): returns false and leaves `server_running` unset.
+/// auto-serves the website. A busy requested port falls back upward
+/// automatically (`FALLBACK_TRIES`); only a fully busy range errors, naming
+/// the range instead of failing silently.
 fn ensure_server_running(
     app: &mut App,
     shutdown: &Arc<AtomicBool>,
@@ -5095,8 +5118,8 @@ fn ensure_server_running(
     if app.server_running {
         return true;
     }
-    match web::bind_listener(bind, port) {
-        Ok(listener) => {
+    match web::bind_first_free(bind, port) {
+        Ok((listener, actual)) => {
             web::start_in_background(
                 app.web_page.clone(),
                 listener,
@@ -5105,13 +5128,24 @@ fn ensure_server_running(
                 sync_tx.clone(),
             );
             app.server_running = true;
+            app.web_port_live
+                .store(actual, Ordering::Relaxed);
+            if actual != port {
+                app.update_state = UpdateState::Info(format!(
+                    "port {} was busy — serving on {} instead (join codes use the new port)",
+                    port, actual
+                ));
+            }
             publish_web_snapshot(app);
             true
         }
         Err(e) => {
             app.update_state = UpdateState::Error(format!(
-                "can't listen on {}:{} ({}). Web page + sync need a free port — is another copy running?",
-                bind, port, e
+                "can't listen on {}:{}–{} ({}). Web page + sync need a free port — is another copy running?",
+                bind,
+                port,
+                port.saturating_add(web::FALLBACK_TRIES),
+                e
             ));
             false
         }
@@ -5133,7 +5167,11 @@ fn ensure_tui_web_server(
     }
     app.web_enabled.store(true, Ordering::Relaxed);
     publish_web_snapshot(app);
-    let line = web::lan_urls(bind, port).join(" · ");
+    let live = app.web_port_live.load(Ordering::Relaxed);
+    let mut line = web::lan_urls(bind, live).join(" · ");
+    if live != port {
+        line.push_str(&format!(" (moved from busy {})", port));
+    }
     app.web_url = Some(line.clone());
     Some(line)
 }
@@ -5253,21 +5291,28 @@ fn run_serve(bind: &str, port: u16) -> io::Result<()> {
             shared.theme = theme;
         }
     }
-    let listener = match web::bind_listener(bind, port) {
-        Ok(l) => l,
+    let web_port_live = Arc::new(std::sync::atomic::AtomicU16::new(port));
+    let listener = match web::bind_first_free(bind, port) {
+        Ok((l, actual)) => {
+            web_port_live.store(actual, Ordering::Relaxed);
+            if actual != port {
+                println!("port {} was busy — serving on {} instead", port, actual);
+            }
+            l
+        }
         Err(e) => {
             // Fail fast: probing without a listener means joins and page
             // views fail with no hint about the real cause (port busy?).
-            eprintln!("cannot listen on {}:{} ({}). Is another copy running?", bind, port, e);
+            eprintln!("cannot listen on {}:{}–{} ({}). Is another copy running?", bind, port, port.saturating_add(web::FALLBACK_TRIES), e);
             std::process::exit(1);
         }
     };
     web::start_in_background(page.clone(), listener, shutdown.clone(), web_enabled, sync_tx.clone());
     // Always run: zero peers = sleep; pairings made while running are picked
     // up from disk each round.
-    let sync_pusher = sync::spawn_push_loop(shutdown.clone(), port, sync::device_hostname(), sync_tx);
+    let sync_pusher = sync::spawn_push_loop(shutdown.clone(), web_port_live.clone(), sync::device_hostname(), sync_tx);
 
-    let urls = web::lan_urls(bind, port);
+    let urls = web::lan_urls(bind, web_port_live.load(Ordering::Relaxed));
     println!("ping-uin serving {} hosts on {}  (click headers to sort; ?group=<label> filters)", config.hosts.len(), urls.join(" · "));
     if config.sync_token.is_some() {
         println!("sync on ({} peers) — bidirectional, ~1/min", config.sync_peers.len());
@@ -5447,6 +5492,8 @@ fn print_usage() {
     println!();
     println!("Usage:");
     println!("  ping-uin                 run the TUI (W = LAN page, B = browser, Y = device sync)");
+    println!("  ping-uin [--bind 0.0.0.0] [--port 8080]");
+    println!("                         TUI with its listener on another address (a busy port falls back automatically)");
     println!("  ping-uin --once [--format json|text]   check once, print, exit (0=all up, 2=any down)");
     println!("  ping-uin --serve [--bind 0.0.0.0] [--port 8080]");
     println!("                         headless probing + read-only LAN page (+ sync when paired)");
@@ -5685,6 +5732,10 @@ fn main() -> io::Result<()> {
     let themes = build_themes();
     let theme_idx = themes.iter().position(|t| t.name == config.theme).unwrap_or(0);
     let collapsed: HashSet<String> = config.collapsed_groups.iter().cloned().collect();
+    // Listener address also applies to TUI mode, so a busy default port
+    // (or a second copy on this box) is escapable: `ping-uin --port 8090`.
+    let web_bind = parse_web_bind(&args);
+    let web_port = parse_web_port(&args);
     let mut app = App {
         themes,
         theme_idx,
@@ -5718,6 +5769,9 @@ fn main() -> io::Result<()> {
         web_enabled: Arc::new(AtomicBool::new(false)),
         server_running: false,
         web_last_publish: Instant::now(),
+        web_bind,
+        web_port,
+        web_port_live: Arc::new(std::sync::atomic::AtomicU16::new(web_port)),
     };
     // Session restore: re-select last session's host.
     if let Some(sel) = app.config.selected.clone() {
@@ -5732,11 +5786,12 @@ fn main() -> io::Result<()> {
     // A previously paired device keeps syncing without any keypress: the
     // listener serves sync routes (the HTML page stays off until `W`).
     if app.config.sync_token.is_some() {
-        ensure_server_running(&mut app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT);
+        let (bind, port) = (app.web_bind.clone(), app.web_port);
+        ensure_server_running(&mut app, &shutdown, &sync_tx, &bind, port);
     }
     // Always run: with zero peers it just sleeps, and it picks up pairings
     // made while running (disk is re-read every round).
-    let sync_pusher = sync::spawn_push_loop(shutdown.clone(), startup::DEFAULT_WEB_PORT, sync::device_hostname(), sync_tx.clone());
+    let sync_pusher = sync::spawn_push_loop(shutdown.clone(), app.web_port_live.clone(), sync::device_hostname(), sync_tx.clone());
 
     let result = run_app(&mut terminal, &mut app, tx, rx, shared_hosts, shutdown.clone(), sync_tx, sync_rx);
     // Persist session selection for next startup.

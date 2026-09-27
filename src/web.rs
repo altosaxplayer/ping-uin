@@ -536,7 +536,7 @@ pub fn render_status_page(
 
 fn http_response(status: &str, content_type: &str, body: &str) -> Vec<u8> {
     format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {}\r\nServer: ping-uin\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
         status,
         content_type,
         body.len(),
@@ -700,8 +700,12 @@ fn handle_connection(
     page: &SharedPage,
     version: &str,
     web_enabled: &Arc<AtomicBool>,
+    peer: std::net::SocketAddr,
 ) {
     let Some((method, target, body)) = read_request(&mut stream) else {
+        // Accepted but unreadable (RST, timeout, garbage): say so instead of
+        // closing silently, or every such case looks like "empty reply".
+        eprintln!("web: dropping {}: unreadable request", peer);
         return;
     };
     let (path, query) = match target.split_once('?') {
@@ -747,7 +751,10 @@ fn handle_connection(
             let _ = stream.write_all(&http_response("200 OK", "text/html; charset=utf-8", &body));
         }
         "/health" | "/healthz" => {
-            let _ = stream.write_all(&http_response("200 OK", "text/plain; charset=utf-8", "ok\n"));
+            // Versioned body: `curl` tells you WHO answers (us vs a port
+            // squatter), which decides the whole "empty reply" class of bugs.
+            let body = format!("ok ping-uin {}\n", version);
+            let _ = stream.write_all(&http_response("200 OK", "text/plain; charset=utf-8", &body));
         }
         _ => {
             let _ = stream.write_all(&http_response(
@@ -766,6 +773,26 @@ pub fn bind_listener(bind: &str, port: u16) -> std::io::Result<TcpListener> {
     let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+/// How many ports past the requested one to try before giving up. Nobody
+/// should have to pass `--port` just because the default is busy: the app
+/// takes the first free port and reports the actual address everywhere
+/// (page URLs, join codes, push callbacks). An explicit `--port` is still
+/// honored as the first choice (matters for services with stable peers).
+pub const FALLBACK_TRIES: u16 = 32;
+
+/// Bind `port`, falling back upward to the first free one. Returns the
+/// listener plus the port actually won.
+pub fn bind_first_free(bind: &str, port: u16) -> std::io::Result<(TcpListener, u16)> {
+    let mut last_err = std::io::Error::new(std::io::ErrorKind::AddrInUse, "no ports tried");
+    for p in port..=port.saturating_add(FALLBACK_TRIES) {
+        match bind_listener(bind, p) {
+            Ok(l) => return Ok((l, p)),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 /// Cap on concurrent HTTP connections (page views + sync pushes). Past it,
@@ -791,7 +818,7 @@ pub fn run_server(
     SYNC_TX.with(|tx| *tx.borrow_mut() = Some(sync_tx.clone()));
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((mut stream, _)) => {
+            Ok((mut stream, peer)) => {
                 // Accepted sockets inherit the listener's non-blocking mode
                 // on Windows, which makes the handler's first read fail
                 // instantly and drops every connection. Force blocking:
@@ -801,12 +828,14 @@ pub fn run_server(
                     continue;
                 }
                 // Stalled connections must not hold a thread forever (slow
-                // scanners, dead peers, half-open health checks).
+                // scanners, dead peers, half-open health checks). If the
+                // timeout itself can't be set, serve anyway: dropping the
+                // connection here would look like "empty reply from server".
                 if stream
                     .set_read_timeout(Some(Duration::from_secs(10)))
                     .is_err()
                 {
-                    continue;
+                    eprintln!("web: {}: cannot set read timeout, serving without", peer);
                 }
                 let n = in_flight.fetch_add(1, Ordering::Relaxed);
                 if n >= MAX_CONNECTIONS {
@@ -825,7 +854,7 @@ pub fn run_server(
                 let in_flight = in_flight.clone();
                 thread::spawn(move || {
                     SYNC_TX.with(|tx| *tx.borrow_mut() = Some(sync_tx));
-                    handle_connection(stream, &page, &version, &web_enabled);
+                    handle_connection(stream, &page, &version, &web_enabled, peer);
                     in_flight.fetch_sub(1, Ordering::Relaxed);
                 });
             }
@@ -1022,12 +1051,28 @@ mod tests {
     fn bind_conflict_fails_loudly() {
         // Hold a port, then prove a second bind fails (surfaced to the
         // caller, never swallowed): this is the "joins fail, nothing
-        // listening" case when the port is already taken.
+        // listening" case when the port is already taken. No rebind
+        // assertion: under parallel tests another test may grab a freed
+        // ephemeral port first (that race is what bind_first_free is for).
         let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = holder.local_addr().unwrap().port();
         assert!(bind_listener("127.0.0.1", port).is_err());
         drop(holder);
-        assert!(bind_listener("127.0.0.1", port).is_ok());
+    }
+
+    #[test]
+    fn bind_first_free_moves_past_busy_ports() {
+        // Occupy a port, request exactly it, and prove the fallback wins a
+        // nearby free one and reports it (callers display/join-code the
+        // actual port). The probe holds `busy` for the duration.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = probe.local_addr().unwrap().port();
+        let (listener, actual) = bind_first_free("127.0.0.1", busy).unwrap();
+        let won = listener.local_addr().unwrap().port();
+        assert_eq!(won, actual);
+        assert_ne!(won, busy, "must not take the held port");
+        drop(probe);
+        drop(listener);
     }
 
     #[test]

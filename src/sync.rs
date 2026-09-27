@@ -423,6 +423,17 @@ fn join_with_code_timeout(
     Ok((hosts, deleted, hostname))
 }
 
+/// How many ports to sweep per host during fallback discovery: the code's
+/// own port plus the whole automatic-fallback window above it (see
+/// `web::FALLBACK_TRIES`, asserted equal in main.rs tests). A peer that
+/// moved ports after its code was generated still gets found.
+pub const SCAN_PORTS: u16 = 33;
+
+/// Overall budget for the port rounds past the first: the first round (the
+/// code's port) always runs fully; further rounds stop when this elapses so
+/// a huge/filtered LAN can't stall a join indefinitely.
+const SCAN_EXTRA_BUDGET: Duration = Duration::from_secs(20);
+
 /// True when the join failed before any application answer came back
 /// (unreachable host) as opposed to being answered and rejected (wrong
 /// token, outdated peer). Only the former is worth a LAN scan — a rejection
@@ -535,22 +546,41 @@ pub fn join_device(
             let subnet = subnet24_of(&primary_lan_ip().unwrap_or_default()).ok_or_else(|| {
                 format!("{} (and no local subnet to scan)", first_err)
             })?;
-            let port = peer_addr.rsplit(':').next().unwrap_or("8080").to_string();
-            notify(format!("code address unreachable, scanning {}.0/24 …", subnet));
-            match scan_subnet(&subnet, &port, own_last_octet(), token, from_addr, from_token, from_hostname) {
+            // The code address is always host:port (parse_join_code
+            // guarantees it); 8080 fallback is unreachable-but-harmless.
+            let start_port: u16 = peer_addr
+                .rsplit(':')
+                .next()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8080);
+            notify(format!(
+                "code address unreachable, scanning {}.0/24 ports {}–{} …",
+                subnet,
+                start_port,
+                start_port.saturating_add(SCAN_PORTS - 1)
+            ));
+            match scan_subnet(&subnet, start_port, own_last_octet(), token, from_addr, from_token, from_hostname) {
                 Some((hosts, deleted, hostname, via)) => Ok((hosts, deleted, hostname, via)),
-                None => Err(format!("{} (also scanned {}.0/24: no ping-uin answering)", first_err, subnet)),
+                None => Err(format!(
+                    "{} (also scanned {}.0/24 ports {}–{}: no ping-uin answering)",
+                    first_err,
+                    subnet,
+                    start_port,
+                    start_port.saturating_add(SCAN_PORTS - 1)
+                )),
             }
         }
     }
 }
 
-/// Probe every host in `subnet` (a "192.168.1" prefix) on `port` in parallel
-/// and join the first ping-uin listener that accepts `token`. Skips our own
-/// last octet. Bounded by the per-connection timeouts above.
+/// Probe every host in `subnet` (a "192.168.1" prefix), starting at
+/// `start_port` and sweeping upward through [`SCAN_PORTS`] ports so peers
+/// that moved after their code was generated are still found. Skips our own
+/// last octet. Bounded per-connection timeouts plus an overall budget for
+/// rounds past the first (which always runs fully).
 fn scan_subnet(
     subnet: &str,
-    port: &str,
+    start_port: u16,
     skip_octet: Option<u8>,
     token: &str,
     from_addr: &str,
@@ -560,67 +590,76 @@ fn scan_subnet(
     use std::sync::atomic::{AtomicBool, Ordering as O};
     let found = AtomicBool::new(false);
     let result = std::sync::Mutex::new(None);
-    // Batched scopes (32 at a time) instead of one 253-thread scope:
-    // bounds concurrent threads *and* sequential spawn cost, and lets an
-    // early hit skip the remaining batches.
+    let deadline = std::time::Instant::now() + SCAN_EXTRA_BUDGET;
     let mut addrs: Vec<String> = (1u8..=254u8)
         .filter(|last| Some(*last) != skip_octet)
-        .map(|last| format!("{}.{}:{}", subnet, last, port))
+        .map(|last| format!("{}.{}", subnet, last))
         .collect();
     // Probe our closest neighbors first — DHCP hands out nearby addresses,
     // so the peer is usually within a few doors either way.
     if let Some(own) = skip_octet {
         addrs.sort_by_key(|a| {
-            let ip = a.rsplit_once(':').map(|(h, _)| h).unwrap_or(a.as_str());
-            let last: u8 = ip.rsplit('.').next().and_then(|o| o.parse().ok()).unwrap_or(0);
+            let last: u8 = a.rsplit('.').next().and_then(|o| o.parse().ok()).unwrap_or(0);
             last.abs_diff(own)
         });
     }
-    for chunk in addrs.chunks(32) {
+    for offset in 0..SCAN_PORTS {
         if found.load(O::Relaxed) {
             break;
         }
-        std::thread::scope(|s| {
-            for addr in chunk {
-                if found.load(O::Relaxed) {
-                    break;
-                }
-                let addr = addr.clone();
-                let token = token.to_string();
-                let from_addr = from_addr.to_string();
-                let from_token = from_token.to_string();
-                let from_hostname = from_hostname.to_string();
-                let found_ref = &found;
-                let result_ref = &result;
-                s.spawn(move || {
-                    if found_ref.load(O::Relaxed) {
-                        return;
+        if offset > 0 && std::time::Instant::now() > deadline {
+            break;
+        }
+        let port = start_port.saturating_add(offset);
+        for chunk in addrs.chunks(32) {
+            if found.load(O::Relaxed) {
+                break;
+            }
+            std::thread::scope(|s| {
+                for host in chunk {
+                    if found.load(O::Relaxed) {
+                        break;
                     }
-                    if let Some(out) = try_candidate(&addr, &token, &from_addr, &from_token, &from_hostname) {
-                        if let Ok(mut slot) = result_ref.lock() {
-                            if slot.is_none() {
-                                *slot = Some(out);
-                                found_ref.store(true, O::Relaxed);
+                    let addr = format!("{}:{}", host, port);
+                    let token = token.to_string();
+                    let from_addr = from_addr.to_string();
+                    let from_token = from_token.to_string();
+                    let from_hostname = from_hostname.to_string();
+                    let found_ref = &found;
+                    let result_ref = &result;
+                    s.spawn(move || {
+                        if found_ref.load(O::Relaxed) {
+                            return;
+                        }
+                        if let Some(out) = try_candidate(&addr, &token, &from_addr, &from_token, &from_hostname) {
+                            if let Ok(mut slot) = result_ref.lock() {
+                                if slot.is_none() {
+                                    *slot = Some(out);
+                                    found_ref.store(true, O::Relaxed);
+                                }
                             }
                         }
-                    }
-                });
-            }
-        });
+                    });
+                }
+            });
+        }
     }
     result.into_inner().ok().flatten()
 }
 
 /// Background push loop: every 60s, load the on-disk config and push to all
 /// peers (each in its own thread). Results come back as `SyncEvent`s so the
-/// main loop stays the single config writer. `port`/`hostname` identify us.
+/// main loop stays the single config writer. `port` is shared so a moved
+/// listener (port fallback) is reflected in our callback address; `hostname`
+/// identifies us.
 pub fn spawn_push_loop(
     shutdown: Arc<AtomicBool>,
-    port: u16,
+    port: Arc<std::sync::atomic::AtomicU16>,
     hostname: String,
     tx: SyncSender<SyncEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        use std::sync::atomic::Ordering as O;
         // Small delay so startup isn't competing with the first probes.
         for _ in 0..6 {
             if shutdown.load(Ordering::Relaxed) {
@@ -632,7 +671,7 @@ pub fn spawn_push_loop(
             let from_addr = format!(
                 "{}:{}",
                 primary_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
-                port
+                port.load(O::Relaxed)
             );
             let cfg = Config::load();
             for peer in cfg.sync_peers.clone() {
@@ -703,9 +742,22 @@ mod tests {
 
     /// Minimal stub peer: answers /health and /sync/join like the real server.
     /// Takes an already-bound listener so no other test can steal the port.
+    /// Reads each request FULLY (headers + body) before responding: replying
+    /// early would RST a client still sending its body, flaking the test.
+    /// Binds with retries: parallel tests can briefly exhaust ephemeral ports.
+    fn stub_listener() -> std::net::TcpListener {
+        for _ in 0..20 {
+            if let Ok(l) = std::net::TcpListener::bind("127.0.0.1:0") {
+                return l;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("no ephemeral port available for stub peer");
+    }
+
     fn stub_peer(listener: std::net::TcpListener) {
         use std::io::{Read, Write};
-        for mut stream in listener.incoming().take(64) {
+        for stream in listener.incoming().take(256) {
             let mut stream = match stream {
                 Ok(s) => s,
                 Err(_) => break,
@@ -713,15 +765,41 @@ mod tests {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
             let mut buf = vec![0u8; 0];
             let mut tmp = [0u8; 1024];
-            loop {
+            // Headers.
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
                 match stream.read(&mut tmp) {
                     Ok(0) => break,
-                    Ok(n) => {
-                        buf.extend_from_slice(&tmp[..n]);
-                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
-                        }
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    Err(_) => break,
+                }
+                if buf.len() > 65536 {
+                    break;
+                }
+            }
+            // Body (so the client never takes an RST mid-send).
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            let (head, body_len) = match text.split_once("\r\n\r\n") {
+                Some((h, b)) => (h.to_string(), b.len()),
+                None => (String::new(), 0),
+            };
+            let want: usize = head
+                .lines()
+                .skip(1)
+                .filter_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        v.trim().parse().ok()
+                    } else {
+                        None
                     }
+                })
+                .next()
+                .unwrap_or(0);
+            let head_end = buf.len() - body_len;
+            while buf.len() < head_end + want.min(65536) {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
                     Err(_) => break,
                 }
             }
@@ -749,7 +827,7 @@ mod tests {
         // Proves the fallback path reaches a peer the code didn't name.
         // The stub listener is bound before spawning, so no parallel test
         // can steal the port; readiness is retried, not slept on.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = stub_listener();
         let port = listener.local_addr().unwrap().port();
         let stub = std::thread::spawn(move || stub_peer(listener));
         let stub_addr = format!("127.0.0.1:{}", port);
@@ -779,14 +857,14 @@ mod tests {
     fn scan_subnet_finds_a_live_peer() {
         // End-to-end scan over loopback: 253 instant-refused probes plus one
         // live stub must resolve to the stub. Should take ~2s, not tens.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = stub_listener();
         let port = listener.local_addr().unwrap().port();
         let stub = std::thread::spawn(move || stub_peer(listener));
         let token = generate_token();
         let start = std::time::Instant::now();
         let found = scan_subnet(
             "127.0.0",
-            &port.to_string(),
+            port,
             None,
             &token,
             "127.0.0.1:9999",
@@ -802,6 +880,24 @@ mod tests {
             "scan took too long: {:?}",
             elapsed
         );
+        drop(stub);
+    }
+
+    #[test]
+    fn scan_finds_peer_that_moved_ports() {
+        // The stub listens one port above where the scan starts: round 0
+        // misses everywhere, round 1 hits. Mirrors a peer that fell back
+        // after its join code was generated.
+        let listener = stub_listener();
+        let port = listener.local_addr().unwrap().port();
+        let stub = std::thread::spawn(move || stub_peer(listener));
+        let token = generate_token();
+        // start_port saturated: scan must not wrap past 65535.
+        let start = port.saturating_sub(1).max(1024);
+        let found = scan_subnet("127.0.0", start, None, &token, "127.0.0.1:9999", &token, "tester");
+        let (_, _, hostname, via) = found.expect("scan should find the moved peer");
+        assert_eq!(hostname, "stub");
+        assert!(via.ends_with(&port.to_string()));
         drop(stub);
     }
 
