@@ -134,6 +134,9 @@ jobs:
           # unpack into a throwaway root (no maintainer scripts in the .deb,
           # so --force-not-root is safe).
           gpg --dearmor /tmp/site/apt/key.asc > /tmp/ping-uin-archive-keyring.gpg
+          ls -la /tmp/ping-uin-archive-keyring.gpg
+          gpg --with-colons --show-keys /tmp/ping-uin-archive-keyring.gpg | grep -E "^(pub|sub|fpr)" || true
+          gpgv --keyring /tmp/ping-uin-archive-keyring.gpg dists/stable/InRelease || echo "GPGV-FAILED"
           mkdir -p /tmp/aptverify/lists/partial /tmp/aptverify/cache/archives/partial
           cat > /tmp/aptverify/sources.list <<EOF2
           deb [signed-by=/tmp/ping-uin-archive-keyring.gpg] file:///tmp/site/apt stable main
