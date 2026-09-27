@@ -4992,7 +4992,8 @@ fn run_app<B: ratatui::backend::Backend>(
                                     let exe = env::current_exe().map(|p| p.to_string_lossy().to_string())
                                         .unwrap_or_else(|_| "ping-uin".to_string());
                                     // TUI suspends while sudo prompts.
-                                    if run_setcap_interactive(terminal, &exe) {
+                                    if run_setcap_interactive(&exe) {
+                                        let _ = terminal.clear();
                                         let (bind, port) = (app.web_bind.clone(), app.web_port);
                                         if page {
                                             if let Some(urls) = ensure_tui_web_server(app, &shutdown, &sync_tx, &bind, port) {
@@ -5735,18 +5736,24 @@ fn should_offer_grant(port: u16, e: &std::io::Error) -> bool {
 
 /// Run `sudo setcap …` with the TUI suspended so sudo can prompt on the
 /// real terminal, then restore the TUI. Returns whether the grant landed.
+/// Uses `stdout` directly (same pattern as TUI init/teardown) so no generic
+/// `Write` bound leaks into `run_app`.
 #[cfg(target_os = "linux")]
-fn run_setcap_interactive<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, exe: &str) -> bool {
+fn run_setcap_interactive(exe: &str) -> bool {
+    let mut stdout = io::stdout();
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen, Show);
+    let _ = stdout.execute(DisableMouseCapture);
+    let _ = stdout.execute(LeaveAlternateScreen);
+    let _ = stdout.execute(Show);
     let ok = std::process::Command::new("sudo")
         .args(["setcap", "cap_net_bind_service=+ep", exe])
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     let _ = enable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture, Hide);
-    let _ = terminal.clear();
+    let _ = stdout.execute(EnterAlternateScreen);
+    let _ = stdout.execute(EnableMouseCapture);
+    let _ = stdout.execute(Hide);
     ok
 }
 

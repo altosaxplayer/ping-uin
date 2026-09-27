@@ -373,9 +373,9 @@ fn parse_linger_value(s: &str) -> Option<bool> {
 #[cfg(target_os = "linux")]
 fn current_user() -> Option<String> {
     std::env::var("USER")
+        .ok()
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty())
-        .ok()
         .or_else(|| {
             dirs::home_dir()?
                 .file_name()
