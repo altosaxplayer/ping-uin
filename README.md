@@ -347,6 +347,9 @@ ping-uin --sync-join PUIN-192.168.1.42-8080-abcd-efgh-jklm --port 8080
   code's IP is wrong, keep the code and append the right address when
   joining: `Y → j`, paste `PUIN-…-…`, add ` @ 192.168.1.42`, Enter
   (CLI: `--sync-join "CODE @ 192.168.1.42"` or `--sync-join CODE 192.168.1.42`).
+  Even without that: if the code's address is unreachable, joining
+  automatically scans your subnet for the peer, so a stale IP usually
+  just works (wrong tokens and outdated peers are never scanned).
 
 ### Start on boot (opt-in)
 

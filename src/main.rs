@@ -3133,7 +3133,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                         Span::styled("  join code:   ", Style::default().fg(theme.inactive_fg)),
                         Span::styled(code, Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
                     ]));
-                    lines.push(Line::from("  wrong IP in the code (VPN/Docker)? join with: code @ 192.168.1.42").style(Style::default().fg(theme.inactive_fg)));
+                    lines.push(Line::from("  wrong IP in the code (VPN/Docker)? join anyway — your subnet is auto-scanned, or join with: code @ 192.168.1.42").style(Style::default().fg(theme.inactive_fg)));
                 }
                 None => {
                     lines.push(Line::from("  no join code yet — press [g] to create one.").style(Style::default().fg(theme.hi_fg)));
@@ -4521,10 +4521,15 @@ fn run_app<B: ratatui::backend::Backend>(
                                             app.input_mode = InputMode::Normal;
                                             app.update_state = UpdateState::Info(format!("joining {} …", peer_addr));
                                             thread::spawn(move || {
-                                                match sync::join_with_code(&peer_addr, &peer_token, &from_addr, &from_token, &hostname) {
-                                                    Ok((hosts, deleted, peer_hostname)) => {
+                                                let notify = |msg: String| {
+                                                    let _ = tx2.send(Message::UpdateState(UpdateState::Info(msg)));
+                                                };
+                                                // join_device tries the code address first, then
+                                                // scans our subnet when it is unreachable.
+                                                match sync::join_device(&peer_addr, &peer_token, &from_addr, &from_token, &hostname, &notify) {
+                                                    Ok((hosts, deleted, peer_hostname, via)) => {
                                                         let peer = config::SyncPeer {
-                                                            addr: peer_addr.clone(),
+                                                            addr: via.clone(),
                                                             token: peer_token,
                                                             hostname: peer_hostname.clone(),
                                                             joined_at: config::now_epoch(),
@@ -4533,7 +4538,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                         let _ = sync_tx2.try_send(sync::SyncEvent {
                                                             hosts,
                                                             deleted,
-                                                            from_addr: peer_addr,
+                                                            from_addr: via,
                                                             from_hostname: peer_hostname,
                                                             new_peer: Some(peer),
                                                             push_result: None,
@@ -5418,12 +5423,13 @@ fn run_sync_join(code: &str, port: u16) -> io::Result<()> {
     let from_addr = self_sync_addr(port);
     let hostname = sync::device_hostname();
     println!("joining {} …", peer_addr);
-    match sync::join_with_code(&peer_addr, &peer_token, &from_addr, &from_token, &hostname) {
-        Ok((hosts, deleted, peer_hostname)) => {
+    let notify = |msg: String| println!("{}", msg);
+    match sync::join_device(&peer_addr, &peer_token, &from_addr, &from_token, &hostname, &notify) {
+        Ok((hosts, deleted, peer_hostname, via)) => {
             let now = config::now_epoch();
             let stats = sync::merge_state(&mut config.hosts, &mut config.sync_deleted, &hosts, &deleted, now);
             let peer = config::SyncPeer {
-                addr: peer_addr.clone(),
+                addr: via.clone(),
                 token: peer_token,
                 hostname: peer_hostname,
                 joined_at: now,
@@ -5434,7 +5440,7 @@ fn run_sync_join(code: &str, port: u16) -> io::Result<()> {
                 None => config.sync_peers.push(peer),
             }
             config.save().map_err(|e| io::Error::other(format!("cannot save config: {}", e)))?;
-            println!("paired with {}: +{} ~{} -{} hosts (bidirectional from here on while both run)", peer_addr, stats.added, stats.updated, stats.removed);
+            println!("paired with {}: +{} ~{} -{} hosts (bidirectional from here on while both run)", via, stats.added, stats.updated, stats.removed);
             Ok(())
         }
         Err(e) => {

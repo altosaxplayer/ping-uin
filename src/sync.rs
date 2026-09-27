@@ -308,11 +308,38 @@ impl SyncEvent {
     }
 }
 
+/// Fast reachability gate: ureq's timeout does not bound the TCP connect
+/// phase against blackholes (30s stall observed), so probe with our own
+/// short-timeout connect first. Error strings stay in the vocabulary that
+/// [`is_unreachable`] classifies (refused / timed out / resolve).
+fn check_reachable(addr: &str) -> Result<(), String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let sock = addr
+        .to_socket_addrs()
+        .map_err(|_| format!("can't resolve {}", addr))?
+        .next()
+        .ok_or_else(|| format!("can't resolve {}", addr))?;
+    match TcpStream::connect_timeout(&sock, Duration::from_secs(2)) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            Err("connection refused".to_string())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            Err("connection timed out".to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn post_json(url: &str, body: &str) -> Result<String, String> {
+    post_json_timeout(url, body, Duration::from_secs(10))
+}
+
+fn post_json_timeout(url: &str, body: &str, timeout: Duration) -> Result<String, String> {
     ureq::post(url)
         .set("Content-Type", "application/json")
         .set("User-Agent", "ping-uin-sync")
-        .timeout(Duration::from_secs(10))
+        .timeout(timeout)
         .send_string(body)
         .map_err(|e| match &e {
             // Keep the HTTP status in the message: a 404 from /sync/* means
@@ -333,6 +360,8 @@ pub fn push_to_peer(
     from_addr: &str,
     from_hostname: &str,
 ) -> Result<(), String> {
+    // Fail fast: a blackholed peer must not stall a background push thread.
+    check_reachable(&peer.addr).map_err(|e| format!("{}: {}", peer.addr, e))?;
     let body = serde_json::json!({
         "token": peer.token,
         "from_addr": from_addr,
@@ -351,14 +380,16 @@ pub fn push_to_peer(
     }
 }
 
-/// Join via a code: presents our callback so pairing is two-way. Returns the
-/// other side's (hosts, tombstones, hostname) to merge locally.
-pub fn join_with_code(
+/// Join via a code with a caller-chosen timeout: presents our callback so
+/// pairing is two-way. Returns the other side's (hosts, tombstones, hostname)
+/// to merge locally.
+fn join_with_code_timeout(
     addr: &str,
     token: &str,
     from_addr: &str,
     from_token: &str,
     from_hostname: &str,
+    timeout: Duration,
 ) -> Result<(Vec<HostConfig>, Vec<SyncDeletion>, String), String> {
     let body = serde_json::json!({
         "token": token,
@@ -367,7 +398,10 @@ pub fn join_with_code(
         "from_hostname": from_hostname,
     })
     .to_string();
-    let resp = post_json(&format!("http://{}/sync/join", addr), &body)?;
+    // Fail fast before ureq (see check_reachable): its timeout doesn't bound
+    // blackholed connects, which would stall the join for ~30s.
+    check_reachable(addr).map_err(|e| format!("request failed: http://{}/sync/join: {}", addr, e))?;
+    let resp = post_json_timeout(&format!("http://{}/sync/join", addr), &body, timeout)?;
     let v: serde_json::Value =
         serde_json::from_str(&resp).map_err(|e| format!("bad response: {}", e))?;
     if !v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
@@ -387,6 +421,194 @@ pub fn join_with_code(
         .unwrap_or("")
         .to_string();
     Ok((hosts, deleted, hostname))
+}
+
+/// True when the join failed before any application answer came back
+/// (unreachable host) as opposed to being answered and rejected (wrong
+/// token, outdated peer). Only the former is worth a LAN scan — a rejection
+/// is definitive and must not spray the neighborhood.
+pub fn is_unreachable(err: &str) -> bool {
+    let e = err.to_lowercase();
+    [
+        "refus", "timed out", "timeout", "timedout", "network error", "eof",
+        "reset", "broken pipe", "unreachable", "no route", "couldn't connect",
+        "connect error", "connection failed", "connection closed",
+        "resolv", "lookup", "dns", "nodename", "name or service",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
+}
+
+/// First three octets of an IPv4 address → the /24 to scan. Pure helper so
+/// the derivation itself is unit-testable (the live address comes from
+/// [`primary_lan_ip`]).
+pub fn subnet24_of(ip: &str) -> Option<String> {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+        Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]))
+    } else {
+        None
+    }
+}
+
+/// Our own last octet, so the scan skips self (our listener would just
+/// reject our own token anyway, but no point knocking).
+fn own_last_octet() -> Option<u8> {
+    primary_lan_ip()?.rsplit('.').next()?.parse().ok()
+}
+
+/// Minimal `GET /health` probe over a short-timeout raw connection: true
+/// only for a 200 whose body is exactly `ok` (i.e. a ping-uin listener).
+fn health_ok(addr: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let sock: std::net::SocketAddr = match addr.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let mut stream = match TcpStream::connect_timeout(&sock, Duration::from_millis(250)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if stream.set_read_timeout(Some(Duration::from_millis(800))).is_err() {
+        return false;
+    }
+    if stream.write_all(b"GET /health HTTP/1.0\r\n\r\n").is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 512];
+    let mut raw = Vec::new();
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 2048 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&raw);
+    match text.split_once("\r\n\r\n") {
+        Some((head, body)) => head.contains("200") && body.trim() == "ok",
+        None => false,
+    }
+}
+
+/// Try one candidate address: health-gate first (cheap), full join second.
+/// Returns the join result plus the address that answered.
+fn try_candidate(
+    addr: &str,
+    token: &str,
+    from_addr: &str,
+    from_token: &str,
+    from_hostname: &str,
+) -> Option<(Vec<HostConfig>, Vec<SyncDeletion>, String, String)> {
+    if !health_ok(addr) {
+        return None;
+    }
+    match join_with_code_timeout(addr, token, from_addr, from_token, from_hostname, Duration::from_secs(4)) {
+        Ok((hosts, deleted, hostname)) => Some((hosts, deleted, hostname, addr.to_string())),
+        Err(_) => None,
+    }
+}
+
+/// Join with automatic LAN discovery: try the code's address first (fast,
+/// 3s budget), and only when it is unreachable — never on rejection — scan
+/// our own /24 for a ping-uin listener holding this token. `notify` reports
+/// progress (e.g. "scanning 192.168.1.0/24 …") to the UI/CLI.
+/// Returns (hosts, tombstones, peer hostname, address that answered).
+pub fn join_device(
+    peer_addr: &str,
+    token: &str,
+    from_addr: &str,
+    from_token: &str,
+    from_hostname: &str,
+    notify: &dyn Fn(String),
+) -> Result<(Vec<HostConfig>, Vec<SyncDeletion>, String, String), String> {
+    match join_with_code_timeout(peer_addr, token, from_addr, from_token, from_hostname, Duration::from_secs(3)) {
+        Ok((hosts, deleted, hostname)) => return Ok((hosts, deleted, hostname, peer_addr.to_string())),
+        Err(e) if !is_unreachable(&e) => return Err(e),
+        Err(first_err) => {
+            let subnet = subnet24_of(&primary_lan_ip().unwrap_or_default()).ok_or_else(|| {
+                format!("{} (and no local subnet to scan)", first_err)
+            })?;
+            let port = peer_addr.rsplit(':').next().unwrap_or("8080").to_string();
+            notify(format!("code address unreachable, scanning {}.0/24 …", subnet));
+            match scan_subnet(&subnet, &port, own_last_octet(), token, from_addr, from_token, from_hostname) {
+                Some((hosts, deleted, hostname, via)) => Ok((hosts, deleted, hostname, via)),
+                None => Err(format!("{} (also scanned {}.0/24: no ping-uin answering)", first_err, subnet)),
+            }
+        }
+    }
+}
+
+/// Probe every host in `subnet` (a "192.168.1" prefix) on `port` in parallel
+/// and join the first ping-uin listener that accepts `token`. Skips our own
+/// last octet. Bounded by the per-connection timeouts above.
+fn scan_subnet(
+    subnet: &str,
+    port: &str,
+    skip_octet: Option<u8>,
+    token: &str,
+    from_addr: &str,
+    from_token: &str,
+    from_hostname: &str,
+) -> Option<(Vec<HostConfig>, Vec<SyncDeletion>, String, String)> {
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+    let found = AtomicBool::new(false);
+    let result = std::sync::Mutex::new(None);
+    // Batched scopes (32 at a time) instead of one 253-thread scope:
+    // bounds concurrent threads *and* sequential spawn cost, and lets an
+    // early hit skip the remaining batches.
+    let mut addrs: Vec<String> = (1u8..=254u8)
+        .filter(|last| Some(*last) != skip_octet)
+        .map(|last| format!("{}.{}:{}", subnet, last, port))
+        .collect();
+    // Probe our closest neighbors first — DHCP hands out nearby addresses,
+    // so the peer is usually within a few doors either way.
+    if let Some(own) = skip_octet {
+        addrs.sort_by_key(|a| {
+            let ip = a.rsplit_once(':').map(|(h, _)| h).unwrap_or(a.as_str());
+            let last: u8 = ip.rsplit('.').next().and_then(|o| o.parse().ok()).unwrap_or(0);
+            last.abs_diff(own)
+        });
+    }
+    for chunk in addrs.chunks(32) {
+        if found.load(O::Relaxed) {
+            break;
+        }
+        std::thread::scope(|s| {
+            for addr in chunk {
+                if found.load(O::Relaxed) {
+                    break;
+                }
+                let addr = addr.clone();
+                let token = token.to_string();
+                let from_addr = from_addr.to_string();
+                let from_token = from_token.to_string();
+                let from_hostname = from_hostname.to_string();
+                let found_ref = &found;
+                let result_ref = &result;
+                s.spawn(move || {
+                    if found_ref.load(O::Relaxed) {
+                        return;
+                    }
+                    if let Some(out) = try_candidate(&addr, &token, &from_addr, &from_token, &from_hostname) {
+                        if let Ok(mut slot) = result_ref.lock() {
+                            if slot.is_none() {
+                                *slot = Some(out);
+                                found_ref.store(true, O::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    result.into_inner().ok().flatten()
 }
 
 /// Background push loop: every 60s, load the on-disk config and push to all
@@ -453,9 +675,146 @@ mod tests {
     fn join_errors_map_to_actionable_hints() {
         assert!(join_error_hint("request failed: Connection refused (os error 111)").contains("firewall"));
         assert!(join_error_hint("request failed: timed out").contains("wrong IP"));
-        assert!(join_error_hint("request failed: http status: 404").contains("v0.2.0"));
+        assert!(join_error_hint("request failed: HTTP 404").contains("v0.2.0"));
         assert!(join_error_hint("bad token (generate a fresh join code?)").contains("fresh code"));
         assert!(!join_error_hint("something weird").is_empty());
+    }
+
+    #[test]
+    fn unreachable_means_no_answer_not_rejection() {
+        // The exact failure from the field: connected-ish, then EOF.
+        assert!(is_unreachable("request failed: http://172.16.10.2:8080/sync/join: Network Error: Unexpected EOF"));
+        assert!(is_unreachable("request failed: Connection refused (os error 61)"));
+        assert!(is_unreachable("request failed: timed out"));
+        assert!(!is_unreachable("bad token in join code"));
+        assert!(!is_unreachable("request failed: HTTP 404: foo"));
+        assert!(!is_unreachable("join rejected"));
+    }
+
+    #[test]
+    fn subnet_derivation() {
+        assert_eq!(subnet24_of("192.168.1.25"), Some("192.168.1".to_string()));
+        assert_eq!(subnet24_of("10.0.0.1"), Some("10.0.0".to_string()));
+        assert_eq!(subnet24_of("::1"), None);
+        assert_eq!(subnet24_of("fe80::1"), None);
+        assert_eq!(subnet24_of("garbage"), None);
+        assert_eq!(subnet24_of("1.2.3.256"), None);
+    }
+
+    /// Minimal stub peer: answers /health and /sync/join like the real server.
+    /// Takes an already-bound listener so no other test can steal the port.
+    fn stub_peer(listener: std::net::TcpListener) {
+        use std::io::{Read, Write};
+        for mut stream in listener.incoming().take(64) {
+            let mut stream = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
+            let mut buf = vec![0u8; 0];
+            let mut tmp = [0u8; 1024];
+            loop {
+                match stream.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let req = String::from_utf8_lossy(&buf);
+            let first = req.lines().next().unwrap_or("");
+            let resp = if first.starts_with("GET /health") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n".to_string()
+            } else if first.starts_with("POST /sync/join") {
+                let body = r#"{"ok":true,"hosts":[],"deleted":[],"hostname":"stub"}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            };
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    }
+
+    #[test]
+    fn join_falls_back_from_dead_code_ip_to_scanned_peer() {
+        // A dead address first (nothing on :1 → refused), then a live stub.
+        // Proves the fallback path reaches a peer the code didn't name.
+        // The stub listener is bound before spawning, so no parallel test
+        // can steal the port; readiness is retried, not slept on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stub = std::thread::spawn(move || stub_peer(listener));
+        let stub_addr = format!("127.0.0.1:{}", port);
+        let mut ready = false;
+        for _ in 0..40 {
+            if health_ok(&stub_addr) {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready, "stub peer never answered /health");
+        assert!(!health_ok("127.0.0.1:1"));
+        // Simulate the fallback's inner loop directly: dead then live.
+        let token = generate_token();
+        let r1 = try_candidate("127.0.0.1:1", &token, "127.0.0.1:9999", &token, "tester");
+        assert!(r1.is_none());
+        let r2 = try_candidate(&format!("127.0.0.1:{}", port), &token, "127.0.0.1:9999", &token, "tester");
+        let (hosts, _, hostname, via) = r2.expect("stub peer should accept the join");
+        assert!(hosts.is_empty());
+        assert_eq!(hostname, "stub");
+        assert!(via.ends_with(&port.to_string()));
+        drop(stub);
+    }
+
+    #[test]
+    fn scan_subnet_finds_a_live_peer() {
+        // End-to-end scan over loopback: 253 instant-refused probes plus one
+        // live stub must resolve to the stub. Should take ~2s, not tens.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stub = std::thread::spawn(move || stub_peer(listener));
+        let token = generate_token();
+        let start = std::time::Instant::now();
+        let found = scan_subnet(
+            "127.0.0",
+            &port.to_string(),
+            None,
+            &token,
+            "127.0.0.1:9999",
+            &token,
+            "tester",
+        );
+        let elapsed = start.elapsed();
+        let (_, _, hostname, via) = found.expect("scan should find the stub peer");
+        assert_eq!(hostname, "stub");
+        assert!(via.ends_with(&port.to_string()));
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "scan took too long: {:?}",
+            elapsed
+        );
+        drop(stub);
+    }
+
+    #[test]
+    fn reachable_gate_fails_fast_with_classifiable_errors() {
+        // Closed localhost port: refused, immediately (no 30s blackhole stall).
+        let t = std::time::Instant::now();
+        let err = check_reachable("127.0.0.1:1").unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(5), "took {:?}", t.elapsed());
+        assert!(is_unreachable(&err), "classifiable: {}", err);
+        // Unresolvable name: resolve error, also classifiable.
+        let err = check_reachable("no-such-host.invalid:8080").unwrap_err();
+        assert!(is_unreachable(&err), "classifiable: {}", err);
     }
 
     #[test]
