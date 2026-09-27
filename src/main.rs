@@ -3156,6 +3156,18 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 }
             }
             lines.push(Line::from(""));
+            lines.push(Line::from(if app.server_running {
+                format!(
+                    "  listening on {}:{} (page {}) — joins reach this device here",
+                    startup::DEFAULT_WEB_BIND,
+                    startup::DEFAULT_WEB_PORT,
+                    if app.web_url.is_some() { "shown" } else { "off" }
+                )
+            } else {
+                "  listener off — press [g] or [j] to start it".to_string()
+            }).style(Style::default().fg(theme.inactive_fg)));
+            lines.push(Line::from("  joins failing? same Wi-Fi, allow ping-uin through the firewall, IP in the code must be pingable.").style(Style::default().fg(theme.inactive_fg)));
+            lines.push(Line::from(""));
             lines.push(Line::from("[g] new code   [j] join with code   [1-9] forget peer   [Esc] close").style(Style::default().fg(theme.inactive_fg)));
             let popup_area = popup_rect(popup_width(72, area), lines.len() as u16 + 2, area);
             let max_lines = popup_area.height.saturating_sub(2) as usize;
@@ -3921,11 +3933,16 @@ fn run_app<B: ratatui::backend::Backend>(
                                         "web page hidden — press W to serve again".to_string(),
                                     );
                                 } else {
-                                    let urls = ensure_tui_web_server(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT);
-                                    app.update_state = UpdateState::Info(format!(
-                                        "serving read-only page on {} (W hides it, B opens it in your browser)",
-                                        urls
-                                    ));
+                                    match ensure_tui_web_server(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT) {
+                                        Some(urls) => {
+                                            app.update_state = UpdateState::Info(format!(
+                                                "serving read-only page on {} (W hides it, B opens it in your browser)",
+                                                urls
+                                            ));
+                                        }
+                                        // Bind failure is already shown by ensure_server_running.
+                                        None => {}
+                                    }
                                 }
                             }
                             KeyCode::Char('b') | KeyCode::Char('B') => {
@@ -3933,8 +3950,11 @@ fn run_app<B: ratatui::backend::Backend>(
                                 // Explicitly opt-in like W: starts serving first
                                 // when off, then opens the primary (LAN) URL.
                                 let urls = match app.web_url.clone() {
-                                    Some(line) => line,
+                                    Some(line) => Some(line),
                                     None => ensure_tui_web_server(app, &shutdown, &sync_tx, startup::DEFAULT_WEB_BIND, startup::DEFAULT_WEB_PORT),
+                                };
+                                let Some(urls) = urls else {
+                                    continue; // bind failure already shown
                                 };
                                 let url = primary_web_url(&urls).to_string();
                                 match open_in_browser(&url) {
@@ -4518,7 +4538,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                                         });
                                                     }
                                                     Err(e) => {
-                                                        let _ = tx2.send(Message::UpdateState(UpdateState::Error(format!("sync join failed: {}", e))));
+                                                        let _ = tx2.send(Message::UpdateState(UpdateState::Error(format!("sync join failed — {}", sync::join_error_hint(&e)))));
                                                     }
                                                 }
                                             });
@@ -5043,45 +5063,59 @@ fn self_sync_addr(port: u16) -> String {
 
 /// Start the shared listener if needed (page and/or sync). The page itself
 /// stays gated behind `web_enabled` — starting the listener for sync never
-/// auto-serves the website.
+/// auto-serves the website. Bind failures are shown in the UI (nothing
+/// listens silently): returns false and leaves `server_running` unset.
 fn ensure_server_running(
     app: &mut App,
     shutdown: &Arc<AtomicBool>,
     sync_tx: &std::sync::mpsc::SyncSender<sync::SyncEvent>,
     bind: &str,
     port: u16,
-) {
+) -> bool {
     if app.server_running {
-        return;
+        return true;
     }
-    let sync_tx = sync_tx.clone();
-    web::start_in_background(
-        app.web_page.clone(),
-        bind.to_string(),
-        port,
-        shutdown.clone(),
-        app.web_enabled.clone(),
-        sync_tx,
-    );
-    app.server_running = true;
-    publish_web_snapshot(app);
+    match web::bind_listener(bind, port) {
+        Ok(listener) => {
+            web::start_in_background(
+                app.web_page.clone(),
+                listener,
+                shutdown.clone(),
+                app.web_enabled.clone(),
+                sync_tx.clone(),
+            );
+            app.server_running = true;
+            publish_web_snapshot(app);
+            true
+        }
+        Err(e) => {
+            app.update_state = UpdateState::Error(format!(
+                "can't listen on {}:{} ({}). Web page + sync need a free port — is another copy running?",
+                bind, port, e
+            ));
+            false
+        }
+    }
 }
 
 /// Enable the read-only LAN page for a running TUI session (idempotent).
-/// Returns a human-readable "url [· url]" line with the real LAN IP + port.
+/// Returns the human-readable "url [· url]" line, or None when the
+/// listener couldn't bind (the error is already shown in the UI).
 fn ensure_tui_web_server(
     app: &mut App,
     shutdown: &Arc<AtomicBool>,
     sync_tx: &std::sync::mpsc::SyncSender<sync::SyncEvent>,
     bind: &str,
     port: u16,
-) -> String {
-    ensure_server_running(app, shutdown, sync_tx, bind, port);
+) -> Option<String> {
+    if !ensure_server_running(app, shutdown, sync_tx, bind, port) {
+        return None;
+    }
     app.web_enabled.store(true, Ordering::Relaxed);
     publish_web_snapshot(app);
     let line = web::lan_urls(bind, port).join(" · ");
     app.web_url = Some(line.clone());
-    line
+    Some(line)
 }
 
 /// Apply one inbound sync event to live state + config (single writer).
@@ -5192,7 +5226,16 @@ fn run_serve(bind: &str, port: u16) -> io::Result<()> {
             shared.theme = theme;
         }
     }
-    web::start_in_background(page.clone(), bind.to_string(), port, shutdown.clone(), web_enabled, sync_tx.clone());
+    let listener = match web::bind_listener(bind, port) {
+        Ok(l) => l,
+        Err(e) => {
+            // Fail fast: probing without a listener means joins and page
+            // views fail with no hint about the real cause (port busy?).
+            eprintln!("cannot listen on {}:{} ({}). Is another copy running?", bind, port, e);
+            std::process::exit(1);
+        }
+    };
+    web::start_in_background(page.clone(), listener, shutdown.clone(), web_enabled, sync_tx.clone());
     // Always run: zero peers = sleep; pairings made while running are picked
     // up from disk each round.
     let sync_pusher = sync::spawn_push_loop(shutdown.clone(), port, sync::device_hostname(), sync_tx);
@@ -5393,7 +5436,7 @@ fn run_sync_join(code: &str, port: u16) -> io::Result<()> {
             Ok(())
         }
         Err(e) => {
-            eprintln!("sync join failed: {}", e);
+            eprintln!("sync join failed: {}\n{}", e, sync::join_error_hint(&e));
             std::process::exit(1);
         }
     }

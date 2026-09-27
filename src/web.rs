@@ -759,29 +759,26 @@ fn handle_connection(
     }
 }
 
-/// Blocking serve loop. `web_enabled` gates the HTML page (sync routes are
-/// always live once a token exists); `sync_tx` carries inbound sync events
-/// to the main loop. Returns when `shutdown` is set.
+/// Bind the shared listener. Done by the caller — never inside the server
+/// thread — so bind failures (port busy, no permission) surface in the UI
+/// or CLI instead of dying silently in a background thread's stderr.
+pub fn bind_listener(bind: &str, port: u16) -> std::io::Result<TcpListener> {
+    let listener = TcpListener::bind(format!("{}:{}", bind, port))?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+}
+
+/// Blocking serve loop over an already-bound listener. `web_enabled` gates
+/// the HTML page (sync routes are always live once a token exists);
+/// `sync_tx` carries inbound sync events to the main loop. Returns when
+/// `shutdown` is set.
 pub fn run_server(
     page: SharedPage,
-    bind: &str,
-    port: u16,
+    listener: TcpListener,
     shutdown: Arc<AtomicBool>,
     web_enabled: Arc<AtomicBool>,
     sync_tx: SyncSender<SyncEvent>,
 ) {
-    let addr = format!("{}:{}", bind, port);
-    let listener = match TcpListener::bind(&addr) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("web server: cannot bind {}: {}", addr, e);
-            return;
-        }
-    };
-    if listener.set_nonblocking(true).is_err() {
-        eprintln!("web server: cannot set nonblocking");
-        return;
-    }
     let version = env!("CARGO_PKG_VERSION").to_string();
     // Handlers run on spawned threads; publish the channel thread-locally.
     SYNC_TX.with(|tx| *tx.borrow_mut() = Some(sync_tx.clone()));
@@ -817,15 +814,15 @@ pub fn run_server(
 }
 
 /// Spawn the server in the background; the thread exits when `shutdown` flips.
+/// Takes an already-bound listener from [`bind_listener`].
 pub fn start_in_background(
     page: SharedPage,
-    bind: String,
-    port: u16,
+    listener: TcpListener,
     shutdown: Arc<AtomicBool>,
     web_enabled: Arc<AtomicBool>,
     sync_tx: SyncSender<SyncEvent>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || run_server(page, &bind, port, shutdown, web_enabled, sync_tx))
+    thread::spawn(move || run_server(page, listener, shutdown, web_enabled, sync_tx))
 }
 
 #[cfg(test)]
@@ -858,10 +855,10 @@ mod tests {
         let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
+        let listener = bind_listener("127.0.0.1", port).unwrap();
         let handle = start_in_background(
             page,
-            "127.0.0.1".to_string(),
-            port,
+            listener,
             shutdown.clone(),
             enabled,
             tx,
@@ -992,6 +989,18 @@ mod tests {
         let mut hosts = sample();
         apply_sort(&mut hosts, SortKey::Name, true);
         assert_eq!(hosts[0].display_name, "Google DNS");
+    }
+
+    #[test]
+    fn bind_conflict_fails_loudly() {
+        // Hold a port, then prove a second bind fails (surfaced to the
+        // caller, never swallowed): this is the "joins fail, nothing
+        // listening" case when the port is already taken.
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        assert!(bind_listener("127.0.0.1", port).is_err());
+        drop(holder);
+        assert!(bind_listener("127.0.0.1", port).is_ok());
     }
 
     #[test]

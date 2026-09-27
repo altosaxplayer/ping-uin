@@ -338,6 +338,12 @@ ping-uin --sync-join PUIN-192.168.1.42-8080-abcd-efgh-jklm --port 8080
 * **CLI twins** — `--sync-peers` lists pairs, `--sync-forget <ip:port>`
   unpairs (hosts stay, pushes stop). CLI commands edit the config file, so
   quit the TUI on that device first if it's running.
+* **Joins failing?** Both devices must be on the same network with ping-uin
+  running (TUI or `--serve`) and listening — the Y menu shows the listener
+  address, and a busy port is reported instead of failing silently. Same
+  Wi-Fi (no client isolation), allow ping-uin through the device firewall,
+  and make sure the IP in the join code is reachable (VPNs/Docker can put a
+  wrong one in — join errors say which of these it looks like).
 
 ### Start on boot (opt-in)
 

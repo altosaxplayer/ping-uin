@@ -111,6 +111,25 @@ pub fn parse_join_code(code: &str) -> Result<(String, String), String> {
     Ok((format!("{}:{}", host, port), token))
 }
 
+/// One-line diagnosis for a failed join, so the fix is obvious instead of
+/// a bare I/O error. Used by the CLI (appended to the raw error) and the
+/// TUI (shown on its own, since popups clip long lines).
+pub fn join_error_hint(err: &str) -> &'static str {
+    let e = err.to_lowercase();
+    if e.contains("refused") {
+        "connection refused — is ping-uin running there (TUI or --serve), on the same port, and allowed through its firewall?"
+    } else if e.contains("timeout") || e.contains("timed out") {
+        "timed out — wrong IP in the code (VPN? Docker? hotspot isolation?), firewall, or different networks"
+    } else if e.contains("404") {
+        "that device answered but has no sync endpoint — it needs ping-uin v0.2.0 or newer"
+    } else if e.contains("lookup") || e.contains("resolve") || e.contains("dns") || e.contains("name or service") {
+        "can't resolve that address — check the code for typos"
+    } else if e.contains("bad token") || e.contains("rejected") {
+        "rejected — generate a fresh code on the other device (codes die when regenerated)"
+    } else {
+        "check both devices are on the same network with ping-uin running"
+    }
+}
 /// Outbound-interface LAN IP via a UDP `connect()` (sends no packets).
 /// Returns None offline — callers fall back to the bind address.
 pub fn primary_lan_ip() -> Option<String> {
@@ -390,6 +409,15 @@ pub fn spawn_push_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_errors_map_to_actionable_hints() {
+        assert!(join_error_hint("request failed: Connection refused (os error 111)").contains("firewall"));
+        assert!(join_error_hint("request failed: timed out").contains("wrong IP"));
+        assert!(join_error_hint("request failed: http status: 404").contains("v0.2.0"));
+        assert!(join_error_hint("bad token (generate a fresh join code?)").contains("fresh code"));
+        assert!(!join_error_hint("something weird").is_empty());
+    }
 
     #[test]
     fn token_shape_and_grouping() {
