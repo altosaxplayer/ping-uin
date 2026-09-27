@@ -4994,16 +4994,15 @@ fn run_app<B: ratatui::backend::Backend>(
                                     // TUI suspends while sudo prompts.
                                     if run_setcap_interactive(&exe) {
                                         let _ = terminal.clear();
-                                        let (bind, port) = (app.web_bind.clone(), app.web_port);
                                         if page {
-                                            if let Some(urls) = ensure_tui_web_server(app, &shutdown, &sync_tx, &bind, port) {
-                                                app.config.serve_page = true;
-                                                app.persist();
-                                                app.update_state = UpdateState::Info(format!("capability granted — serving on {}", urls));
-                                            }
-                                        } else if ensure_server_running(app, &shutdown, &sync_tx, &bind, port, false) {
-                                            app.update_state = UpdateState::Info("capability granted — listener is up".to_string());
+                                            // File capabilities are applied at exec time; this
+                                            // process cannot use the new grant. Persist the
+                                            // requested page so the relaunched TUI restores it.
+                                            app.config.serve_page = true;
+                                            app.persist();
                                         }
+                                        app.restart_after_exit = true;
+                                        return Ok(());
                                     } else {
                                         app.update_state = UpdateState::Error(format!(
                                             "grant failed — run it manually: sudo setcap 'cap_net_bind_service=+ep' {}",
@@ -6536,7 +6535,7 @@ fn main() -> io::Result<()> {
                 } else {
                     exe
                 };
-                let _ = Command::new(&restart_exe).spawn();
+                let _ = Command::new(&restart_exe).args(env::args_os().skip(1)).spawn();
             }
         }
     }

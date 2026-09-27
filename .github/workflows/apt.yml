@@ -25,7 +25,6 @@ on:
   workflow_run:
     workflows: [release]
     types: [completed]
-    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
@@ -42,6 +41,7 @@ concurrency:
 
 jobs:
   deb-and-repo:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Resolve tag
