@@ -173,18 +173,78 @@ fn status_rank(status: &str) -> u8 {
 }
 
 /// Parsed page query: sort + direction + optional group-label filter +
-/// grouped-cards view. Default is a flat table like the TUI (ungrouped);
-/// `?view=grouped` restores the collapsible per-label cards.
-#[derive(Clone, Debug, Default)]
+/// text search + grouped-cards view. Default is grouped cards (flat table
+/// via `?view=flat`); any `?sort=` switches to a flat sorted table.
+#[derive(Clone, Debug)]
 pub struct PageQuery {
     pub sort: SortKey,
     pub desc: bool,
     pub group: Option<String>,
     pub grouped: bool,
+    pub q: Option<String>,
 }
 
-/// Parse `sort`/`order`/`group`/`view` from a raw query string.
-/// Unknown values fall back to the flat ungrouped view, ascending.
+impl Default for PageQuery {
+    fn default() -> Self {
+        PageQuery {
+            sort: SortKey::None,
+            desc: false,
+            group: None,
+            grouped: true,
+            q: None,
+        }
+    }
+}
+
+/// Decode `application/x-www-form-urlencoded` (`+` → space, `%XX` bytes).
+/// Query values arrive encoded from links and the search form.
+pub fn decode_query_value(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &s[i + 1..i + 3];
+                match u8::from_str_radix(hex, 16) {
+                    Ok(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Encode for query strings (unreserved chars raw, space → `+`, rest `%XX`).
+pub fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Parse `sort`/`order`/`group`/`view`/`q` from a raw query string.
+/// Unknown values fall back to grouped view, ascending, no filter.
 pub fn parse_query(query: &str) -> PageQuery {
     let mut out = PageQuery::default();
     for pair in query.split('&') {
@@ -198,18 +258,48 @@ pub fn parse_query(query: &str) -> PageQuery {
                 out.desc = matches!(v.to_lowercase().as_str(), "desc" | "descending" | "down" | "1");
             }
             "group" | "label" => {
+                let v = decode_query_value(v);
                 let v = v.trim();
                 if !v.is_empty() {
                     out.group = Some(v.to_string());
                 }
             }
             "view" | "layout" => {
-                out.grouped = matches!(v.to_lowercase().as_str(), "grouped" | "groups" | "1");
+                // Explicit flat only; anything else (incl. missing) is grouped.
+                out.grouped = !matches!(v.to_lowercase().as_str(), "flat" | "off" | "0" | "false" | "list");
+            }
+            "q" | "query" | "search" => {
+                let v = decode_query_value(v);
+                let v = v.trim();
+                if !v.is_empty() {
+                    out.q = Some(v.to_string());
+                }
             }
             _ => {}
         }
     }
     out
+}
+
+/// True when a host passes the group filter AND the text search (name,
+/// target/IP, or group — same coverage as the TUI's `/` search).
+pub fn matches_query(h: &HostSnapshot, q: &PageQuery) -> bool {
+    if q.group.as_deref().map_or(false, |g| group_label(h) != g) {
+        return false;
+    }
+    match q.q.as_deref() {
+        None => true,
+        Some(needle) => {
+            let needle = needle.to_lowercase();
+            h.display_name.to_lowercase().contains(&needle)
+                || h.target.to_lowercase().contains(&needle)
+                || h.group.to_lowercase().contains(&needle)
+        }
+    }
+}
+
+fn visible_hosts<'a>(hosts: &'a [HostSnapshot], q: &PageQuery) -> Vec<&'a HostSnapshot> {
+    hosts.iter().filter(|h| matches_query(h, q)).collect()
 }
 
 /// Sort a snapshot in place. Stable, so ties keep probe order.
@@ -324,24 +414,44 @@ fn group_label(h: &HostSnapshot) -> String {
     }
 }
 
+/// Canonical navigation URL preserving view state. Only non-defaults are
+/// emitted (no `view` param means grouped): sort/order when sorting, the
+/// group filter, and the search text — all encoded.
+fn nav_href(sort: SortKey, desc: bool, grouped: bool, group: Option<&str>, q: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if sort != SortKey::None {
+        parts.push(format!("sort={}", sort.param()));
+        parts.push(format!("order={}", if desc { "desc" } else { "asc" }));
+    }
+    if !grouped {
+        parts.push("view=flat".to_string());
+    }
+    if let Some(g) = group {
+        parts.push(format!("group={}", encode_query_value(g)));
+    }
+    if let Some(query) = q {
+        parts.push(format!("q={}", encode_query_value(query)));
+    }
+    if parts.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/?{}", parts.join("&amp;"))
+    }
+}
+
 /// Header link for a sortable column: clicking the active column toggles
-/// asc/desc, clicking another column sorts ascending by it. Preserves the
-/// group filter and the grouped/flat view.
+/// asc/desc, clicking another column sorts ascending by it. View state
+/// (group, search, grouped/flat) rides along.
 fn sort_link(label: &str, key: SortKey, q: &PageQuery) -> String {
     let arrow = if q.sort == key {
         if q.desc { " \u{25bc}" } else { " \u{25b2}" }
     } else {
         ""
     };
-    let order = if q.sort == key && !q.desc { "desc" } else { "asc" };
-    let group = q.group.as_deref().map(|g| format!("&amp;group={}", html_escape(g))).unwrap_or_default();
-    let view: String = if q.grouped { "&amp;view=grouped".to_string() } else { String::new() };
+    let desc = q.sort == key && !q.desc;
     format!(
-        "<a href=\"/?sort={}&amp;order={}{}{}\">{}{}</a>",
-        key.param(),
-        order,
-        group,
-        view,
+        "<a href=\"{}\">{}{}</a>",
+        nav_href(key, desc, q.grouped, q.group.as_deref(), q.q.as_deref()),
         html_escape(label),
         arrow
     )
@@ -409,7 +519,7 @@ const POLLER_SCRIPT: &str = r##"
 var content=document.getElementById('content');
 if(!content){return;}
 var params=new URLSearchParams(window.location.search);
-var grouped=params.get('view')==='grouped';
+var grouped=!/^(flat|off|0|false|list)$/i.test(params.get('view')||'');
 var api='/api/state'+window.location.search;
 var prev={};
 var fails=0,timer=null;
@@ -480,11 +590,11 @@ timer=setTimeout(poll,5000);
 "##;
 
 
-/// Full HTML status page in the serving instance's theme. Static CSS + meta
-/// refresh so it works in any browser with no JS. The default view is a flat
-/// table — every host its own row, like the TUI; `?view=grouped` restores
-/// the collapsible per-label cards, and any `?sort=` switches to a flat
-/// sorted table.
+/// Full HTML status page in the serving instance's theme. Static CSS + a
+/// live-polling script (meta refresh only under <noscript>). The default
+/// view is collapsible per-label group cards, like the TUI; `?view=flat`
+/// switches to a flat table — every host its own row — and any `?sort=`
+/// switches to a flat sorted table.
 pub fn render_status_page(
     hosts: &[HostSnapshot],
     theme: &SharedTheme,
@@ -493,10 +603,7 @@ pub fn render_status_page(
     q: &PageQuery,
     started_unix: i64,
 ) -> String {
-    let visible: Vec<&HostSnapshot> = hosts
-        .iter()
-        .filter(|h| q.group.as_deref().map_or(true, |g| group_label(h) == g))
-        .collect();
+    let visible: Vec<&HostSnapshot> = visible_hosts(hosts, q);
     let up = visible.iter().filter(|h| h.up).count();
     let down = visible.len().saturating_sub(up);
 
@@ -511,10 +618,11 @@ pub fn render_status_page(
     if let Some(g) = q.group.as_deref() {
         state_note.push_str(&format!(" \u{00b7} group <code>{}</code>", html_escape(g)));
     }
-    if q.grouped {
-        state_note.push_str(" \u{00b7} grouped view");
+    if let Some(s) = q.q.as_deref() {
+        state_note.push_str(&format!(" \u{00b7} search <code>{}</code>", html_escape(s)));
     }
-    if q.sort != SortKey::None || q.group.is_some() || q.grouped {
+    // Reset only when the view differs from the default (grouped, unfiltered).
+    if q.sort != SortKey::None || q.group.is_some() || q.q.is_some() || !q.grouped {
         state_note.push_str(" \u{00b7} <a href=\"/\" style=\"color:accent\">reset</a>");
     }
     let state_note = state_note.replace("color:accent", &format!("color:{}", html_escape(&theme.accent)));
@@ -550,73 +658,63 @@ pub fn render_status_page(
         b_down.cmp(&a_down).then_with(|| a.cmp(b))
     });
 
-    // Group filter chips (pure links, no JS), preserving the sort and view.
-    let mut base_qs = if q.sort == SortKey::None {
-        String::new()
-    } else {
-        format!("sort={}&order={}", q.sort.param(), if q.desc { "desc" } else { "asc" })
-    };
-    if q.grouped {
-        if !base_qs.is_empty() {
-            base_qs.push('&');
-        }
-        base_qs.push_str("view=grouped");
-    }
-    let href_for = |group: Option<&str>| {
-        let escaped = |s: &str| html_escape(s).replace('&', "&amp;");
-        match (base_qs.is_empty(), group) {
-            (true, None) => "/".to_string(),
-            (false, None) => format!("/?{}", escaped(&base_qs)),
-            (true, Some(g)) => format!("/?group={}", html_escape(g)),
-            (false, Some(g)) => format!("/?{}&amp;group={}", escaped(&base_qs), html_escape(g)),
-        }
-    };
+    // Group filter chips (pure links, no JS) plus a text search form and a
+    // flat/grouped toggle. Everything preserves the rest of the view state.
     let mut chips = String::from("<nav class=\"chips\">");
     chips.push_str(&format!(
         "<a class=\"chip{}\" href=\"{}\">All</a>",
         if q.group.is_none() { " active" } else { "" },
-        href_for(None),
+        nav_href(q.sort, q.desc, q.grouped, None, q.q.as_deref()),
     ));
     for g in &group_order {
         chips.push_str(&format!(
             "<a class=\"chip{}\" href=\"{}\">{}</a>",
             if q.group.as_deref() == Some(g.as_str()) { " active" } else { "" },
-            href_for(Some(g)),
+            nav_href(q.sort, q.desc, q.grouped, Some(g), q.q.as_deref()),
             html_escape(g),
         ));
     }
-    // View toggle: grouped cards vs the default flat table.
+    // View toggle: the alternative layout, keeping sort/filter/search.
     if q.grouped {
-        let flat_href = match (q.sort == SortKey::None, q.group.as_deref()) {
-            (true, None) => "/".to_string(),
-            (true, Some(g)) => format!("/?group={}", html_escape(g)),
-            (false, None) => format!(
-                "/?sort={}&amp;order={}",
-                q.sort.param(),
-                if q.desc { "desc" } else { "asc" }
-            ),
-            (false, Some(g)) => format!(
-                "/?sort={}&amp;order={}&amp;group={}",
-                q.sort.param(),
-                if q.desc { "desc" } else { "asc" },
-                html_escape(g)
-            ),
-        };
         chips.push_str(&format!(
-            "<a class=\"chip active\" href=\"{}\">Grouped ✓</a>",
-            flat_href,
+            "<a class=\"chip\" href=\"{}\">Flat</a>",
+            nav_href(q.sort, q.desc, false, q.group.as_deref(), q.q.as_deref()),
         ));
     } else {
-        let grouped_href = if base_qs.is_empty() {
-            "/?view=grouped".to_string()
-        } else {
-            format!("/?{}&amp;view=grouped", html_escape(&base_qs).replace('&', "&amp;"))
-        };
         chips.push_str(&format!(
             "<a class=\"chip\" href=\"{}\">Grouped</a>",
-            grouped_href,
+            nav_href(q.sort, q.desc, true, q.group.as_deref(), q.q.as_deref()),
         ));
     }
+    // Text search across name, IP, and group. Plain GET form: no JS, and
+    // the live poller never touches it (it lives outside #content), so
+    // typing is never interrupted by refreshes.
+    chips.push_str("<form class=\"searchform\" method=\"get\" action=\"/\">");
+    if q.sort != SortKey::None {
+        chips.push_str(&format!(
+            "<input type=\"hidden\" name=\"sort\" value=\"{}\">",
+            q.sort.param()
+        ));
+        chips.push_str(&format!(
+            "<input type=\"hidden\" name=\"order\" value=\"{}\">",
+            if q.desc { "desc" } else { "asc" }
+        ));
+    }
+    if !q.grouped {
+        chips.push_str("<input type=\"hidden\" name=\"view\" value=\"flat\">");
+    }
+    if let Some(g) = q.group.as_deref() {
+        chips.push_str(&format!(
+            "<input type=\"hidden\" name=\"group\" value=\"{}\">",
+            html_escape(g)
+        ));
+    }
+    chips.push_str(&format!(
+        "<input type=\"search\" name=\"q\" value=\"{}\" placeholder=\"Search name or IP…\" aria-label=\"Search hosts\">",
+        q.q.as_deref().map(html_escape).unwrap_or_default()
+    ));
+    chips.push_str("<input type=\"submit\" value=\"Search\">");
+    chips.push_str("</form>");
     chips.push_str("</nav>");
 
     let body = if q.sort != SortKey::None {
@@ -722,8 +820,6 @@ pub fn render_status_page(
         <header class=\"hero\"><div><h1>((\u{2022}O\u{2022})) ping-uin status</h1>\
         <p class=\"sub\"><span id=\"metaGen\">generated {generated}</span> \u{00b7} v{version} \u{00b7} theme {themename} \u{00b7} <span id=\"appUp\">up {appup}</span> \u{00b7} <span id=\"liveNote\">auto-refresh</span>{note}</p></div>\
         <div class=\"pills\"><span class=\"pill up\" id=\"pillUp\">\u{25cf} {up} up</span><span class=\"pill down\" id=\"pillDown\">\u{25cf} {down} down</span></div></header>\
-        {chips}\
-        <main id=\"content\">{body}</main>\
         {chips}\
         <main id=\"content\">{body}</main>\
         </div>{script}</body></html>",
@@ -1018,13 +1114,17 @@ pub fn bind_listener(bind: &str, port: u16) -> std::io::Result<TcpListener> {
 pub const FALLBACK_TRIES: u16 = 32;
 
 /// Bind `port`, falling back upward to the first free one. Returns the
-/// listener plus the port actually won.
+/// listener plus the port actually won. Only address-in-use falls back:
+/// permission errors (e.g. ports <1024 without privilege) fail fast with
+/// the original error — silently serving elsewhere would strand everyone
+/// holding the requested address.
 pub fn bind_first_free(bind: &str, port: u16) -> std::io::Result<(TcpListener, u16)> {
     let mut last_err = std::io::Error::new(std::io::ErrorKind::AddrInUse, "no ports tried");
     for p in port..=port.saturating_add(FALLBACK_TRIES) {
         match bind_listener(bind, p) {
             Ok(l) => return Ok((l, p)),
-            Err(e) => last_err = e,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => last_err = e,
+            Err(e) => return Err(e),
         }
     }
     Err(last_err)
@@ -1226,21 +1326,22 @@ mod tests {
     }
 
     #[test]
-    fn status_page_default_is_flat_like_the_tui() {
+    fn status_page_default_is_grouped_like_the_tui() {
         let html = render_default(&sample(), &PageQuery::default());
-        // No group blocks (NB: the inline script mentions "<details"+suffix
-        // without a space, so "<details " only matches real elements).
-        assert!(!html.contains("<details "));
+        // Group cards by default (NB: the inline script mentions
+        // "<details"+suffix without a space, so "<details " only matches
+        // real elements).
+        assert!(html.contains("<details open data-group"));
         assert!(html.contains("Google DNS"));
         assert!(html.contains("db:5432"));
         let goog = html.find("Google DNS").unwrap();
         let db = html.find("db:5432").unwrap();
-        assert!(goog < db, "flat view keeps probe order");
+        assert!(db < goog, "grouped view puts the DOWN host's group first");
     }
 
     #[test]
     fn status_page_groups_by_label() {
-        let q = PageQuery { sort: SortKey::None, desc: false, group: None, grouped: true };
+        let q = PageQuery { sort: SortKey::None, desc: false, group: None, grouped: true, q: None };
         let html = render_default(&sample(), &q);
         // Group blocks with tallies, down-group first.
         assert!(html.contains("<details open data-group"));
@@ -1253,7 +1354,7 @@ mod tests {
 
     #[test]
     fn status_page_group_filter() {
-        let q = PageQuery { sort: SortKey::None, desc: false, group: Some("g".to_string()), grouped: false };
+        let q = PageQuery { sort: SortKey::None, desc: false, group: Some("g".to_string()), grouped: false, q: None };
         let html = render_default(&sample(), &q);
         assert!(html.contains("db:5432"));
         assert!(!html.contains("Google DNS"));
@@ -1271,7 +1372,7 @@ mod tests {
 
     #[test]
     fn status_page_headers_are_sort_links() {
-        let q = PageQuery { sort: SortKey::Name, desc: false, group: None, grouped: false };
+        let q = PageQuery { sort: SortKey::Name, desc: false, group: None, grouped: false, q: None };
         let html = render_default(&sample(), &q);
         assert!(html.contains("?sort=name"));
         assert!(html.contains("?sort=status"));
@@ -1282,8 +1383,9 @@ mod tests {
     fn view_param_toggles_grouped_cards() {
         let q = parse_query("view=grouped");
         assert!(q.grouped);
-        assert!(parse_query("").grouped == false);
+        assert!(parse_query("").grouped);
         assert!(parse_query("view=flat").grouped == false);
+        assert!(parse_query("view=list").grouped == false);
         assert!(parse_query("sort=name&view=grouped").sort == SortKey::Name);
     }
 

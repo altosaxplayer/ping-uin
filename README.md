@@ -301,12 +301,19 @@ carry the actual port).
 * **Bind `0.0.0.0`** (the default) to make it visible anywhere on the local
   network; use `--bind 127.0.0.1` for local-only. The startup banner and the
   `W` popup print the real LAN IP + port (e.g. `http://192.168.1.42:8080/`),
-  so you know exactly what to type from other devices.
-* **Flat by default, grouped on demand** — the page opens as one table with
-  every host its own row, like the TUI. The `Grouped` chip (or
-  `?view=grouped`) switches to collapsible per-label cards, groups and
-  hosts down-first with per-group tallies. `?group=<label>` filters to one
-  group either way, plus one-click group filter chips.
+  so you know exactly what to type from other devices. Want port 80 instead
+  of `:8080`? Ports below 1024 need privilege once:
+  `sudo setcap 'cap_net_bind_service=+ep' $(which ping-uin)` (re-apply after
+  each update), then serve with `--port 80`. Installing start-on-boot with
+  `--install-startup --port 80` attempts that grant for you, and if the
+  grant is ever missing at bind time (an update replaces the binary and
+  drops it), the TUI offers to re-grant it on the spot — the interface
+  suspends while `sudo` asks your password, then retries the bind.
+* **Grouped by default, flat on demand** — the page opens as collapsible
+  per-label cards, groups and hosts down-first with per-group tallies, like
+  the TUI. The `Flat` chip (or `?view=flat`) switches to one table with
+  every host its own row. `?group=<label>` filters to one group either way,
+  plus one-click group filter chips.
 * **Modern card UI, zero JS** — status summary pills, per-status badges,
   sticky table headers, row hover, system fonts with monospace numerals,
   and a responsive layout that stacks on phones. Values update in place every 5s with no reload
@@ -382,7 +389,14 @@ ping-uin --uninstall-startup   # remove it again
   (starts at login, kept alive, logs to `~/Library/Logs/ping-uin.log`).
 * **Linux**: systemd user service (`systemctl --user enable --now ping-uin`),
   falling back to XDG autostart (`~/.config/autostart/ping-uin.desktop`)
-  where systemd isn't available.
+  where systemd isn't available. Reinstalling applies new flags (the service
+  is restarted, not left on the old config). Headless servers: without
+  lingering the service stops at logout — install enables it when possible,
+  otherwise run once as admin: `sudo loginctl enable-linger $USER`.
+  Installing with a privileged port (`--port 80`) automatically tries to
+  grant the binary `cap_net_bind_service` (works as root or with
+  passwordless sudo) so the service can bind it; without either, the
+  install message prints the one-time manual command.
 * **Windows**: Scheduled Task `ping-uin` (on logon).
 
 ---

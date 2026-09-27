@@ -21,7 +21,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use crate::config::{now_epoch, Config, HostConfig, SyncDeletion, SyncPeer};
+use crate::config::{names_equal, now_epoch, Config, HostConfig, SyncDeletion, SyncPeer};
 
 /// Tombstones older than this are pruned (a month is plenty for a delete to
 /// reach every peer through the minute-interval pushes).
@@ -221,7 +221,10 @@ pub fn ago(ep: i64, now: i64) -> String {
 
 use chrono::TimeZone;
 
-/// Bidirectional merge of full sync state. Rules:
+/// Bidirectional merge of full sync state. Name matching is trim +
+/// case-insensitive (`config::names_equal`), so a peer's spelling variant of
+/// the same host merges instead of duplicating; the winning side's spelling
+/// is kept. Rules:
 /// - Tombstones union (max `at` per name), pruned past the TTL.
 /// - A local host dies iff a tombstone (either side) is newer than its
 ///   `updated_at`; a newer incoming edit resurrects (drops the tombstone).
@@ -243,7 +246,7 @@ pub fn merge_state(
     let mut stats = MergeStats::default();
     // 1. Union tombstones (max at), prune stale ones.
     for inc in incoming_deleted {
-        match local_deleted.iter_mut().find(|d| d.name == inc.name) {
+        match local_deleted.iter_mut().find(|d| names_equal(&d.name, &inc.name)) {
             Some(cur) => cur.at = cur.at.max(inc.at),
             None => local_deleted.push(inc.clone()),
         }
@@ -252,17 +255,17 @@ pub fn merge_state(
     // 2. Incoming tombstones kill local hosts edited before the delete.
     let before = local_hosts.len();
     local_hosts.retain(|h| {
-        !local_deleted.iter().any(|d| d.name == h.name && d.at > h.updated_at)
+        !local_deleted.iter().any(|d| names_equal(&d.name, &h.name) && d.at > h.updated_at)
     });
     stats.removed = before.saturating_sub(local_hosts.len());
     // 3. Incoming hosts: skip ones our newer delete already covers, drop
     //    tombstones superseded by their newer edit, then upsert by date.
     for inc in incoming_hosts {
-        if local_deleted.iter().any(|d| d.name == inc.name && d.at > inc.updated_at) {
+        if local_deleted.iter().any(|d| names_equal(&d.name, &inc.name) && d.at > inc.updated_at) {
             continue;
         }
-        local_deleted.retain(|d| !(d.name == inc.name && d.at <= inc.updated_at));
-        match local_hosts.iter_mut().find(|h| h.name == inc.name) {
+        local_deleted.retain(|d| !(names_equal(&d.name, &inc.name) && d.at <= inc.updated_at));
+        match local_hosts.iter_mut().find(|h| names_equal(&h.name, &inc.name)) {
             Some(cur) => {
                 if inc.updated_at > cur.updated_at {
                     *cur = inc.clone();
@@ -1033,5 +1036,48 @@ mod tests {
         let mut deleted = vec![SyncDeletion { name: "old".to_string(), at: 10 }];
         merge_state(&mut local, &mut deleted, &[], &[], now);
         assert!(!deleted.iter().any(|d| d.name == "old"));
+    }
+
+    #[test]
+    fn merge_matches_spelling_variants_instead_of_duplicating() {
+        // Peer has the same host with a different case/space spelling.
+        let mut local = vec![host("google.com", 100, "old")];
+        let mut deleted = Vec::new();
+        // Newer incoming edit wins: updates in place, takes the winner's
+        // spelling, and must NOT add a second row.
+        let incoming = vec![host("Google.com", 200, "new")];
+        let stats = merge_state(&mut local, &mut deleted, &incoming, &[], 1000);
+        assert_eq!((stats.added, stats.updated, stats.removed), (0, 1, 0));
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].name, "Google.com");
+        assert_eq!(local[0].group, "new");
+        // Stale incoming edit loses: no update, no duplicate — even with
+        // surrounding whitespace in the spelling.
+        let incoming = vec![host(" GOOGLE.COM ", 50, "stale")];
+        let stats = merge_state(&mut local, &mut deleted, &incoming, &[], 1000);
+        assert_eq!((stats.added, stats.updated, stats.removed), (0, 0, 0));
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].group, "new");
+    }
+
+    #[test]
+    fn tombstones_match_spelling_variants() {
+        let now = 1000;
+        // A peer's tombstone for "Google.com" kills our "google.com".
+        let mut local = vec![host("google.com", 100, "g")];
+        let mut deleted = Vec::new();
+        let incoming_del = vec![SyncDeletion { name: "Google.com".to_string(), at: 900 }];
+        let stats = merge_state(&mut local, &mut deleted, &[], &incoming_del, now);
+        assert_eq!(stats.removed, 1);
+        assert!(local.is_empty());
+        // A stale push of any spelling variant must not resurrect it.
+        let stats = merge_state(&mut local, &mut deleted, &[host("GOOGLE.COM", 50, "g")], &[], now);
+        assert_eq!((stats.added, stats.updated), (0, 0));
+        assert!(local.is_empty());
+        // Tombstone union merges spelling variants instead of stacking.
+        let incoming_del = vec![SyncDeletion { name: "google.com ".to_string(), at: 950 }];
+        merge_state(&mut local, &mut deleted, &[], &incoming_del, now);
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].at, 950);
     }
 }

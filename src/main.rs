@@ -706,6 +706,80 @@ mod tests {
     }
 
     #[test]
+    fn bind_hint_points_at_setcap_for_low_ports() {
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let busy = std::io::Error::new(std::io::ErrorKind::AddrInUse, "busy");
+        assert!(bind_hint("0.0.0.0", 80, &denied).contains("setcap"));
+        assert!(!bind_hint("0.0.0.0", 8080, &busy).contains("setcap"));
+        assert!(bind_hint("0.0.0.0", 8080, &busy).contains("another copy"));
+    }
+
+    #[test]
+    fn grant_offer_only_for_privileged_permission_denied() {
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let busy = std::io::Error::new(std::io::ErrorKind::AddrInUse, "busy");
+        assert!(should_offer_grant(80, &denied));
+        assert!(should_offer_grant(443, &denied));
+        assert!(!should_offer_grant(80, &busy));
+        assert!(!should_offer_grant(8080, &denied));
+        assert!(!should_offer_grant(1024, &denied));
+    }
+
+    #[test]
+    fn entry_edit_takes_any_non_duplicate_ip() {
+        let mut hosts = vec![
+            HostConfig::new("8.8.8.8", 60, "external", None, None),
+            HostConfig::new("1.1.1.1", 60, "a", None, None),
+        ];
+        // Change an entry's IP to a brand-new one: the edit takes.
+        let idx = apply_entry_edit(&mut hosts, "8.8.8.8", "9.9.9.9", 120, "external".to_string(), None, None);
+        assert_eq!(idx, Some(0));
+        assert_eq!(hosts[0].name, "9.9.9.9");
+        assert_eq!(hosts[0].interval_secs, 120);
+        // Edit other fields without touching the IP: the entry never blocks
+        // itself with a false "name is taken".
+        let idx = apply_entry_edit(&mut hosts, "9.9.9.9", "9.9.9.9", 60, "dmz".to_string(), None, None);
+        assert_eq!(idx, Some(0));
+        assert_eq!(hosts[0].group, "dmz");
+        // Case/space-only respelling of its own name: takes, keeps spelling.
+        let idx = apply_entry_edit(&mut hosts, "9.9.9.9", " 9.9.9.9 ", 30, "dmz".to_string(), None, None);
+        assert_eq!(idx, Some(0));
+        assert_eq!(hosts[0].name, "9.9.9.9");
+        assert_eq!(hosts[0].interval_secs, 30);
+    }
+
+    #[test]
+    fn entry_edit_rejects_only_a_real_duplicate() {
+        let mut hosts = vec![
+            HostConfig::new("8.8.8.8", 60, "external", None, None),
+            HostConfig::new("1.1.1.1", 60, "a", None, None),
+        ];
+        // A DIFFERENT entry already has that IP: edit refused, nothing changes.
+        let idx = apply_entry_edit(&mut hosts, "8.8.8.8", "1.1.1.1", 120, "x".to_string(), None, None);
+        assert_eq!(idx, None);
+        assert_eq!(hosts[0].name, "8.8.8.8");
+        assert_eq!(hosts[0].interval_secs, 60);
+        // Same, case-insensitively.
+        let idx = apply_entry_edit(&mut hosts, "8.8.8.8", "1.1.1.1 ", 120, "x".to_string(), None, None);
+        assert_eq!(idx, None);
+        assert_eq!(hosts[0].name, "8.8.8.8");
+    }
+
+    #[test]
+    fn entry_edit_finds_legacy_spelling_variants() {
+        // Stored spelling differs from what the runtime row shows (legacy
+        // case/space drift): the entry is still found and editable.
+        let mut hosts = vec![HostConfig::new("Google.com", 60, "g", None, None)];
+        let idx = apply_entry_edit(&mut hosts, "google.com", "10.0.0.1", 60, "g".to_string(), None, None);
+        assert_eq!(idx, Some(0));
+        assert_eq!(hosts[0].name, "10.0.0.1");
+        // Unknown original: no-op.
+        let idx = apply_entry_edit(&mut hosts, "nope", "10.0.0.2", 60, "g".to_string(), None, None);
+        assert_eq!(idx, None);
+        assert_eq!(hosts[0].name, "10.0.0.1");
+    }
+
+    #[test]
     fn menu_status_rows_show_on_off() {
         let theme = build_themes().into_iter().next().unwrap();
         let on = status_row(true, "web page", "on — x".to_string(), &theme);
@@ -959,20 +1033,94 @@ struct AddHostForm {
     alias: String,
     port: String,
     focus: usize,
+    cursor: usize,
+}
+
+/// Byte-index text cursor that always sits on a char boundary. Powers
+/// ←/→/Home/End in every text field so a typo no longer means retyping.
+fn snap_cursor(s: &str, cursor: usize) -> usize {
+    let mut c = cursor.min(s.len());
+    while c > 0 && !s.is_char_boundary(c) {
+        c -= 1;
+    }
+    c
+}
+
+fn cursor_left(s: &str, cursor: &mut usize) {
+    let c = snap_cursor(s, *cursor);
+    *cursor = s.char_indices().take_while(|(i, _)| *i < c).last().map(|(i, _)| i).unwrap_or(0);
+}
+
+fn cursor_right(s: &str, cursor: &mut usize) {
+    let c = snap_cursor(s, *cursor);
+    *cursor = s[c..].chars().next().map(|ch| c + ch.len_utf8()).unwrap_or(s.len());
+}
+
+fn cursor_insert(s: &mut String, cursor: &mut usize, ch: char) {
+    let c = snap_cursor(s, *cursor);
+    s.insert(c, ch);
+    *cursor = c + ch.len_utf8();
+}
+
+fn cursor_backspace(s: &mut String, cursor: &mut usize) {
+    let c = snap_cursor(s, *cursor);
+    if c == 0 {
+        *cursor = 0;
+        return;
+    }
+    let prev = s.char_indices().take_while(|(i, _)| *i < c).last().map(|(i, _)| i).unwrap_or(0);
+    s.remove(prev);
+    *cursor = prev;
+}
+
+/// Field text with a visible `▌` block at the cursor (appended at the end,
+/// like before, when the cursor sits there).
+fn render_cursor(s: &str, cursor: usize) -> String {
+    let c = snap_cursor(s, cursor);
+    format!("{}▌{}", &s[..c], &s[c..])
 }
 
 impl AddHostForm {
     const FIELDS: usize = 5;
 
     fn for_host(h: &HostState) -> Self {
+        let host = h.name.clone();
         AddHostForm {
-            host: h.name.clone(),
             interval: format_interval(h.interval_secs),
             group: h.group.clone(),
             alias: h.alias.clone().unwrap_or_default(),
             port: h.port.map(|p| p.to_string()).unwrap_or_default(),
             focus: 0,
+            cursor: host.len(),
+            host,
         }
+    }
+
+    fn field(&self) -> &str {
+        match self.focus {
+            0 => &self.host,
+            1 => &self.interval,
+            2 => &self.group,
+            3 => &self.alias,
+            _ => &self.port,
+        }
+    }
+
+    fn field_mut(&mut self) -> &mut String {
+        match self.focus {
+            0 => &mut self.host,
+            1 => &mut self.interval,
+            2 => &mut self.group,
+            3 => &mut self.alias,
+            _ => &mut self.port,
+        }
+    }
+
+    /// Move to another field; the cursor starts at the end (append mode,
+    /// matching the old always-append behavior).
+    fn move_focus(&mut self, next: usize) {
+        self.focus = next % Self::FIELDS;
+        self.cursor = self.field().len();
     }
 }
 
@@ -990,6 +1138,7 @@ struct SmtpForm {
     threshold: String, // consecutive failures before DOWN mail
     escalations: String, // "y" / "n": also mail still_down_5m/30m
     focus: usize,
+    cursor: usize,
 }
 
 impl SmtpForm {
@@ -1009,6 +1158,7 @@ impl SmtpForm {
                 threshold: s.effective_threshold().to_string(),
                 escalations: if s.escalations { "y".to_string() } else { "n".to_string() },
                 focus: 0,
+                cursor: 1, // end of the "y"/"n" field
             },
             None => SmtpForm {
                 enabled: "n".to_string(),
@@ -1022,8 +1172,45 @@ impl SmtpForm {
                 threshold: config::SMTP_DOWN_THRESHOLD.to_string(),
                 escalations: "n".to_string(),
                 focus: 0,
+                cursor: 1,
             },
         }
+    }
+
+    fn field(&self) -> &str {
+        match self.focus {
+            0 => &self.enabled,
+            1 => &self.host,
+            2 => &self.port,
+            3 => &self.username,
+            4 => &self.password,
+            5 => &self.from,
+            6 => &self.to,
+            7 => &self.use_tls,
+            8 => &self.threshold,
+            _ => &self.escalations,
+        }
+    }
+
+    fn field_mut(&mut self) -> &mut String {
+        match self.focus {
+            0 => &mut self.enabled,
+            1 => &mut self.host,
+            2 => &mut self.port,
+            3 => &mut self.username,
+            4 => &mut self.password,
+            5 => &mut self.from,
+            6 => &mut self.to,
+            7 => &mut self.use_tls,
+            8 => &mut self.threshold,
+            _ => &mut self.escalations,
+        }
+    }
+
+    /// Move to another field; the cursor starts at the end (append mode).
+    fn move_focus(&mut self, next: usize) {
+        self.focus = next % Self::FIELDS;
+        self.cursor = self.field().len();
     }
 
     fn yn(s: &str) -> bool {
@@ -1123,6 +1310,10 @@ enum InputMode {
     KeysHelp,
     Search { query: String },
     ConfirmDelete,
+    /// Linux: a privileged-port bind failed — offer to grant
+    /// CAP_NET_BIND_SERVICE interactively. `page` = enable the web page
+    /// after a successful grant (vs. listener-only for sync).
+    GrantBindCap { page: bool },
     /// Device sync menu (join code, peers with hostname/join/last-sync).
     SyncMenu,
     /// Join form: paste the other device's code.
@@ -1194,12 +1385,45 @@ struct App {
     started_unix: i64,
 }
 
+/// Core of `App::edit_entry`, split out for tests. Finds the entry whose
+/// name matches `original` (trim + case-insensitive, so entries with legacy
+/// spelling variants stay editable) and applies the full edit. A rename is
+/// blocked only by a DIFFERENT entry with the same normalized name — the
+/// entry being edited never blocks itself. Returns the edited entry's index,
+/// or None when the original wasn't found or a duplicate blocked the rename.
+fn apply_entry_edit(
+    hosts: &mut Vec<HostConfig>,
+    original: &str,
+    new_name: &str,
+    interval_secs: u64,
+    group: String,
+    alias: Option<String>,
+    port: Option<u16>,
+) -> Option<usize> {
+    let new_name = new_name.trim();
+    let idx = hosts.iter().position(|h| config::names_equal(&h.name, original))?;
+    let renamed = !new_name.is_empty() && !config::names_equal(new_name, &hosts[idx].name);
+    if renamed && hosts.iter().enumerate().any(|(i, h)| i != idx && config::names_equal(&h.name, new_name)) {
+        return None;
+    }
+    if !new_name.is_empty() {
+        hosts[idx].name = new_name.to_string();
+    }
+    hosts[idx].interval_secs = interval_secs;
+    hosts[idx].interval_m = 0;
+    hosts[idx].group = group;
+    hosts[idx].alias = alias;
+    hosts[idx].port = port;
+    hosts[idx].touch();
+    Some(idx)
+}
+
 impl App {
     fn theme(&self) -> &Theme { &self.themes[self.theme_idx] }
 
     fn add_host(&mut self, name: String, interval_secs: u64, group: String, alias: String, port: Option<u16>, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
         let name = name.trim().to_string();
-        if name.is_empty() || self.config.hosts.iter().any(|h| h.name == name) { return; }
+        if name.is_empty() || self.config.hosts.iter().any(|h| config::names_equal(&h.name, &name)) { return; }
         let interval_secs = interval_secs.clamp(config::MIN_INTERVAL_SECS, config::MAX_INTERVAL_SECS);
         let group = if group.trim().is_empty() { "default".to_string() } else { group.trim().to_string() };
         let alias = if alias.trim().is_empty() { None } else { Some(alias.trim().to_string()) };
@@ -1223,7 +1447,7 @@ impl App {
             // Tombstone so the delete propagates to synced neighbors instead
             // of being resurrected by their next push.
             let now = config::now_epoch();
-            if let Some(d) = self.config.sync_deleted.iter_mut().find(|d| d.name == removed.name) {
+            if let Some(d) = self.config.sync_deleted.iter_mut().find(|d| config::names_equal(&d.name, &removed.name)) {
                 d.at = now;
             } else {
                 self.config.sync_deleted.push(config::SyncDeletion { name: removed.name, at: now });
@@ -1373,20 +1597,11 @@ impl App {
         let group = if form.group.trim().is_empty() { "default".to_string() } else { form.group.trim().to_string() };
         let alias = if form.alias.trim().is_empty() { None } else { Some(form.alias.trim().to_string()) };
         let port = form.port.trim().parse::<u16>().ok().filter(|p| *p > 0);
-        if let Some(idx) = self.config.hosts.iter().position(|h| h.name == original) {
-            let renamed = !new_name.is_empty() && new_name != self.config.hosts[idx].name;
-            if renamed && self.config.hosts.iter().any(|h| h.name == new_name) { return; }
-            if !new_name.is_empty() {
-                self.config.hosts[idx].name = new_name.clone();
-                if let Some(h) = self.hosts.get_mut(idx) { h.name = new_name.clone(); }
-            }
-            self.config.hosts[idx].interval_secs = interval_secs;
-            self.config.hosts[idx].interval_m = 0;
-            self.config.hosts[idx].group  = group.clone();
-            self.config.hosts[idx].alias  = alias.clone();
-            self.config.hosts[idx].port   = port;
-            self.config.hosts[idx].touch();
+        if let Some(idx) = apply_entry_edit(&mut self.config.hosts, &original, &new_name, interval_secs, group, alias, port) {
+            // Mirror into runtime state (sync_config covers everything but
+            // the name, which is the host's identity).
             if let Some(h) = self.hosts.get_mut(idx) {
+                h.name = self.config.hosts[idx].name.clone();
                 h.sync_config(&self.config.hosts[idx]);
             }
             self.history_cache.clear();
@@ -2747,6 +2962,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
                         Span::styled("? [y/n]", Style::default().fg(theme.status_danger)),
                     ]))
                 }
+                InputMode::GrantBindCap { .. } => Text::from(Line::from(vec![
+                    Span::styled(format!("Grant binding for port {}?", app.web_port), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
+                    Span::raw("   "),
+                    Span::raw("[y] grant   [n] not now").style(Style::default().fg(theme.inactive_fg)),
+                ])),
                 InputMode::HistoryView { .. } => Text::from(Line::from(vec![
                     Span::styled("History", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
@@ -2808,6 +3028,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 InputMode::ImportPath { .. } => "import",
                 InputMode::EditEntry { .. } => "edit",
                 InputMode::ConfirmDelete => "delete",
+                InputMode::GrantBindCap { .. } => "bind",
                 InputMode::HistoryView { .. } => "history",
                 InputMode::ExportPath { .. } => "export",
                 InputMode::ThemePicker { .. } => "theme",
@@ -3370,6 +3591,29 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme.status_danger))
+                .style(Style::default().bg(theme.popup_bg)));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(popup, popup_area);
+        }
+        InputMode::GrantBindCap { .. } => {
+            let popup_area = centered_rect(56, 22, area);
+            let popup = Paragraph::new(Text::from(vec![
+                Line::from(""),
+                Line::from(format!("Port {} needs privilege to bind.", app.web_port)).style(Style::default().fg(theme.main_fg).add_modifier(Modifier::BOLD)),
+                Line::from(""),
+                Line::from("Grant cap_net_bind_service to this binary now?").style(Style::default().fg(theme.main_fg)),
+                Line::from("(sudo may ask for your password;").style(Style::default().fg(theme.inactive_fg)),
+                Line::from("re-grant after every update)").style(Style::default().fg(theme.inactive_fg)),
+                Line::from(""),
+                Line::from("[y] grant   [n] not now").style(Style::default().fg(theme.inactive_fg)),
+            ]))
+            .alignment(Alignment::Center)
+            .block(Block::default()
+                .title(accent_title("Allow port binding", &theme))
+                .title_alignment(Alignment::Center)
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.title))
                 .style(Style::default().bg(theme.popup_bg)));
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
@@ -4261,6 +4505,9 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('o') | KeyCode::Char('O') => {
                                 app.input_mode = InputMode::SmtpForm(SmtpForm::from_config(app.config.smtp.as_ref()));
                             }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                toggle_startup(app);
+                            }
                             KeyCode::Char('y') | KeyCode::Char('Y') => {
                                 app.input_mode = InputMode::SyncMenu;
                             }
@@ -4307,8 +4554,26 @@ fn run_app<B: ratatui::backend::Backend>(
                             let mut form = form0.clone();
                             match key.code {
                                 KeyCode::Esc => { app.input_mode = InputMode::Normal; }
-                                KeyCode::Tab | KeyCode::Down => { form.focus = (form.focus + 1) % AddHostForm::FIELDS; app.input_mode = InputMode::AddHost(form); }
-                                KeyCode::BackTab | KeyCode::Up => { form.focus = (form.focus + AddHostForm::FIELDS - 1) % AddHostForm::FIELDS; app.input_mode = InputMode::AddHost(form); }
+                                KeyCode::Tab | KeyCode::Down => { form.move_focus(form.focus + 1); app.input_mode = InputMode::AddHost(form); }
+                                KeyCode::BackTab | KeyCode::Up => { form.move_focus(form.focus + AddHostForm::FIELDS - 1); app.input_mode = InputMode::AddHost(form); }
+                                KeyCode::Left => {
+                                    let text = form.field().to_string();
+                                    cursor_left(&text, &mut form.cursor);
+                                    app.input_mode = InputMode::AddHost(form);
+                                }
+                                KeyCode::Right => {
+                                    let text = form.field().to_string();
+                                    cursor_right(&text, &mut form.cursor);
+                                    app.input_mode = InputMode::AddHost(form);
+                                }
+                                KeyCode::Home => {
+                                    form.cursor = 0;
+                                    app.input_mode = InputMode::AddHost(form);
+                                }
+                                KeyCode::End => {
+                                    form.cursor = form.field().len();
+                                    app.input_mode = InputMode::AddHost(form);
+                                }
                                 KeyCode::Enter => {
                                     let host = form.host.trim().to_string();
                                     if host.is_empty() {
@@ -4316,7 +4581,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                         app.input_mode = InputMode::AddHost(form);
                                         continue;
                                     }
-                                    if app.config.hosts.iter().any(|h| h.name == host) {
+                                    if app.config.hosts.iter().any(|h| config::names_equal(&h.name, &host)) {
                                         app.update_state = UpdateState::Info("already watching that host".to_string());
                                         app.input_mode = InputMode::AddHost(form);
                                         continue;
@@ -4339,23 +4604,19 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.add_host(host, interval_secs, group, alias, port, &shared_hosts);
                                 }
                                 KeyCode::Backspace => {
-                                    match form.focus {
-                                        0 => { form.host.pop(); }
-                                        1 => { form.interval.pop(); }
-                                        2 => { form.group.pop(); }
-                                        3 => { form.alias.pop(); }
-                                        _ => { form.port.pop(); }
-                                    }
+                                    let mut text = form.field().to_string();
+                                    let mut cursor = form.cursor;
+                                    cursor_backspace(&mut text, &mut cursor);
+                                    *form.field_mut() = text;
+                                    form.cursor = cursor;
                                     app.input_mode = InputMode::AddHost(form);
                                 }
                                 KeyCode::Char(c) => {
-                                    match form.focus {
-                                        0 => form.host.push(c),
-                                        1 => form.interval.push(c),
-                                        2 => form.group.push(c),
-                                        3 => form.alias.push(c),
-                                        _ => form.port.push(c),
-                                    }
+                                    let mut text = form.field().to_string();
+                                    let mut cursor = form.cursor;
+                                    cursor_insert(&mut text, &mut cursor, c);
+                                    *form.field_mut() = text;
+                                    form.cursor = cursor;
                                     app.input_mode = InputMode::AddHost(form);
                                 }
                                 _ => {}
@@ -4613,18 +4874,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     // session's listener address so the
                                     // service serves the same page. Stays in
                                     // the menu so the new status shows.
-                                    if startup::is_installed() {
-                                        match startup::uninstall() {
-                                            Ok(msg) => app.update_state = UpdateState::Info(format!("startup off — {}", msg)),
-                                            Err(e) => app.update_state = UpdateState::Error(format!("startup remove failed: {}", e)),
-                                        }
-                                    } else {
-                                        let (bind, port) = (app.web_bind.clone(), app.web_port);
-                                        match startup::install(port, &bind) {
-                                            Ok(msg) => app.update_state = UpdateState::Info(format!("startup on — {}", msg)),
-                                            Err(e) => app.update_state = UpdateState::Error(format!("startup install failed: {}", e)),
-                                        }
-                                    }
+                                    toggle_startup(app);
                                 }
                                 KeyCode::Char('q') | KeyCode::Char('Q') => {
                                     shutdown.store(true, Ordering::Relaxed);
@@ -4678,7 +4928,16 @@ fn run_app<B: ratatui::backend::Backend>(
                                         continue;
                                     }
                                     let new_name = form.host.trim().to_string();
-                                    if new_name != original && app.config.hosts.iter().any(|h| h.name == new_name) {
+                                    // Self-excluding by identity, not spelling:
+                                    // the entry being edited never blocks
+                                    // itself — even with legacy case/space
+                                    // variants in the list — only a real clash
+                                    // with a DIFFERENT host blocks.
+                                    let editing = app.config.hosts.iter()
+                                        .position(|h| config::names_equal(&h.name, &original));
+                                    let clash = app.config.hosts.iter().enumerate()
+                                        .any(|(i, h)| Some(i) != editing && config::names_equal(&h.name, &new_name));
+                                    if clash {
                                         app.update_state = UpdateState::Info("that name is taken".to_string());
                                         app.input_mode = InputMode::EditEntry { original, form };
                                         continue;
@@ -4725,6 +4984,45 @@ fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => { app.input_mode = InputMode::Normal; }
                             _ => {}
                         },
+                        InputMode::GrantBindCap { page } => match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                app.input_mode = InputMode::Normal;
+                                #[cfg(target_os = "linux")]
+                                {
+                                    let exe = env::current_exe().map(|p| p.to_string_lossy().to_string())
+                                        .unwrap_or_else(|_| "ping-uin".to_string());
+                                    // TUI suspends while sudo prompts.
+                                    if run_setcap_interactive(terminal, &exe) {
+                                        let (bind, port) = (app.web_bind.clone(), app.web_port);
+                                        if page {
+                                            if let Some(urls) = ensure_tui_web_server(app, &shutdown, &sync_tx, &bind, port) {
+                                                app.config.serve_page = true;
+                                                app.persist();
+                                                app.update_state = UpdateState::Info(format!("capability granted — serving on {}", urls));
+                                            }
+                                        } else if ensure_server_running(app, &shutdown, &sync_tx, &bind, port, false) {
+                                            app.update_state = UpdateState::Info("capability granted — listener is up".to_string());
+                                        }
+                                    } else {
+                                        app.update_state = UpdateState::Error(format!(
+                                            "grant failed — run it manually: sudo setcap 'cap_net_bind_service=+ep' {}",
+                                            exe
+                                        ));
+                                    }
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    let _ = page;
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                app.input_mode = InputMode::Normal;
+                                // Declined: fall back to the manual instructions.
+                                let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+                                app.update_state = UpdateState::Error(bind_hint(&app.web_bind.clone(), app.web_port, &e));
+                            }
+                            _ => {}
+                        },
                         InputMode::SyncMenu => match key.code {
                             KeyCode::Esc | KeyCode::Char('y') | KeyCode::Char('Y') => {
                                 app.input_mode = InputMode::Normal;
@@ -4735,10 +5033,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                 let token = sync::generate_token();
                                 app.config.sync_token = Some(token);
                                 app.persist();
-                                let (bind, port) = (app.web_bind.clone(), app.web_port);
-                                ensure_server_running(app, &shutdown, &sync_tx, &bind, port);
-                            }
-                            KeyCode::Char('j') | KeyCode::Char('J') => {
+                                        let (bind, port) = (app.web_bind.clone(), app.web_port);
+                                        ensure_server_running(app, &shutdown, &sync_tx, &bind, port, false);
+                                    }
+                                    KeyCode::Char('j') | KeyCode::Char('J') => {
                                 app.input_mode = InputMode::SyncJoin { code: String::new() };
                             }
                             KeyCode::Char(c) if ('1'..='9').contains(&c) => {
@@ -4782,9 +5080,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                             let listen_port = app.web_port_live.load(Ordering::Relaxed);
                                             let from_addr = self_sync_addr(listen_port);
                                             let hostname = sync::device_hostname();
-                                            let (bind, port) = (app.web_bind.clone(), app.web_port);
-                                            ensure_server_running(app, &shutdown, &sync_tx, &bind, port);
-                                            let sync_tx2 = sync_tx.clone();
+                                             let (bind, port) = (app.web_bind.clone(), app.web_port);
+                                             ensure_server_running(app, &shutdown, &sync_tx, &bind, port, false);
+                                             let sync_tx2 = sync_tx.clone();
                                             let tx2 = tx.clone();
                                             app.input_mode = InputMode::Normal;
                                             app.update_state = UpdateState::Info(format!("joining {} …", peer_addr));
@@ -5338,6 +5636,24 @@ fn self_sync_addr(port: u16) -> String {
     )
 }
 
+/// R action, Normal mode and menu alike: toggle start-on-boot (install
+/// when missing, remove when present) using this session's listener
+/// address so the service serves the same page.
+fn toggle_startup(app: &mut App) {
+    if startup::is_installed() {
+        match startup::uninstall() {
+            Ok(msg) => app.update_state = UpdateState::Info(format!("startup off — {}", msg)),
+            Err(e) => app.update_state = UpdateState::Error(format!("startup remove failed: {}", e)),
+        }
+    } else {
+        let (bind, port) = (app.web_bind.clone(), app.web_port);
+        match startup::install(port, &bind) {
+            Ok(msg) => app.update_state = UpdateState::Info(format!("startup on — {}", msg)),
+            Err(e) => app.update_state = UpdateState::Error(format!("startup install failed: {}", e)),
+        }
+    }
+}
+
 /// W action, shared by Normal mode and the menu: toggle the read-only LAN
 /// page. The choice persists (`Config.serve_page`) so reboots restore it
 /// with no flags or clicks. The sync listener keeps running regardless.
@@ -5410,6 +5726,49 @@ fn open_web_page(
     true
 }
 
+/// True when a bind failure is the privileged-port wall (<1024, no
+/// permission): the fix is CAP_NET_BIND_SERVICE, which the TUI can offer
+/// to grant interactively instead of just reciting the manual command.
+fn should_offer_grant(port: u16, e: &std::io::Error) -> bool {
+    port < 1024 && e.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+/// Run `sudo setcap …` with the TUI suspended so sudo can prompt on the
+/// real terminal, then restore the TUI. Returns whether the grant landed.
+#[cfg(target_os = "linux")]
+fn run_setcap_interactive<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, exe: &str) -> bool {
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen, Show);
+    let ok = std::process::Command::new("sudo")
+        .args(["setcap", "cap_net_bind_service=+ep", exe])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let _ = enable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), EnterAlternateScreen, EnableMouseCapture, Hide);
+    let _ = terminal.clear();
+    ok
+}
+
+/// Human message for a failed listener bind. Privileged ports get the
+/// setcap fix (re-applied after every binary update); anything else is
+/// either busy range or another copy holding it.
+fn bind_hint(bind: &str, port: u16, e: &std::io::Error) -> String {
+    if port < 1024 && e.kind() == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "can't listen on {}:{} ({}). Ports below 1024 need privilege — run once: sudo setcap 'cap_net_bind_service=+ep' $(which ping-uin) (re-apply after each update), or serve a high port instead",
+            bind, port, e
+        )
+    } else {
+        format!(
+            "can't listen on {}:{}–{} ({}). Web page + sync need a free port — is another copy running?",
+            bind,
+            port,
+            port.saturating_add(web::FALLBACK_TRIES),
+            e
+        )
+    }
+}
 /// Start the shared listener if needed (page and/or sync). The page itself
 /// stays gated behind `web_enabled` — starting the listener for sync never
 /// auto-serves the website. A busy requested port falls back upward
@@ -5421,6 +5780,7 @@ fn ensure_server_running(
     sync_tx: &std::sync::mpsc::SyncSender<sync::SyncEvent>,
     bind: &str,
     port: u16,
+    page: bool,
 ) -> bool {
     if app.server_running {
         return true;
@@ -5447,13 +5807,15 @@ fn ensure_server_running(
             true
         }
         Err(e) => {
-            app.update_state = UpdateState::Error(format!(
-                "can't listen on {}:{}–{} ({}). Web page + sync need a free port — is another copy running?",
-                bind,
-                port,
-                port.saturating_add(web::FALLBACK_TRIES),
-                e
-            ));
+            // Linux privileged port: offer to grant the capability right
+            // here (sudo prompts on the suspended terminal) — the common
+            // case is an update having replaced the binary, dropping the
+            // previous grant.
+            if cfg!(target_os = "linux") && should_offer_grant(port, &e) {
+                app.input_mode = InputMode::GrantBindCap { page };
+                return false;
+            }
+            app.update_state = UpdateState::Error(bind_hint(bind, port, &e));
             false
         }
     }
@@ -5469,7 +5831,7 @@ fn ensure_tui_web_server(
     bind: &str,
     port: u16,
 ) -> Option<String> {
-    if !ensure_server_running(app, shutdown, sync_tx, bind, port) {
+    if !ensure_server_running(app, shutdown, sync_tx, bind, port, true) {
         return None;
     }
     app.web_enabled.store(true, Ordering::Relaxed);
@@ -5502,12 +5864,17 @@ fn apply_sync_event(
     let now = config::now_epoch();
     let stats = sync::merge_state(&mut config.hosts, &mut config.sync_deleted, &ev.hosts, &ev.deleted, now);
     // Mirror into runtime state: drop tombstoned hosts, upsert the rest.
+    // Matching is normalization-aware like the merge itself, and the row
+    // takes the config's spelling so the two never drift into duplicates.
     hosts.retain(|h| {
-        !config.sync_deleted.iter().any(|d| d.name == h.name && d.at > h.updated_at)
+        !config.sync_deleted.iter().any(|d| config::names_equal(&d.name, &h.name) && d.at > h.updated_at)
     });
     for entry in &config.hosts {
-        match hosts.iter_mut().find(|h| h.name == entry.name) {
-            Some(h) => h.sync_config(entry),
+        match hosts.iter_mut().find(|h| config::names_equal(&h.name, &entry.name)) {
+            Some(h) => {
+                h.name = entry.name.clone();
+                h.sync_config(entry);
+            }
             None => hosts.push(HostState::new(entry)),
         }
     }
@@ -5626,7 +5993,7 @@ fn run_serve(bind: &str, port: u16) -> io::Result<()> {
         Err(e) => {
             // Fail fast: probing without a listener means joins and page
             // views fail with no hint about the real cause (port busy?).
-            eprintln!("cannot listen on {}:{}–{} ({}). Is another copy running?", bind, port, port.saturating_add(web::FALLBACK_TRIES), e);
+            eprintln!("{}", bind_hint(bind, port, &e));
             std::process::exit(1);
         }
     };
@@ -6116,7 +6483,7 @@ fn main() -> io::Result<()> {
     // listener serves sync routes (the HTML page stays off until `W`).
     if app.config.sync_token.is_some() {
         let (bind, port) = (app.web_bind.clone(), app.web_port);
-        ensure_server_running(&mut app, &shutdown, &sync_tx, &bind, port);
+        ensure_server_running(&mut app, &shutdown, &sync_tx, &bind, port, false);
     }
     // A persisted page choice restores itself: W once means serving on
     // every boot, no flags or clicks. Runs after the sync autostart so a

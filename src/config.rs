@@ -861,6 +861,14 @@ impl Config {
     }
 }
 
+/// Host identity for matching: trimmed + case-insensitive. DNS names are
+/// case-insensitive and CSV imports accumulate whitespace/case variants, so
+/// every add/edit/import comparison goes through here — exact-match checks
+/// false-block edits whenever a near-duplicate exists.
+pub fn names_equal(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
 /// Merge one CSV import row keyed by immutable IP.
 ///
 /// Matching is trimmed + case-insensitive so `DB.internal` updates `db.internal`
@@ -874,8 +882,7 @@ impl Config {
 pub fn upsert_imported_host(hosts: &mut Vec<HostConfig>, mut entry: HostConfig) -> (usize, bool) {
     entry.touch();
     entry.name = entry.name.trim().to_string();
-    let key = entry.name.to_lowercase();
-    match hosts.iter().position(|h| h.name.trim().to_lowercase() == key) {
+    match hosts.iter().position(|h| names_equal(&h.name, &entry.name)) {
         Some(i) => {
             let muted_until = hosts[i].muted_until;
             entry.name = hosts[i].name.clone();
@@ -1091,6 +1098,15 @@ mod tests {
         // Local-only mute window survives; edit is stamped fresh for sync.
         assert_eq!(h.muted_until, Some(9_999_999_999));
         assert!(h.updated_at > 100);
+    }
+
+    #[test]
+    fn names_match_trimmed_case_insensitive() {
+        assert!(names_equal("db.internal", "db.internal"));
+        assert!(names_equal("DB.internal", "db.internal"));
+        assert!(names_equal("  db.internal  ", "db.internal"));
+        assert!(!names_equal("db.internal", "db2.internal"));
+        assert!(!names_equal("", "db.internal"));
     }
 
     #[test]

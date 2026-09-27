@@ -30,6 +30,62 @@ fn serve_args(port: u16, bind: &str) -> String {
     format!("--serve --bind {} --port {}", bind, port)
 }
 
+/// One-time command that lets the binary bind privileged ports (<1024) as a
+/// normal user. File capabilities ride the binary, so they must be
+/// re-applied after every update replaces it.
+#[allow(dead_code)] // Linux-only callers; kept portable so tests run anywhere.
+fn setcap_command(exe: &str) -> String {
+    format!("sudo setcap 'cap_net_bind_service=+ep' {}", exe)
+}
+
+/// Install/describe suffix for privileged ports; empty for high ports.
+/// `granted` is the outcome of the automatic setcap attempt (None = not
+/// attempted yet, e.g. the `describe` plan).
+#[allow(dead_code)] // Linux-only callers; kept portable so tests run anywhere.
+fn low_port_note(port: u16, exe: &str, granted: Option<bool>) -> String {
+    if port >= 1024 {
+        return String::new();
+    }
+    match granted {
+        Some(true) => format!(
+            " (cap_net_bind_service granted for port {}; re-apply after each update: {})",
+            port,
+            setcap_command(exe)
+        ),
+        Some(false) => format!(
+            " — NOTE: port {} needs privilege; run once: {} (re-apply after each update), or system-wide: sudo sysctl net.ipv4.ip_unprivileged_port_start={}",
+            port,
+            setcap_command(exe),
+            port
+        ),
+        None => format!(
+            " — port {} is privileged: install tries to grant cap_net_bind_service (root or passwordless sudo), else prints the manual command",
+            port
+        ),
+    }
+}
+
+/// Try to give the binary CAP_NET_BIND_SERVICE so a privileged port binds
+/// as a normal user. Root runs setcap directly; otherwise only passwordless
+/// sudo can help (a detached installer can't prompt for a password).
+#[cfg(target_os = "linux")]
+fn grant_bind_capability(exe: &str) -> bool {
+    const CAP: &str = "cap_net_bind_service=+ep";
+    let direct = std::process::Command::new("setcap")
+        .args([CAP, exe])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if direct {
+        return true;
+    }
+    std::process::Command::new("sudo")
+        .args(["-n", "setcap", CAP, exe])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Human-readable description of what install will do on this OS.
 pub fn describe(port: u16, bind: &str) -> String {
     let exe = current_exe_string().unwrap_or_else(|_| "ping-uin".to_string());
@@ -45,10 +101,11 @@ pub fn describe(port: u16, bind: &str) -> String {
     #[cfg(target_os = "linux")]
     {
         format!(
-            "systemd user service ~/.config/systemd/user/{}.service -> '{}' {} (enable --now; falls back to XDG autostart when systemd is unavailable)",
+            "systemd user service ~/.config/systemd/user/{}.service -> '{}' {} (enable --now; falls back to XDG autostart when systemd is unavailable){}",
             SERVICE_NAME,
             exe,
-            serve_args(port, bind)
+            serve_args(port, bind),
+            low_port_note(port, &exe, None)
         )
     }
     #[cfg(target_os = "windows")]
@@ -121,6 +178,16 @@ pub fn is_installed() -> bool {
 
 pub fn status_line() -> String {
     if is_installed() {
+        #[cfg(target_os = "linux")]
+        {
+            // Installed on disk is half the story: say whether it runs.
+            let running = if service_active() { ", running" } else { ", NOT running" };
+            match primary_path() {
+                Some(p) => format!("startup: installed ({}){}", p.display(), running),
+                None => format!("startup: installed{}", running),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         match primary_path() {
             Some(p) => format!("startup: installed ({})", p.display()),
             None => {
@@ -265,10 +332,97 @@ fn systemctl_available() -> bool {
     std::process::Command::new("systemctl").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
+/// True when this session has a user bus (plain SSH without lingering or a
+/// `su` shell may not). Without it every `systemctl --user` call fails, so
+/// install reports that plainly instead of a cryptic bus error.
+#[cfg(target_os = "linux")]
+fn user_bus_alive() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "show", "-p", "Version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Linger state for `user`: `Some(true)` on, `Some(false)` off, `None` when
+/// loginctl can't tell us. Without lingering the user manager — and our
+/// service — stops at logout, which is the classic "startup install does
+/// nothing" on headless servers.
+#[cfg(target_os = "linux")]
+fn linger_state(user: &str) -> Option<bool> {
+    let out = std::process::Command::new("loginctl")
+        .args(["show-user", user, "-p", "Linger", "--value"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_linger_value(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// Parse `loginctl ... Linger` output (`yes`/`no`, anything else unknown).
+#[cfg(target_os = "linux")]
+fn parse_linger_value(s: &str) -> Option<bool> {
+    match s {
+        "yes" => Some(true),
+        "no" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn current_user() -> Option<String> {
+    std::env::var("USER")
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .ok()
+        .or_else(|| {
+            dirs::home_dir()?
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+}
+
+/// Best-effort: enable lingering so the service survives logout. Works when
+/// already privileged (e.g. root); ordinary users get guidance instead.
+#[cfg(target_os = "linux")]
+fn try_enable_linger(user: &str) -> bool {
+    std::process::Command::new("loginctl")
+        .args(["enable-linger", user])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Parse `systemctl --user is-active` output.
+#[cfg(target_os = "linux")]
+fn parse_active_state(out: &str) -> bool {
+    out.trim() == "active"
+}
+
+#[cfg(target_os = "linux")]
+fn service_active() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", SERVICE_NAME])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map_or(false, |s| parse_active_state(&s))
+}
+
 #[cfg(target_os = "linux")]
 fn install_linux(port: u16, bind: &str) -> io::Result<String> {
     let exe = current_exe_string()?;
     let exec = format!("{} --serve --bind {} --port {}", exe, bind, port);
+    // Ports below 1024 need CAP_NET_BIND_SERVICE on the binary: try to
+    // grant it up front (root or passwordless sudo) so the service's first
+    // start can actually bind, and ride the outcome note on every message.
+    let cap_note = if port < 1024 {
+        low_port_note(port, &exe, Some(grant_bind_capability(&exe)))
+    } else {
+        String::new()
+    };
     if systemctl_available() {
         if let Some(path) = systemd_unit_path() {
             if let Some(parent) = path.parent() {
@@ -281,20 +435,53 @@ fn install_linux(port: u16, bind: &str) -> io::Result<String> {
                 exec
             );
             fs::write(&path, unit)?;
-            let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).output();
-            let enable = std::process::Command::new("systemctl").args(["--user", "enable", "--now", SERVICE_NAME]).output();
-            match enable {
-                Ok(o) if o.status.success() => return Ok(format!("installed + enabled {}", path.display())),
-                Ok(o) => {
-                    return Ok(format!(
-                        "installed {} (systemctl said: {}; start it with: systemctl --user start {})",
-                        path.display(),
-                        String::from_utf8_lossy(&o.stderr).trim(),
-                        SERVICE_NAME
-                    ));
-                }
-                Err(e) => return Ok(format!("installed {} (systemctl not run: {})", path.display(), e)),
+            if !user_bus_alive() {
+                return Ok(format!(
+                    "installed {} but no user bus here (plain SSH/su shell?) — start it with: systemctl --user start {} (needs a systemd user session){}",
+                    path.display(),
+                    SERVICE_NAME,
+                    cap_note
+                ));
             }
+            let _ = std::process::Command::new("systemctl").args(["--user", "daemon-reload"]).output();
+            let _ = std::process::Command::new("systemctl").args(["--user", "enable", SERVICE_NAME]).output();
+            // Restart, not just enable --now: a re-install with new flags
+            // (e.g. a different --port) must pick them up instead of
+            // leaving the old unit running.
+            let restarted = std::process::Command::new("systemctl")
+                .args(["--user", "restart", SERVICE_NAME])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            let mut msg = if restarted && service_active() {
+                format!("installed + running {}", path.display())
+            } else {
+                format!(
+                    "installed {} but the service didn't start — check: journalctl --user -u {}",
+                    path.display(),
+                    SERVICE_NAME
+                )
+            };
+            // Without lingering the user manager (and our service) stops at
+            // logout — the classic headless "startup does nothing".
+            match current_user().and_then(|u| linger_state(&u).map(|l| (u, l))) {
+                Some((_, true)) => {}
+                Some((user, false)) => {
+                    if try_enable_linger(&user) {
+                        msg.push_str(" (lingering enabled so it survives logout)");
+                    } else {
+                        msg.push_str(&format!(
+                            " — NOTE: lingering is off, so it stops at logout; run once as admin: sudo loginctl enable-linger {}",
+                            user
+                        ));
+                    }
+                }
+                None => {
+                    msg.push_str(" (couldn't check lingering; if it stops at logout run: sudo loginctl enable-linger $USER)");
+                }
+            }
+            msg.push_str(&cap_note);
+            return Ok(msg);
         }
     }
     // Fallback: XDG autostart (works without systemd, e.g. WSL/desktop sessions).
@@ -307,7 +494,7 @@ fn install_linux(port: u16, bind: &str) -> io::Result<String> {
             exec
         );
         fs::write(&path, desktop)?;
-        return Ok(format!("installed XDG autostart {}", path.display()));
+        return Ok(format!("installed XDG autostart {} (starts at graphical login){}", path.display(), cap_note));
     }
     Err(io::Error::new(io::ErrorKind::NotFound, "cannot determine config dir"))
 }
@@ -383,5 +570,36 @@ mod tests {
         let d = describe(8080, "0.0.0.0");
         assert!(d.contains("--serve"));
         assert!(d.contains("8080"));
+    }
+
+    #[test]
+    fn low_port_note_guides_privilege() {
+        // High ports: no note at all, whatever the grant outcome.
+        assert!(low_port_note(8080, "/usr/bin/ping-uin", None).is_empty());
+        assert!(low_port_note(8080, "/usr/bin/ping-uin", Some(false)).is_empty());
+        // Plan (not yet attempted): says a grant will be tried.
+        let plan = low_port_note(80, "/usr/bin/ping-uin", None);
+        assert!(plan.contains("cap_net_bind_service"));
+        // Granted: confirms, with the re-apply-after-update reminder.
+        let ok = low_port_note(80, "/usr/bin/ping-uin", Some(true));
+        assert!(ok.contains("granted"));
+        assert!(ok.contains("setcap"));
+        // Failed: exact manual command + the sysctl alternative.
+        let failed = low_port_note(80, "/usr/bin/ping-uin", Some(false));
+        assert!(failed.contains("sudo setcap 'cap_net_bind_service=+ep' /usr/bin/ping-uin"));
+        assert!(failed.contains("ip_unprivileged_port_start=80"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linger_and_active_parsing() {
+        assert_eq!(parse_linger_value("yes"), Some(true));
+        assert_eq!(parse_linger_value("no"), Some(false));
+        assert_eq!(parse_linger_value("maybe"), None);
+        assert_eq!(parse_linger_value(""), None);
+        assert!(parse_active_state("active\n"));
+        assert!(!parse_active_state("inactive\n"));
+        assert!(!parse_active_state("failed\n"));
+        assert!(!parse_active_state(""));
     }
 }
