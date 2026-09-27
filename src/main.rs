@@ -3294,7 +3294,9 @@ fn spawn_worker_pool(
     timeout_ms: u64,
     shutdown: Arc<AtomicBool>,
 ) -> Vec<thread::JoinHandle<()>> {
-    let (job_tx, job_rx) = mpsc::channel::<CheckJob>();
+    // Bounded queue: if every worker is wedged (hung DNS, wedged command),
+    // jobs drop-and-retry next tick instead of piling up without bound.
+    let (job_tx, job_rx) = mpsc::sync_channel::<CheckJob>(WORKER_POOL_SIZE * 2);
     let job_rx = Arc::new(std::sync::Mutex::new(job_rx));
     let mut handles = Vec::with_capacity(WORKER_POOL_SIZE + 1);
 
@@ -3372,8 +3374,19 @@ fn spawn_worker_pool(
                     due
                 };
                 for job in due {
-                    if job_tx.send(job).is_err() {
-                        break;
+                    match job_tx.try_send(job) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(job)) => {
+                            // Workers saturated: release the host so the next
+                            // tick retries it (leaving inflight set would
+                            // wedge the host forever — no worker owns it).
+                            if let Ok(mut list) = hosts.write() {
+                                if let Some(h) = list.iter_mut().find(|h| h.name == job.name) {
+                                    h.inflight = false;
+                                }
+                            }
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
                     }
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -5257,6 +5270,7 @@ fn run_serve(bind: &str, port: u16) -> io::Result<()> {
     let mut history_cache: HashMap<(String, HistoryRange), (Option<SystemTime>, HistorySummary)> = HashMap::new();
     let mut last_publish = Instant::now() - Duration::from_secs(60);
     let mut last_trim = Instant::now();
+    let mut last_report = Instant::now();
     // Headless loop: same probe handling as the TUI minus rendering.
     loop {
         match rx.recv_timeout(Duration::from_millis(500)) {
@@ -5330,6 +5344,18 @@ fn run_serve(bind: &str, port: u16) -> io::Result<()> {
             let _ = trim_log(&mut hosts, config.graph_width);
             history_cache.clear();
         }
+        // Hourly self-report (Linux RSS + thread count) so slow resource
+        // growth is visible in service logs instead of discovered via OOM.
+        if last_report.elapsed() > Duration::from_secs(3600) {
+            last_report = Instant::now();
+            println!(
+                "self-report: {} hosts, {} peers, rss {} MB, threads {}",
+                hosts.len(),
+                config.sync_peers.len(),
+                rss_mb().map_or("?".to_string(), |mb| mb.to_string()),
+                thread_count(),
+            );
+        }
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -5349,6 +5375,39 @@ fn save_serve_config(config: &Config) {
         let mut wtr = csv::Writer::from_writer(file);
         let _ = App::write_host_records(&mut wtr, &config.hosts);
     }
+}
+
+/// Resident memory in MiB, Linux only (VmRSS straight from procfs, so no
+/// page-size math and no new dependencies). Used by the hourly self-report.
+#[cfg(target_os = "linux")]
+fn rss_mb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rss_mb() -> Option<u64> {
+    None
+}
+
+/// Live thread count, Linux only (one dir entry per thread in task/).
+/// A climbing count points at connection/push-thread pileup.
+#[cfg(target_os = "linux")]
+fn thread_count() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .map(|d| d.count())
+        .unwrap_or(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thread_count() -> usize {
+    0
 }
 
 fn parse_flag_value(args: &[String], names: &[&str]) -> Option<String> {

@@ -768,6 +768,10 @@ pub fn bind_listener(bind: &str, port: u16) -> std::io::Result<TcpListener> {
     Ok(listener)
 }
 
+/// Cap on concurrent HTTP connections (page views + sync pushes). Past it,
+/// newcomers get an instant 503 instead of queueing another thread.
+pub const MAX_CONNECTIONS: usize = 64;
+
 /// Blocking serve loop over an already-bound listener. `web_enabled` gates
 /// the HTML page (sync routes are always live once a token exists);
 /// `sync_tx` carries inbound sync events to the main loop. Returns when
@@ -780,11 +784,14 @@ pub fn run_server(
     sync_tx: SyncSender<SyncEvent>,
 ) {
     let version = env!("CARGO_PKG_VERSION").to_string();
+    // Cap concurrent connections: without a cap, stalled scanners pile up
+    // one thread each. Over the cap we answer 503 and close immediately.
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // Handlers run on spawned threads; publish the channel thread-locally.
     SYNC_TX.with(|tx| *tx.borrow_mut() = Some(sync_tx.clone()));
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
-            Ok((stream, _)) => {
+            Ok((mut stream, _)) => {
                 // Accepted sockets inherit the listener's non-blocking mode
                 // on Windows, which makes the handler's first read fail
                 // instantly and drops every connection. Force blocking:
@@ -793,13 +800,33 @@ pub fn run_server(
                 if stream.set_nonblocking(false).is_err() {
                     continue;
                 }
+                // Stalled connections must not hold a thread forever (slow
+                // scanners, dead peers, half-open health checks).
+                if stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .is_err()
+                {
+                    continue;
+                }
+                let n = in_flight.fetch_add(1, Ordering::Relaxed);
+                if n >= MAX_CONNECTIONS {
+                    in_flight.fetch_sub(1, Ordering::Relaxed);
+                    let _ = stream.write_all(&http_response(
+                        "503 Service Unavailable",
+                        "text/plain; charset=utf-8",
+                        "busy\n",
+                    ));
+                    continue;
+                }
                 let page = page.clone();
                 let version = version.clone();
                 let web_enabled = web_enabled.clone();
                 let sync_tx = sync_tx.clone();
+                let in_flight = in_flight.clone();
                 thread::spawn(move || {
                     SYNC_TX.with(|tx| *tx.borrow_mut() = Some(sync_tx));
-                    handle_connection(stream, &page, &version, &web_enabled)
+                    handle_connection(stream, &page, &version, &web_enabled);
+                    in_flight.fetch_sub(1, Ordering::Relaxed);
                 });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -852,10 +879,10 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let enabled = Arc::new(AtomicBool::new(true));
         let (tx, _rx) = sync_channel::<SyncEvent>(8);
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        let listener = bind_listener("127.0.0.1", port).unwrap();
+        // Bind :0 directly (no probe-then-rebind race with parallel tests);
+        // read the assigned port back off the bound socket.
+        let listener = bind_listener("127.0.0.1", 0).unwrap();
+        let port = listener.local_addr().unwrap().port();
         let handle = start_in_background(
             page,
             listener,
