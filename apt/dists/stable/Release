@@ -1,24 +1,24 @@
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Sun, 27 Sep 2026 13:04:04 +0000
+Date: Sun, 27 Sep 2026 13:22:53 +0000
 Description: ping-uin apt archive
 Label: ping-uin
 Origin: altosaxplayer
 Suite: stable
 MD5Sum:
- 2b9703ba7f8b1e21ad664280be607558              179 Release
- 7519cf14d99129d878e8dffba291d8c7              731 main/binary-amd64/Packages
- 2eb7986e99e51813cad986201e755ea2              525 main/binary-amd64/Packages.gz
+ 87758deb3f22a5a507449143552978cc              179 Release
+ 10c50512aa612a6da5d6fc102eab6845              731 main/binary-amd64/Packages
+ d68e8128f4e45a30d47b53c03a736486              525 main/binary-amd64/Packages.gz
 SHA1:
- 8fc74f91c8754600239766daae4551d0f8fa016c              179 Release
- 6afed739bee0c9af22b9c06beb91559041eff48a              731 main/binary-amd64/Packages
- 20ab4ad487015b8aaf12b5c99aac8f3cb1813621              525 main/binary-amd64/Packages.gz
+ 38acf6566a8130ca9438ccb143bfbd73738b2b0b              179 Release
+ 19888abc7dc42152a26f43bfdc0bab3ce3b7ebeb              731 main/binary-amd64/Packages
+ 75d3c5d61d853c7a6d4ecd42c4624a5b978a0f7a              525 main/binary-amd64/Packages.gz
 SHA256:
- c70c181346006715bb6c9158dcfbc7a005d97de20ba6bdbf6adbe53b05a2a3c2              179 Release
- 20ac6711434fbe470be0054c45f0328bf9739faa31fa1ba24ddd8da0e959764d              731 main/binary-amd64/Packages
- ea8d39bca9f571cb93afe966ef18c8b13d922491eb66ad3b76463cc39d62b237              525 main/binary-amd64/Packages.gz
+ ad104f5e684201858b23bac2a3609097aac8b604a420050c7e2e14dfc9211a6c              179 Release
+ 9ee2d238e3dffac991b8a0c5ee3c5ffb9a529f29a2b40e096b7e61ce2a95b81b              731 main/binary-amd64/Packages
+ 4f704c7d820bf01950cf4d76989fc868fc3ee09775e1563ecbd0ea2db59f2406              525 main/binary-amd64/Packages.gz
 SHA512:
- d6fc787d6fdbbeb4f3f02c54bcae586c316c5c3ba774885d5ae57b473196220f7b3ab5ee83c1e146a07fb60eae62dc66b6462874e3aa335574a8d94e8684528a              179 Release
- d731fd2cfbaf6f1b4d0e5107e090a1ec749c662e0fb03343606cf97ded5f48bdfb8ea469f37147e22b65e9adf188ad0fa3abe23f3879db81ec34994cdea3c5f0              731 main/binary-amd64/Packages
- 9a788ab17cbbcb844033c4c516591ca49155fdf12dffcc0b2711f81db77ebf5f9aa9f143ed42a3bcb272acb4077119c016abfcafa589ae1a13ed5d90f334d5f2              525 main/binary-amd64/Packages.gz
+ 2903dddbbf1fccb3cfa4da9150f22140a9f9036a76b5df5eddb5c20d2ebb70a7adb31a76a1208a930100e330a6cd295335bbfb9a92a96301a26afe595a256975              179 Release
+ 14b4da12aa02aeff1002b90cd11f751f6b2318a486f6adb262e964e8dab63a407c7539ce4a13000cd859764e0b12f91d2b6df6acd80ae1986acce4aa3db42628              731 main/binary-amd64/Packages
+ 04bdb2e36ec859978945b08f70314fc42e8e508f70954dd565c1e0d2e3152eb493cf291a9812947b2d07c610c22282b2484ca83e70bd0aba1fd888ebdfd03c72              525 main/binary-amd64/Packages.gz
