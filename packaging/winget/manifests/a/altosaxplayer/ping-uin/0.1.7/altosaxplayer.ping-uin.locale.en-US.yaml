@@ -10,6 +10,7 @@ PackageName: ping-uin
 PackageUrl: https://github.com/altosaxplayer/ping-uin
 License: MIT
 LicenseUrl: https://github.com/altosaxplayer/ping-uin/blob/main/LICENSE
+PrivacyUrl: https://github.com/altosaxplayer/ping-uin/blob/main/PRIVACY.md
 ShortDescription: Btop-style TUI for monitoring IPs and hostnames
 Tags:
   - ping

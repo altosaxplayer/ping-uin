@@ -136,14 +136,19 @@ edit it by hand and import.
 
 ## Data & privacy
 
-Everything **stays local** by default. Two features intentionally talk to
-the network: the release checker (GitHub API, every 15 min) and the optional
-`webhook_url` you configure yourself for transition alerts.
+Everything **stays local** by default. The app talks to the network for
+monitoring probes against your own targets, the release checker (GitHub API,
+every 15 min), and — only if you configure them — alert webhooks, SMTP email,
+the opt-in LAN page, and paired device sync. See [PRIVACY.md](./PRIVACY.md)
+for the full accounting of what is stored and what leaves the device.
 
 ### Default location
 
-On Linux/macOS: `~/.config/ping-uin/`
+On Linux: `~/.config/ping-uin/`
+On macOS: `~/Library/Application Support/ping-uin/`
 On Windows: `%APPDATA%\ping-uin\` (usually `C:\Users\<you>\AppData\Roaming\ping-uin\`)
+
+Full details live in [PRIVACY.md](./PRIVACY.md).
 
 | File | Purpose |
 |------|---------|
