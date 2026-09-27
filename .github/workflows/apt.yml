@@ -71,6 +71,15 @@ jobs:
           gh release upload "${{ steps.tag.outputs.tag }}" target/debian/*.deb \
             --clobber --repo ${{ github.repository }}
 
+      - name: Fetch packaging files from main
+        # The tag being packaged predates the apt scaffolding (or may do so
+        # again), so always take key.asc/index.html from main, not the tag.
+        run: |
+          git fetch origin main --depth 1
+          mkdir -p /tmp/packaging-apt
+          git show FETCH_HEAD:packaging/apt/key.asc > /tmp/packaging-apt/key.asc
+          git show FETCH_HEAD:packaging/apt/index.html > /tmp/packaging-apt/index.html
+
       - name: Update apt repo on gh-pages
         env:
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
@@ -95,10 +104,10 @@ jobs:
           fi
           mkdir -p /tmp/site/apt/pool/main/p/ping-uin /tmp/site/apt/dists/stable/main/binary-amd64
           cp "$DEB" /tmp/site/apt/pool/main/p/ping-uin/
-          cp packaging/apt/key.asc /tmp/site/apt/key.asc
+          cp /tmp/packaging-apt/key.asc /tmp/site/apt/key.asc
           touch /tmp/site/.nojekyll
           if [ ! -f /tmp/site/index.html ]; then
-            cp packaging/apt/index.html /tmp/site/index.html
+            cp /tmp/packaging-apt/index.html /tmp/site/index.html
           fi
 
           # Regenerate repository metadata (multi-version pool: keep history).
