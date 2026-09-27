@@ -1,0 +1,24 @@
+Architectures: amd64
+Codename: stable
+Components: main
+Date: Sun, 27 Sep 2026 12:31:10 +0000
+Description: ping-uin apt archive
+Label: ping-uin
+Origin: altosaxplayer
+Suite: stable
+MD5Sum:
+ 1b15e2ca3d260cb9f7869b38d78514df              179 Release
+ dca82590ac28879089f3d2209bd6812b            18025 main/binary-amd64/Packages
+ 505bd4b3cbc46570fecd8cbc77a0ad75             8108 main/binary-amd64/Packages.gz
+SHA1:
+ 0223a6a7822a7165debf494c1c8a5a937eb530b9              179 Release
+ a5e537742da0b7a543ffea9d5f88659007947af0            18025 main/binary-amd64/Packages
+ 16336893f00c7bfa34ca2649a79ef689a36235ae             8108 main/binary-amd64/Packages.gz
+SHA256:
+ 27b19efad0ceec1f9cf740cf11f69ba80bcc5abd86ce791301773dcfaa88dbd0              179 Release
+ d8cfd48f64a3abffd3e8000c6c705d6bfd00019dd85202b8631dcbcd175d3e09            18025 main/binary-amd64/Packages
+ ace1dcf44f687f3338bccaf49d998e1f276077834a38a218a1f02226aa3cd2b3             8108 main/binary-amd64/Packages.gz
+SHA512:
+ b30c9da535787d75516280d1413bfc7c2381e2abeb0eb247dddb09ce339455721fc8f100d2baf5a3de628a6f1c92ea8d5ddc789341ed0c21e4ad967a71bf495b              179 Release
+ f34a354edac536aefba4ce4db662189e9cc3f624e56c1b75c922443dc9a16660a9ac8c05010ae599ef6da58ef5e6add5a8f35d25f6d0fa9b54d354b8985da8ad            18025 main/binary-amd64/Packages
+ 41d0c34e950cbc2966d2e1ed039138a266d3c48f075f91ef3c02b0a6dea09324348e4b2d26104e210108b27cc5b3bd3272fb84e3f40d8ff22af9580ae12aff37             8108 main/binary-amd64/Packages.gz
