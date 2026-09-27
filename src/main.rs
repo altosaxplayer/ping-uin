@@ -350,6 +350,163 @@ fn html_escape_owned(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Email color math (WCAG relative luminance). Email clients are hostile to
+/// dark themes — backgrounds get stripped, dark mode inverts — so emails
+/// always render on a light, client-safe canvas. Theme colors are kept for
+/// the banner, pills, and accents, but darkened until they contrast there.
+fn parse_hex_color(s: &str) -> Option<(f64, f64, f64)> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()? as f64 / 255.0;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()? as f64 / 255.0;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()? as f64 / 255.0;
+    Some((r, g, b))
+}
+
+fn channel_lum(c: f64) -> f64 {
+    if c <= 0.03928 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn luminance_hex(s: &str) -> f64 {
+    match parse_hex_color(s) {
+        Some((r, g, b)) => {
+            0.2126 * channel_lum(r) + 0.7152 * channel_lum(g) + 0.0722 * channel_lum(b)
+        }
+        None => 0.5,
+    }
+}
+
+fn contrast_ratio(a: &str, b: &str) -> f64 {
+    let (l1, l2) = (luminance_hex(a), luminance_hex(b));
+    let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+fn mix_hex(fg: &str, target: &str, t: f64) -> String {
+    let f = parse_hex_color(fg).unwrap_or((0.5, 0.5, 0.5));
+    let g = parse_hex_color(target).unwrap_or((0.0, 0.0, 0.0));
+    let m = |a: f64, b: f64| ((a + (b - a) * t).clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", m(f.0, g.0), m(f.1, g.1), m(f.2, g.2))
+}
+
+/// Darken `fg` toward black until it contrasts `bg` at `min` (or 25 tries).
+/// Our email canvas is always light, so one direction suffices.
+fn ensure_contrast(fg: &str, bg: &str, min: f64) -> String {
+    let mut out = fg.to_string();
+    for _ in 0..25 {
+        if contrast_ratio(&out, bg) >= min {
+            break;
+        }
+        out = mix_hex(&out, "#000000", 0.12);
+    }
+    out
+}
+
+/// Client-safe palette derived from the TUI theme: constant light canvas
+/// (never the theme's dark background), theme status/accent/title colors
+/// adjusted until they read on it. White or near-white theme fonts therefore
+/// always arrive darkened, never invisible.
+struct EmailPalette {
+    page: String,
+    card: String,
+    fg: String,
+    muted: String,
+    title: String,
+    accent: String,
+    divider: String,
+    status: String,
+    banner: String,
+    banner_fg: String,
+}
+
+fn email_palette(theme: &Theme, up: bool) -> EmailPalette {
+    const PAGE: &str = "#eef1f5";
+    const CARD: &str = "#ffffff";
+    let status_raw = css_hex(if up { theme.status_good } else { theme.status_danger });
+    let banner = ensure_contrast(&status_raw, "#ffffff", 3.0);
+    let banner_fg = if contrast_ratio("#ffffff", &banner) >= contrast_ratio("#1a1d21", &banner) {
+        "#ffffff".to_string()
+    } else {
+        "#1a1d21".to_string()
+    };
+    EmailPalette {
+        page: PAGE.to_string(),
+        card: CARD.to_string(),
+        fg: "#1a1d21".to_string(),
+        muted: "#5a6375".to_string(),
+        title: ensure_contrast(&css_hex(theme.title), CARD, 4.5),
+        accent: ensure_contrast(&css_hex(theme.hi_fg), CARD, 4.5),
+        divider: "#dfe3ea".to_string(),
+        status: ensure_contrast(&status_raw, CARD, 3.0),
+        banner,
+        banner_fg,
+    }
+}
+
+/// Shared modern email shell (system fonts, status pill, detail card),
+/// matching the web UI's look. Callers supply the banner kicker, headline,
+/// and label/value rows (all user strings pre-escaped by the caller).
+fn email_shell(
+    p: &EmailPalette,
+    theme_name: &str,
+    state_word: &str,
+    kicker: &str,
+    headline: &str,
+    detail: &str,
+    name_html: &str,
+    rows: &[(String, String)],
+) -> String {
+    let mut table = String::new();
+    for (label, value) in rows {
+        table.push_str(&format!(
+            "<tr><td style=\"color:{muted};padding:6px 16px 6px 0;font-size:13px;\">{label}</td>\
+             <td style=\"font-size:13px;\">{value}</td></tr>",
+            muted = p.muted,
+            label = label,
+            value = value,
+        ));
+    }
+    format!(
+        "<!DOCTYPE html><html><body style=\"margin:0;padding:0;background:{page};color:{fg};font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\">\
+        <div style=\"background:{banner};color:{banner_fg};padding:28px 24px;text-align:center;\">\
+        <div style=\"font-size:12px;font-weight:bold;letter-spacing:3px;opacity:0.9;\">PING-UIN &middot; {kicker}</div>\
+        <div style=\"font-size:30px;font-weight:800;margin-top:6px;\">\u{25cf} {state}</div>\
+        <div style=\"font-size:15px;margin-top:6px;\">{headline}</div>\
+        </div>\
+        <div style=\"padding:24px 16px;max-width:560px;margin:0 auto;\">\
+        <p style=\"color:{muted};font-size:12px;margin:0 0 16px 0;text-align:center;\">Theme: {etheme} &middot; {detail}</p>\
+        <div style=\"background:{card};border:1px solid {divider};border-radius:12px;padding:20px;\">\
+        <p style=\"margin:0 0 12px 0;font-size:15px;\"><span style=\"color:{status};font-weight:bold;border:1px solid {status};border-radius:999px;padding:3px 12px;white-space:nowrap;\">\u{25cf} {state}</span>&nbsp;&nbsp;<span style=\"color:{title};font-weight:bold;font-size:17px;\">{name}</span></p>\
+        <table style=\"color:{fg};border-collapse:collapse;width:100%;\">{table}</table>\
+        </div>\
+        <p style=\"color:{accent};font-size:12px;margin:16px 0 0 0;text-align:center;\">Sent by ping-uin &middot; ((&bull;O&bull;)) watching over your network</p>\
+        </div></body></html>",
+        page = p.page,
+        fg = p.fg,
+        banner = p.banner,
+        banner_fg = p.banner_fg,
+        kicker = kicker,
+        state = state_word,
+        headline = headline,
+        muted = p.muted,
+        etheme = html_escape_owned(theme_name),
+        detail = detail,
+        card = p.card,
+        divider = p.divider,
+        status = p.status,
+        title = p.title,
+        name = name_html,
+        accent = p.accent,
+        table = table,
+    )
+}
+
 /// Build a theme-styled (subject, plain-text, HTML) alert email.
 ///
 /// The status is unmissable by design: a full-width banner in the theme's
@@ -376,18 +533,6 @@ fn build_alert_email(
             display_name, consecutive_failures, target
         )
     };
-    let banner_bg = css_hex(if up { theme.status_good } else { theme.status_danger });
-    // Pick readable banner text: light themes get dark text, dark get white.
-    let banner_fg = if theme.name == "ayu-light" { "#1a1d21" } else { "#ffffff" };
-    let bg = css_hex(theme.main_bg);
-    let fg = css_hex(theme.main_fg);
-    let title_c = css_hex(theme.title);
-    let accent = css_hex(theme.hi_fg);
-    let muted = css_hex(theme.inactive_fg);
-    let divider = css_hex(theme.divider);
-    let card = css_hex(theme.popup_bg);
-    let status_c = css_hex(if up { theme.status_good } else { theme.status_danger });
-    let dot = if up { "●" } else { "●" };
     let headline = if up {
         "Back online — recovery confirmed"
     } else {
@@ -403,7 +548,6 @@ fn build_alert_email(
     let e_target = html_escape_owned(target);
     let e_group = html_escape_owned(group);
     let e_time = html_escape_owned(timestamp);
-    let e_theme = html_escape_owned(theme.name);
 
     let text = format!(
         "ping-uin [{theme}] {state} — {name} ({target})\n\
@@ -418,48 +562,25 @@ fn build_alert_email(
         detail = detail_line,
         group = group,
     );
-    let html = format!(
-        "<!DOCTYPE html><html><body style=\"margin:0;padding:0;background:{bg};color:{fg};font-family:monospace,monospace;\">\
-        <div style=\"background:{banner};color:{banner_fg};padding:20px 24px;text-align:center;\">\
-        <div style=\"font-size:28px;font-weight:bold;letter-spacing:2px;\">{dot} {state}</div>\
-        <div style=\"font-size:15px;margin-top:4px;\">{headline}</div>\
-        </div>\
-        <div style=\"padding:24px;max-width:560px;margin:0 auto;\">\
-        <h1 style=\"color:{title};margin:0 0 4px 0;font-size:22px;\">((&bull;O&bull;)) ping-uin alert</h1>\
-        <p style=\"color:{muted};font-size:12px;margin:0 0 16px 0;\">Theme: {etheme} &middot; {etime}</p>\
-        <div style=\"background:{card};border:1px solid {divider};border-radius:8px;padding:16px;\">\
-        <p style=\"font-size:16px;margin:0 0 8px 0;\"><span style=\"color:{status};font-weight:bold;\">{dot} {state}</span>\
-         &nbsp;<span style=\"color:{title};font-weight:bold;\">{ename}</span></p>\
-        <table style=\"font-size:13px;color:{fg};border-collapse:collapse;\">\
-        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Target</td><td>{etarget}</td></tr>\
-        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Group</td><td>{egroup}</td></tr>\
-        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">When</td><td>{etime}</td></tr>\
-        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Latency</td><td>{lat}</td></tr>\
-        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Streak</td><td>{streak} consecutive failures</td></tr>\
-        </table>\
-        </div>\
-        <p style=\"color:{accent};font-size:12px;margin:16px 0 0 0;\">Sent by ping-uin &middot; ((&bull;O&bull;)) watching over your network</p>\
-        </div></body></html>",
-        bg = bg,
-        fg = fg,
-        title = title_c,
-        muted = muted,
-        banner = banner_bg,
-        banner_fg = banner_fg,
-        dot = dot,
-        state = state_word,
-        headline = html_escape_owned(headline),
-        etheme = e_theme,
-        etime = e_time,
-        card = card,
-        divider = divider,
-        status = status_c,
-        ename = e_name,
-        etarget = e_target,
-        egroup = e_group,
-        lat = if up { format!("{:.0} ms", latency_ms) } else { "&mdash;".to_string() },
-        streak = consecutive_failures,
-        accent = accent,
+    let pal = email_palette(theme, up);
+    let html = email_shell(
+        &pal,
+        theme.name,
+        state_word,
+        if up { "RECOVERY" } else { "ALERT" },
+        &html_escape_owned(headline),
+        &format!("{} · {}", e_time, if up { format!("last latency {:.0} ms", latency_ms) } else { format!("{} consecutive failures", consecutive_failures) }),
+        &e_name,
+        &[
+            ("Target".to_string(), e_target),
+            ("Group".to_string(), e_group),
+            ("When".to_string(), e_time),
+            (
+                "Latency".to_string(),
+                if up { format!("{:.0} ms", latency_ms) } else { "&mdash;".to_string() },
+            ),
+            ("Streak".to_string(), format!("{} consecutive failures", consecutive_failures)),
+        ],
     );
     (subject, text, html)
 }
@@ -474,7 +595,7 @@ fn build_escalation_email(
     group: &str,
     level: u8,
     consecutive_failures: u32,
-    latency_ms: f64,
+    _latency_ms: f64,
     timestamp: &str,
 ) -> (String, String, String) {
     let age = if level >= 2 { "30m" } else { "5m" };
@@ -482,16 +603,6 @@ fn build_escalation_email(
         "[ping-uin] {} still DOWN after {} ({})",
         display_name, age, target
     );
-    let banner_bg = css_hex(theme.status_danger);
-    let banner_fg = if theme.name == "ayu-light" { "#1a1d21" } else { "#ffffff" };
-    let bg = css_hex(theme.main_bg);
-    let fg = css_hex(theme.main_fg);
-    let title_c = css_hex(theme.title);
-    let accent = css_hex(theme.hi_fg);
-    let muted = css_hex(theme.inactive_fg);
-    let divider = css_hex(theme.divider);
-    let card = css_hex(theme.popup_bg);
-    let status_c = css_hex(theme.status_danger);
     let headline = format!("Still down after {} — escalation", age);
     let detail_line = format!(
         "Failing since before {} · {} consecutive failures",
@@ -501,8 +612,6 @@ fn build_escalation_email(
     let e_target = html_escape_owned(target);
     let e_group = html_escape_owned(group);
     let e_time = html_escape_owned(timestamp);
-    let e_theme = html_escape_owned(theme.name);
-    let _ = latency_ms;
 
     let text = format!(
         "ping-uin [{theme}] DOWN (still down after {age}) — {name} ({target})\n\
@@ -517,45 +626,21 @@ fn build_escalation_email(
         detail = detail_line,
         group = group,
     );
-    let html = format!(
-        "<!DOCTYPE html><html><body style=\"margin:0;padding:0;background:{bg};color:{fg};font-family:monospace,monospace;\">\
-        <div style=\"background:{banner};color:{banner_fg};padding:20px 24px;text-align:center;\">\
-        <div style=\"font-size:28px;font-weight:bold;letter-spacing:2px;\">● DOWN — STILL DOWN {age}</div>\
-        <div style=\"font-size:15px;margin-top:4px;\">{headline}</div>\
-        </div>\
-        <div style=\"padding:24px;max-width:560px;margin:0 auto;\">\
-        <h1 style=\"color:{title};margin:0 0 4px 0;font-size:22px;\">((&bull;O&bull;)) ping-uin escalation</h1>\
-        <p style=\"color:{muted};font-size:12px;margin:0 0 16px 0;\">Theme: {etheme} &middot; {etime}</p>\
-        <div style=\"background:{card};border:1px solid {divider};border-radius:8px;padding:16px;\">\
-        <p style=\"font-size:16px;margin:0 0 8px 0;\"><span style=\"color:{status};font-weight:bold;\">● DOWN</span>\
-         &nbsp;<span style=\"color:{title};font-weight:bold;\">{ename}</span></p>\
-        <table style=\"font-size:13px;color:{fg};border-collapse:collapse;\">\
-        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Target</td><td>{etarget}</td></tr>\
-        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Group</td><td>{egroup}</td></tr>\
-        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">When</td><td>{etime}</td></tr>\
-        <tr><td style=\"color:{muted};padding:2px 12px 2px 0;\">Streak</td><td>{streak} consecutive failures</td></tr>\
-        </table>\
-        </div>\
-        <p style=\"color:{accent};font-size:12px;margin:16px 0 0 0;\">Sent by ping-uin &middot; ((&bull;O&bull;)) watching over your network</p>\
-        </div></body></html>",
-        bg = bg,
-        fg = fg,
-        title = title_c,
-        muted = muted,
-        banner = banner_bg,
-        banner_fg = banner_fg,
-        age = age,
-        headline = html_escape_owned(&headline),
-        etheme = e_theme,
-        etime = e_time,
-        card = card,
-        divider = divider,
-        status = status_c,
-        ename = e_name,
-        etarget = e_target,
-        egroup = e_group,
-        streak = consecutive_failures,
-        accent = accent,
+    let pal = email_palette(theme, false);
+    let html = email_shell(
+        &pal,
+        theme.name,
+        "DOWN",
+        &format!("ESCALATION — STILL DOWN {}", age),
+        &html_escape_owned(&headline),
+        &format!("{} · {} consecutive failures", e_time, consecutive_failures),
+        &e_name,
+        &[
+            ("Target".to_string(), e_target),
+            ("Group".to_string(), e_group),
+            ("When".to_string(), e_time),
+            ("Streak".to_string(), format!("{} consecutive failures", consecutive_failures)),
+        ],
     );
     (subject, text, html)
 }
@@ -621,6 +706,20 @@ mod tests {
     }
 
     #[test]
+    fn menu_status_rows_show_on_off() {
+        let theme = build_themes().into_iter().next().unwrap();
+        let on = status_row(true, "web page", "on — x".to_string(), &theme);
+        let off = status_row(false, "web page", "off — press W".to_string(), &theme);
+        // Green dot when on, dim when off; text always present.
+        assert_eq!(on.spans[1].style.fg, Some(theme.status_good));
+        assert_eq!(off.spans[1].style.fg, Some(theme.inactive_fg));
+        assert!(on.spans[3].content.contains("on — x"));
+        assert!(off.spans[3].content.contains("off — press W"));
+        assert_eq!(on_off(true), "on");
+        assert_eq!(on_off(false), "off");
+    }
+
+    #[test]
     fn popup_rect_fits_content_and_clamps_to_area() {
         use ratatui::layout::Rect;
         // Normal: centered box of the requested size.
@@ -680,6 +779,39 @@ mod tests {
     }
 
     #[test]
+    fn email_contrast_math() {
+        // Black on white is the max ratio; same-color is 1.
+        assert!((contrast_ratio("#000000", "#ffffff") - 21.0).abs() < 0.1);
+        assert!((contrast_ratio("#ffffff", "#ffffff") - 1.0).abs() < 0.01);
+        // Light-on-white gets darkened to a passing ratio.
+        let fixed = ensure_contrast("#f9f871", "#ffffff", 4.5);
+        assert!(contrast_ratio(&fixed, "#ffffff") >= 4.5, "fixed={}", fixed);
+        // Already-passing colors survive untouched.
+        assert_eq!(ensure_contrast("#1a1d21", "#ffffff", 4.5), "#1a1d21");
+    }
+
+    #[test]
+    fn email_palette_is_client_safe_for_every_theme() {
+        for theme in build_themes() {
+            for up in [false, true] {
+                let p = email_palette(&theme, up);
+                // Never a dark canvas, however dark the theme.
+                assert!(luminance_hex(&p.page) > 0.5, "theme {} page too dark", theme.name);
+                assert!(luminance_hex(&p.card) > 0.5, "theme {} card too dark", theme.name);
+                // Body text always readable; accents/titles pass AA.
+                assert!(contrast_ratio(&p.fg, &p.card) >= 7.0, "theme {}", theme.name);
+                assert!(contrast_ratio(&p.title, &p.card) >= 4.5, "theme {}", theme.name);
+                assert!(contrast_ratio(&p.accent, &p.card) >= 4.5, "theme {}", theme.name);
+                // Banner badge stays bold-readable in white or dark ink.
+                let ink = contrast_ratio("#ffffff", &p.banner)
+                    .max(contrast_ratio("#1a1d21", &p.banner));
+                assert!(ink >= 3.0, "theme {} banner unreadable", theme.name);
+                assert_eq!(p.banner_fg, if contrast_ratio("#ffffff", &p.banner) >= contrast_ratio("#1a1d21", &p.banner) { "#ffffff" } else { "#1a1d21" });
+            }
+        }
+    }
+
+    #[test]
     fn alert_email_banner_shows_status_and_theme() {
         for theme in build_themes() {
             let (subj_down, text_down, html_down) =
@@ -687,14 +819,18 @@ mod tests {
             assert!(subj_down.contains("DOWN"), "theme {}", theme.name);
             assert!(text_down.contains("DOWN") && text_down.contains(theme.name));
             assert!(html_down.contains("DOWN") && html_down.contains(theme.name));
-            // Banner uses the theme's own danger color.
-            assert!(html_down.contains(&css_hex(theme.status_danger)), "theme {}", theme.name);
+            // Status color comes from the contrast-safe palette (a darkened
+            // theme danger on the light canvas), never a dark page.
+            let pal = email_palette(&theme, false);
+            assert!(html_down.contains(&pal.status), "theme {}", theme.name);
+            assert!(!html_down.contains(&css_hex(theme.main_bg)) || luminance_hex(&css_hex(theme.main_bg)) > 0.4, "theme {}", theme.name);
             let (subj_up, text_up, html_up) =
                 build_alert_email(&theme, "DB host", "db:5432", "databases", true, 0, 12.0, "2026-01-01 00:05:00");
             assert!(subj_up.contains("UP"), "theme {}", theme.name);
             assert!(text_up.contains("UP"));
             assert!(html_up.contains("UP") && !html_up.contains("DOWN"));
-            assert!(html_up.contains(&css_hex(theme.status_good)), "theme {}", theme.name);
+            let pal_up = email_palette(&theme, true);
+            assert!(html_up.contains(&pal_up.status), "theme {}", theme.name);
         }
     }
 
@@ -732,9 +868,10 @@ mod tests {
                 );
                 assert!(subj.contains("still DOWN") && subj.contains(age), "theme {}", theme.name);
                 assert!(text.contains(age) && text.contains("DOWN"));
-                // Unmissable DOWN banner in the theme's danger color; never UP.
+                // Unmissable DOWN banner in the palette status color; never UP.
                 assert!(html.contains("STILL DOWN"), "theme {}", theme.name);
-                assert!(html.contains(&css_hex(theme.status_danger)), "theme {}", theme.name);
+                let pal = email_palette(&theme, false);
+                assert!(html.contains(&pal.status), "theme {}", theme.name);
                 assert!(!html.contains("● UP"), "theme {}", theme.name);
             }
         }
@@ -1049,6 +1186,12 @@ struct App {
     /// Port actually won (first free at/after `web_port`). Everything
     /// user-facing — page URLs, join codes, push callbacks — uses this.
     web_port_live: Arc<std::sync::atomic::AtomicU16>,
+    /// When this process started. Drives the uptime readout in the stats
+    /// bar (and the web page mirrors it).
+    started: Instant,
+    /// Wall-clock twin of `started`, published to the web page once so it
+    /// can render app uptime without any clock of its own.
+    started_unix: i64,
 }
 
 impl App {
@@ -1258,19 +1401,36 @@ impl App {
     /// (case-insensitive); all other fields come from the row. See
     /// `config::upsert_imported_host`.
     fn import_entries(&mut self, path: &std::path::Path, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
-        if let Ok(entries) = read_entries_csv(path) {
-            for entry in entries {
-                let (i, is_new) = config::upsert_imported_host(&mut self.config.hosts, entry);
-                if is_new {
-                    self.hosts.push(HostState::new(&self.config.hosts[i]));
-                } else if let Some(h) = self.hosts.get_mut(i) {
-                    h.sync_config(&self.config.hosts[i]);
+        match read_entries_csv(path) {
+            Ok(entries) => {
+                let (mut added, mut updated) = (0usize, 0usize);
+                for entry in entries {
+                    let (i, is_new) = config::upsert_imported_host(&mut self.config.hosts, entry);
+                    if is_new {
+                        added += 1;
+                        self.hosts.push(HostState::new(&self.config.hosts[i]));
+                    } else {
+                        updated += 1;
+                        if let Some(h) = self.hosts.get_mut(i) {
+                            h.sync_config(&self.config.hosts[i]);
+                        }
+                    }
                 }
+                self.history_cache.clear();
+                self.persist();
+                if let Ok(mut h) = shared_hosts.write() {
+                    *h = schedules_from_config(&self.config.hosts);
+                }
+                self.update_state = UpdateState::Info(format!(
+                    "imported {} hosts ({} new, {} updated)",
+                    added + updated,
+                    added,
+                    updated
+                ));
             }
-            self.history_cache.clear();
-            self.persist();
-            if let Ok(mut h) = shared_hosts.write() {
-                *h = schedules_from_config(&self.config.hosts);
+            Err(e) => {
+                self.update_state =
+                    UpdateState::Error(format!("couldn't read {}: {}", path.display(), e));
             }
         }
     }
@@ -1303,7 +1463,7 @@ impl App {
                 .map_or(true, |t| t < 1 || t > 100)
         {
             self.update_state =
-                UpdateState::Info("fail threshold must be 1-100".to_string());
+                UpdateState::Info("failures must be 1-100".to_string());
             self.input_mode = InputMode::SmtpForm(form);
             return;
         }
@@ -1313,7 +1473,7 @@ impl App {
                 || form.to.trim().is_empty())
         {
             self.update_state = UpdateState::Info(
-                "smtp needs host, from, and to when enabled".to_string(),
+                "needs host, from + to to enable".to_string(),
             );
             self.input_mode = InputMode::SmtpForm(form);
             return;
@@ -1322,9 +1482,9 @@ impl App {
         self.persist();
         self.input_mode = InputMode::Normal;
         let msg = match &self.config.smtp {
-            Some(s) if s.is_configured() => "smtp email alerts saved",
-            Some(_) => "smtp saved (disabled — enable with y)",
-            None => "smtp email alerts disabled",
+            Some(s) if s.is_configured() => "email alerts saved",
+            Some(_) => "saved (off — set enabled to y)",
+            None => "email alerts off",
         };
         self.update_state = UpdateState::Info(msg.to_string());
     }
@@ -1339,10 +1499,10 @@ impl App {
         let now = config::now_epoch();
         if entry.mute_remaining_secs(now) > 0 {
             entry.muted_until = None;
-            self.update_state = UpdateState::Info("host unmuted".to_string());
+            self.update_state = UpdateState::Info("unmuted".to_string());
         } else {
             entry.muted_until = Some(now + 3600);
-            self.update_state = UpdateState::Info("host muted for 1h".to_string());
+            self.update_state = UpdateState::Info("muted 1h".to_string());
         }
         entry.touch();
         self.persist();
@@ -1619,6 +1779,34 @@ fn popup_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// Width for a proportional popup in cells, clamped to `area`.
 fn popup_width(percent: u16, area: Rect) -> u16 {
     (area.width.saturating_mul(percent) / 100).clamp(1, area.width.max(1))
+}
+
+/// One status row for the menu: a green dot + value when on, dim when off.
+fn status_row(on: bool, label: &'static str, value: String, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "● ",
+            Style::default().fg(if on { theme.status_good } else { theme.inactive_fg }),
+        ),
+        Span::styled(
+            format!("{:<14}", label),
+            Style::default().fg(if on { theme.main_fg } else { theme.inactive_fg }),
+        ),
+        Span::styled(
+            value,
+            Style::default().fg(if on { theme.main_fg } else { theme.inactive_fg }),
+        ),
+    ])
+}
+
+/// Short on/off word (no extra prose — the dot carries it).
+fn on_off(on: bool) -> &'static str {
+    if on {
+        "on"
+    } else {
+        "off"
+    }
 }
 
 /// btop-style hotkey hint: [ key ]  with divider brackets + hi_fg key
@@ -2374,6 +2562,31 @@ fn ui(frame: &mut Frame, app: &mut App) {
             Style::default().fg(theme.inactive_fg),
         ));
     }
+    // Sync pulse: persistent home for sync state, right in the stats bar —
+    // no popups. Shows peer count + freshest contact; dim when stale.
+    // Hidden entirely when sync was never set up.
+    if app.config.sync_token.is_some() || !app.config.sync_peers.is_empty() {
+        let now = config::now_epoch();
+        let n = app.config.sync_peers.len();
+        let last = app.config.sync_peers.iter().map(|p| p.last_sync).max().unwrap_or(0);
+        let fresh = now - last < 120;
+        let text = if n == 0 {
+            "  ⇄ sync on — no peers yet".to_string()
+        } else if last <= 0 {
+            format!("  ⇄ {} peer{} — never synced", n, if n == 1 { "" } else { "s" })
+        } else {
+            format!(
+                "  ⇄ {} peer{} · {}",
+                n,
+                if n == 1 { "" } else { "s" },
+                sync::ago(last, now)
+            )
+        };
+        stats_spans.push(Span::styled(
+            text,
+            Style::default().fg(if fresh { theme.hi_fg } else { theme.inactive_fg }),
+        ));
+    }
     if let Some(q) = app.search.as_deref().filter(|q| !q.trim().is_empty()) {
         stats_spans.push(Span::styled(
             format!("  ·  /{}", q),
@@ -2381,15 +2594,17 @@ fn ui(frame: &mut Frame, app: &mut App) {
         ));
     }
     let stats_line = Line::from(stats_spans);
+    let uptime = config::format_duration(app.started.elapsed().as_secs());
     let stats_right = Line::from(vec![
         Span::styled(format!("v{} ", env!("CARGO_PKG_VERSION")), Style::default().fg(theme.inactive_fg)),
+        Span::styled(format!("up {} ", uptime), Style::default().fg(theme.hi_fg)),
         Span::styled(now, Style::default().fg(theme.inactive_fg)),
         Span::styled(" · ", Style::default().fg(theme.divider)),
         Span::styled(theme.name, Style::default().fg(theme.hi_fg)),
     ]);
     let stats_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(30), Constraint::Length(30)])
+        .constraints([Constraint::Min(30), Constraint::Length(40)])
         .split(stats_inner);
     frame.render_widget(Paragraph::new(Text::from(stats_line)), stats_layout[0]);
     frame.render_widget(Paragraph::new(Text::from(stats_right)).alignment(Alignment::Right), stats_layout[1]);
@@ -2502,7 +2717,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 InputMode::AddHost(_) => Text::from(Line::from(vec![
                     Span::styled("Add host", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
-                    Span::raw("[Tab]/[↑↓] move field   [Enter] add   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                    Span::raw("[Tab] next field   [Enter] add   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
                 ])),
                 InputMode::SortPicker { .. } => Text::from(Line::from(vec![
                     Span::styled("View", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
@@ -2522,7 +2737,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 InputMode::EditEntry { ref original, .. } => Text::from(Line::from(vec![
                     Span::styled(format!("Edit {}", original), Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
-                    Span::raw("[Tab]/[↑↓] move field   [Enter] save   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                    Span::raw("[Tab] next field   [Enter] save   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
                 ])),
                 InputMode::ConfirmDelete => {
                     let name = app.hosts.get(app.selected_idx).map(|h| h.name.clone()).unwrap_or_default();
@@ -2550,12 +2765,12 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 InputMode::SmtpForm(_) => Text::from(Line::from(vec![
                     Span::styled("Email alerts", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
-                    Span::raw("[Tab]/[↑↓] move field   [Enter] save   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
+                    Span::raw("[Tab] next field   [Enter] save   [Esc] cancel").style(Style::default().fg(theme.inactive_fg)),
                 ])),
                 InputMode::MenuModal => Text::from(Line::from(vec![
                     Span::styled("Menu", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
-                    Span::raw("[Esc/M] close").style(Style::default().fg(theme.inactive_fg)),
+                    Span::raw("[W/B/Y/R] act   [Esc/M] close").style(Style::default().fg(theme.inactive_fg)),
                 ])),
                 InputMode::KeysHelp => Text::from(Line::from(vec![
                     Span::styled("Keys", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
@@ -2573,7 +2788,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 InputMode::SyncMenu => Text::from(Line::from(vec![
                     Span::styled("Device sync", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                     Span::raw("   "),
-                    Span::raw("[g] new code   [j] join   [1-9] forget peer   [Esc] close").style(Style::default().fg(theme.inactive_fg)),
+                    Span::raw("[g] new code   [j] join   [1-9] forget   [Esc] close").style(Style::default().fg(theme.inactive_fg)),
                 ])),
                 InputMode::SyncJoin { ref code } => {
                     let q = if code.is_empty() { " ".to_string() } else { format!("{}▌", code) };
@@ -2667,8 +2882,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 "from",
                 "to (comma-sep)",
                 "TLS (y/n)",
-                "fails for DOWN",
-                "escalations?",
+                "fails before mail",
+                "still-down mails?",
             ];
             let values = [
                 &form.enabled,
@@ -2692,10 +2907,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 "ops@example.com",
                 "y",
                 "3",
-                "y = 5m/30m mail",
+                "y = reminders too",
             ];
             let mut lines: Vec<Line> = vec![
-                Line::from("DOWN after N fails + UP recovery, themed like this TUI.")
+                Line::from("Mails you when hosts go down and recover.")
                     .style(Style::default().fg(theme.inactive_fg)),
                 Line::from(""),
             ];
@@ -2976,26 +3191,27 @@ fn ui(frame: &mut Frame, app: &mut App) {
         InputMode::MenuModal => {
             let menu_hints = vec![
                 ("Space", "ping now"),
-                ("a", "add host"),
-                ("d", "delete host"),
-                ("e", "edit host"),
+                ("a", "add"),
+                ("d", "delete"),
+                ("e", "edit"),
                 ("h", "history"),
-                ("c", "clear stats"),
-                ("i", "import"),
-                ("E", "export"),
-                ("W", "web page on/off (opt-in)"),
-                ("B", "open page in browser"),
-                ("Y", "device sync"),
-                ("g", "group"),
-                ("f", "filter group"),
-                ("s", "view/sort"),
+                ("c", "clear"),
+                ("i", "import CSV"),
+                ("E", "export CSV"),
+                ("W", "web page on/off"),
+                ("B", "open in browser"),
+                ("Y", "sync devices"),
+                ("R", "start on boot"),
+                ("g", "grouped"),
+                ("f", "filter"),
+                ("s", "sort"),
                 ("/", "search"),
-                ("?", "keys"),
-                ("Enter", "collapse group"),
+                ("?", "all keys"),
+                ("Enter", "collapse"),
                 ("!", "mute 1h"),
-                ("v", "compact"),
+                ("v", "compact rows"),
                 ("t", "theme"),
-                ("o", "email alerts"),
+                ("o", "email"),
                 ("u", "update"),
                 ("q", "quit"),
             ];
@@ -3017,25 +3233,58 @@ fn ui(frame: &mut Frame, app: &mut App) {
             }
             let _ = rows;
             lines.push(Line::from(""));
-            // Live opt-in status: web serving is W-toggled, startup install
-            // is an explicit CLI action — neither ever happens on its own.
-            let web_line = match &app.web_url {
-                Some(urls) => format!("web: serving on {} — W hides it, B opens it in your browser", urls),
-                None => "web: off (opt-in) — W serves this session, B serves + opens it".to_string(),
+            // Live status: every toggle in one glance — green dot + value
+            // when on, dim when off. No guessing, no popups to open.
+            lines.push(Line::from(Span::styled(
+                "  status",
+                Style::default().fg(theme.inactive_fg),
+            )));
+            let web_on = app.web_url.is_some();
+            let web_value = if web_on {
+                format!("on — {}", primary_web_url(app.web_url.as_deref().unwrap_or("")))
+            } else {
+                "off — press W".to_string()
             };
+            lines.push(status_row(web_on, "web page", web_value, &theme));
+            let sync_on = app
+                .config
+                .sync_token
+                .as_deref()
+                .map_or(false, |t| !t.is_empty());
+            let peer_count = app.config.sync_peers.len();
+            lines.push(status_row(
+                sync_on,
+                "device sync",
+                if !sync_on {
+                    "off — press Y".to_string()
+                } else if peer_count == 0 {
+                    "on — no devices yet".to_string()
+                } else {
+                    format!("on — {} paired", peer_count)
+                },
+                &theme,
+            ));
+            let boot_on = startup::is_installed();
+            lines.push(status_row(
+                boot_on,
+                "start on boot",
+                if boot_on { "on".to_string() } else { "off — press R".to_string() },
+                &theme,
+            ));
+            lines.push(status_row(app.group_by, "grouped view", on_off(app.group_by).to_string(), &theme));
+            lines.push(status_row(app.compact, "compact rows", on_off(app.compact).to_string(), &theme));
+            let filter = app.group_filter.clone().unwrap_or_else(|| "all".to_string());
+            let search = app.search.clone().filter(|q| !q.trim().is_empty()).unwrap_or_else(|| "off".to_string());
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(web_line, Style::default().fg(theme.hi_fg)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::raw("  "),
+                Span::styled("● ", Style::default().fg(theme.hi_fg)),
                 Span::styled(
-                    format!("{} (opt-in CLI: --install-startup / --uninstall-startup)", startup::status_line()),
-                    Style::default().fg(theme.inactive_fg),
+                    format!("sort: {}   filter: {}   search: {}", app.sort_mode.label(), filter, search),
+                    Style::default().fg(theme.main_fg),
                 ),
             ]));
             lines.push(Line::from(""));
-            lines.push(Line::from("[Esc/M] close").style(Style::default().fg(theme.inactive_fg)));
+            lines.push(Line::from("[W/B/Y/R] act   [Esc/M] close").style(Style::default().fg(theme.inactive_fg)));
             let popup_area = popup_rect(popup_width(60, area), lines.len() as u16 + 2, area);
             let max_lines = popup_area.height.saturating_sub(2) as usize;
             if lines.len() > max_lines {
@@ -3054,11 +3303,11 @@ fn ui(frame: &mut Frame, app: &mut App) {
         }
         InputMode::KeysHelp => {
             let sections: Vec<(&str, Vec<(&str, &str)>)> = vec![
-                ("navigate", vec![("↑/↓", "select"), ("Enter", "collapse group"), ("g", "grouped/flat"), ("v", "compact")]),
-                ("hosts", vec![("a", "add"), ("e", "edit"), ("d", "delete"), ("c", "clear stats"), ("!", "mute 1h")]),
-                ("inspect", vec![("h", "history"), ("Tab", "compare"), ("s", "view/sort"), ("f", "filter group"), ("/", "search")]),
-                ("run", vec![("Space/p", "ping now"), ("i", "import csv"), ("E", "export csv"), ("W", "web on/off"), ("B", "open page"), ("Y", "sync")]),
-                ("app", vec![("t", "theme"), ("o", "email"), ("u", "update"), ("M", "menu"), ("?", "this help"), ("q", "quit"), ("Esc", "reset view")]),
+                ("navigate", vec![("↑/↓", "select"), ("Enter", "collapse"), ("g", "grouped"), ("v", "compact rows")]),
+                ("hosts", vec![("a", "add"), ("e", "edit"), ("d", "delete"), ("c", "clear"), ("!", "mute 1h")]),
+                ("inspect", vec![("h", "history"), ("Tab", "compare"), ("s", "sort"), ("f", "filter"), ("/", "search")]),
+                ("run", vec![("Space/p", "ping now"), ("i", "import"), ("E", "export"), ("W", "web on/off"), ("B", "browser"), ("Y", "sync")]),
+                ("app", vec![("t", "theme"), ("o", "email"), ("u", "update"), ("M", "menu"), ("R", "startup"), ("?", "help"), ("q", "quit"), ("Esc", "reset view")]),
             ];
             // Row-based box like the menu: width first (rows flow-pack to it),
             // then height from the packed line count. Same small-window bug
@@ -3130,7 +3379,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             let mut lines = vec![
                 Line::from(""),
                 Line::from("Pair devices with a join code — no discovery, no accounts.").style(Style::default().fg(theme.inactive_fg)),
-                Line::from("Adds, edits, and removals sync both ways about once a minute.").style(Style::default().fg(theme.inactive_fg)),
+                Line::from("Adds, edits and deletes sync about once a minute.").style(Style::default().fg(theme.inactive_fg)),
                 Line::from(""),
             ];
             match app.config.sync_token.as_deref().filter(|t| !t.is_empty()) {
@@ -3184,7 +3433,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
             }).style(Style::default().fg(theme.inactive_fg)));
             lines.push(Line::from("  joins failing? same Wi-Fi, allow ping-uin through the firewall, IP in the code must be pingable.").style(Style::default().fg(theme.inactive_fg)));
             lines.push(Line::from(""));
-            lines.push(Line::from("[g] new code   [j] join with code   [1-9] forget peer   [Esc] close").style(Style::default().fg(theme.inactive_fg)));
+            lines.push(Line::from("[g] new code   [j] join   [1-9] forget   [Esc] close").style(Style::default().fg(theme.inactive_fg)));
             let popup_area = popup_rect(popup_width(72, area), lines.len() as u16 + 2, area);
             let max_lines = popup_area.height.saturating_sub(2) as usize;
             if lines.len() > max_lines {
@@ -3662,10 +3911,10 @@ fn spawn_one_shot_update_check(tx: mpsc::Sender<Message>, current_version: Strin
                 let _ = tx.send(Message::UpdateState(UpdateState::Info(format!("v{} available — press u again to install", latest))));
             }
             Some(_) => {
-                let _ = tx.send(Message::UpdateState(UpdateState::Info(format!("already on latest (v{})", current_version))));
+                let _ = tx.send(Message::UpdateState(UpdateState::Info(format!("already up to date (v{})", current_version))));
             }
             None => {
-                let _ = tx.send(Message::UpdateState(UpdateState::Error("update check failed: no network or API error".to_string())));
+                let _ = tx.send(Message::UpdateState(UpdateState::Error("update check failed — no network?".to_string())));
             }
         }
     })
@@ -3881,15 +4130,19 @@ fn run_app<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|f| ui(f, app))?;
         // Inbound neighbor sync (single config writer: this loop).
+        // Routine rounds stay silent — per-device last-sync lives in the
+        // Y menu. Only pairings and propagated removals pop a banner.
         for ev in sync_rx.try_iter() {
-            let summary = apply_sync_event(&mut app.hosts, &mut app.config, &shared_hosts, &mut app.history_cache, ev);
+            let (summary, notable) = apply_sync_event(&mut app.hosts, &mut app.config, &shared_hosts, &mut app.history_cache, ev);
             app.persist();
             publish_web_snapshot(app);
             // Keep selection valid after removals.
             if app.selected_idx >= app.hosts.len() {
                 app.selected_idx = app.hosts.len().saturating_sub(1);
             }
-            app.update_state = UpdateState::Info(summary);
+            if notable {
+                app.update_state = UpdateState::Info(summary);
+            }
         }
         if event::poll(tick_rate)? {
             match event::read()? {
@@ -3929,7 +4182,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             KeyCode::Char('c') | KeyCode::Char('C') => {
                                 app.clear_selected_stats();
-                                app.update_state = UpdateState::Info("stats cleared for selected host".to_string());
+                                app.update_state = UpdateState::Info("stats cleared".to_string());
                             }
                             KeyCode::Char('e') => {
                                 if let Some(h) = app.hosts.get(app.selected_idx) {
@@ -3953,58 +4206,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                 app.input_mode = InputMode::ExportPath { path: default_dir };
                             }
                             KeyCode::Char('w') | KeyCode::Char('W') => {
-                                // Opt-in toggle: W shows the read-only LAN
-                                // page, W again hides it. The sync listener
-                                // keeps running while pairing is configured.
-                                if app.web_url.is_some() {
-                                    app.web_enabled.store(false, Ordering::Relaxed);
-                                    app.web_url = None;
-                                    app.update_state = UpdateState::Info(
-                                        "web page hidden — press W to serve again".to_string(),
-                                    );
-                                } else {
-                                    let (bind, port) = (app.web_bind.clone(), app.web_port);
-                                    match ensure_tui_web_server(app, &shutdown, &sync_tx, &bind, port) {
-                                        Some(urls) => {
-                                            app.update_state = UpdateState::Info(format!(
-                                                "serving read-only page on {} (W hides it, B opens it in your browser)",
-                                                urls
-                                            ));
-                                        }
-                                        // Bind failure is already shown by ensure_server_running.
-                                        None => {}
-                                    }
-                                }
+                                toggle_web_page(app, &shutdown, &sync_tx);
                             }
                             KeyCode::Char('b') | KeyCode::Char('B') => {
-                                // Open the served page in the default browser.
-                                // Explicitly opt-in like W: starts serving first
-                                // when off, then opens the primary (LAN) URL.
-                                let urls = match app.web_url.clone() {
-                                    Some(line) => Some(line),
-                                    None => {
-                                        let (bind, port) = (app.web_bind.clone(), app.web_port);
-                                        ensure_tui_web_server(app, &shutdown, &sync_tx, &bind, port)
-                                    }
-                                };
-                                let Some(urls) = urls else {
-                                    continue; // bind failure already shown
-                                };
-                                let url = primary_web_url(&urls).to_string();
-                                match open_in_browser(&url) {
-                                    Ok(()) => {
-                                        app.update_state = UpdateState::Info(format!(
-                                            "serving on {} — opened in browser (W hides it)",
-                                            urls
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        app.update_state = UpdateState::Info(format!(
-                                            "serving on {} — couldn't open browser ({}); paste the URL manually",
-                                            urls, e
-                                        ));
-                                    }
-                                }
+                                open_web_page(app, &shutdown, &sync_tx);
                             }
                             KeyCode::Char('u') | KeyCode::Char('U') => {
                                 // No known update: manual check first. Known update: install it.
@@ -4091,7 +4296,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.sort_mode = SortMode::None;
                                     app.group_filter = None;
                                     app.save_prefs();
-                                    app.update_state = UpdateState::Info("view reset — showing all hosts".to_string());
+                                    app.update_state = UpdateState::Info("showing all hosts".to_string());
                                 }
                             }
                             KeyCode::Up => move_selection_up(app),
@@ -4107,12 +4312,12 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Enter => {
                                     let host = form.host.trim().to_string();
                                     if host.is_empty() {
-                                        app.update_state = UpdateState::Info("host/IP is required".to_string());
+                                        app.update_state = UpdateState::Info("enter a host or IP".to_string());
                                         app.input_mode = InputMode::AddHost(form);
                                         continue;
                                     }
                                     if app.config.hosts.iter().any(|h| h.name == host) {
-                                        app.update_state = UpdateState::Info("host already exists".to_string());
+                                        app.update_state = UpdateState::Info("already watching that host".to_string());
                                         app.input_mode = InputMode::AddHost(form);
                                         continue;
                                     }
@@ -4383,7 +4588,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Char('u') | KeyCode::Char('U') => {
                                     app.input_mode = InputMode::Normal;
                                     if app.update_available.is_some() {
-                                        app.update_state = UpdateState::Info("press u in the main view to install".to_string());
+                                        app.update_state = UpdateState::Info("exit the menu and press u to install".to_string());
                                     } else {
                                         spawn_one_shot_update_check(tx.clone(), env!("CARGO_PKG_VERSION").to_string());
                                     }
@@ -4392,6 +4597,34 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.input_mode = InputMode::Normal;
                                     app.group_by = !app.group_by;
                                     app.save_prefs();
+                                }
+                                KeyCode::Char('w') | KeyCode::Char('W') => {
+                                    toggle_web_page(app, &shutdown, &sync_tx);
+                                }
+                                KeyCode::Char('b') | KeyCode::Char('B') => {
+                                    open_web_page(app, &shutdown, &sync_tx);
+                                }
+                                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                    app.input_mode = InputMode::SyncMenu;
+                                }
+                                KeyCode::Char('r') | KeyCode::Char('R') => {
+                                    // Toggle start-on-boot: install when
+                                    // missing, remove when present. Uses this
+                                    // session's listener address so the
+                                    // service serves the same page. Stays in
+                                    // the menu so the new status shows.
+                                    if startup::is_installed() {
+                                        match startup::uninstall() {
+                                            Ok(msg) => app.update_state = UpdateState::Info(format!("startup off — {}", msg)),
+                                            Err(e) => app.update_state = UpdateState::Error(format!("startup remove failed: {}", e)),
+                                        }
+                                    } else {
+                                        let (bind, port) = (app.web_bind.clone(), app.web_port);
+                                        match startup::install(port, &bind) {
+                                            Ok(msg) => app.update_state = UpdateState::Info(format!("startup on — {}", msg)),
+                                            Err(e) => app.update_state = UpdateState::Error(format!("startup install failed: {}", e)),
+                                        }
+                                    }
                                 }
                                 KeyCode::Char('q') | KeyCode::Char('Q') => {
                                     shutdown.store(true, Ordering::Relaxed);
@@ -4440,13 +4673,13 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::BackTab | KeyCode::Up => { form.focus = (form.focus + AddHostForm::FIELDS - 1) % AddHostForm::FIELDS; app.input_mode = InputMode::EditEntry { original, form }; }
                                 KeyCode::Enter => {
                                     if form.host.trim().is_empty() {
-                                        app.update_state = UpdateState::Info("host/IP is required".to_string());
+                                        app.update_state = UpdateState::Info("enter a host or IP".to_string());
                                         app.input_mode = InputMode::EditEntry { original, form };
                                         continue;
                                     }
                                     let new_name = form.host.trim().to_string();
                                     if new_name != original && app.config.hosts.iter().any(|h| h.name == new_name) {
-                                        app.update_state = UpdateState::Info("another host already uses that name".to_string());
+                                        app.update_state = UpdateState::Info("that name is taken".to_string());
                                         app.input_mode = InputMode::EditEntry { original, form };
                                         continue;
                                     }
@@ -4514,7 +4747,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     let removed = app.config.sync_peers.remove(idx);
                                     app.persist();
                                     app.update_state = UpdateState::Info(format!(
-                                        "forgot {} — its hosts stay, future pushes stop",
+                                        "forgot {} — hosts stay, syncing stops",
                                         if removed.hostname.is_empty() { removed.addr } else { removed.hostname }
                                     ));
                                 }
@@ -5088,9 +5321,11 @@ fn theme_snapshot(theme: &Theme) -> web::SharedTheme {
 fn publish_web_snapshot(app: &mut App) {
     let hosts = build_web_snapshot(&app.hosts, &mut app.history_cache);
     let theme = theme_snapshot(app.theme());
+    let started_unix = app.started_unix;
     if let Ok(mut page) = app.web_page.write() {
         page.hosts = hosts;
         page.theme = theme;
+        page.started_unix = started_unix;
     }
 }
 
@@ -5101,6 +5336,78 @@ fn self_sync_addr(port: u16) -> String {
         sync::primary_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string()),
         port
     )
+}
+
+/// W action, shared by Normal mode and the menu: toggle the read-only LAN
+/// page. The choice persists (`Config.serve_page`) so reboots restore it
+/// with no flags or clicks. The sync listener keeps running regardless.
+fn toggle_web_page(
+    app: &mut App,
+    shutdown: &Arc<AtomicBool>,
+    sync_tx: &std::sync::mpsc::SyncSender<sync::SyncEvent>,
+) {
+    if app.web_url.is_some() {
+        app.web_enabled.store(false, Ordering::Relaxed);
+        app.web_url = None;
+        app.config.serve_page = false;
+        app.persist();
+        app.update_state = UpdateState::Info(
+            "web page hidden — press W to serve again".to_string(),
+        );
+    } else {
+        let (bind, port) = (app.web_bind.clone(), app.web_port);
+        match ensure_tui_web_server(app, shutdown, sync_tx, &bind, port) {
+            Some(urls) => {
+                app.config.serve_page = true;
+                app.persist();
+                app.update_state = UpdateState::Info(format!(
+                    "serving on {} ([W] hide · [B] browser)",
+                    urls
+                ));
+            }
+            // Bind failure is already shown by ensure_server_running.
+            None => {}
+        }
+    }
+}
+
+/// B action, shared by Normal mode and the menu: open the served page in
+/// the default browser, starting it first when off (same opt-in as W).
+/// Returns false only when the listener couldn't bind (already reported).
+fn open_web_page(
+    app: &mut App,
+    shutdown: &Arc<AtomicBool>,
+    sync_tx: &std::sync::mpsc::SyncSender<sync::SyncEvent>,
+) -> bool {
+    let urls = match app.web_url.clone() {
+        Some(line) => Some(line),
+        None => {
+            let (bind, port) = (app.web_bind.clone(), app.web_port);
+            ensure_tui_web_server(app, shutdown, sync_tx, &bind, port)
+        }
+    };
+    let Some(urls) = urls else {
+        return false; // bind failure already shown
+    };
+    // Showing the page implies serving it: persist like W does.
+    app.config.serve_page = true;
+    app.persist();
+    let url = primary_web_url(&urls).to_string();
+    match open_in_browser(&url) {
+        Ok(()) => {
+            app.update_state = UpdateState::Info(format!(
+                "serving on {} — opened in browser (W hides it)",
+                urls
+            ));
+        }
+        Err(e) => {
+            app.update_state = UpdateState::Info(format!(
+                "serving on {} — couldn't open browser ({}); paste the URL manually",
+                urls, e
+            ));
+        }
+    }
+    true
 }
 
 /// Start the shared listener if needed (page and/or sync). The page itself
@@ -5184,7 +5491,14 @@ fn apply_sync_event(
     shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>,
     history_cache: &mut HashMap<(String, HistoryRange), (Option<SystemTime>, HistorySummary)>,
     ev: sync::SyncEvent,
-) -> String {
+) -> (String, bool) {
+    let joined = ev.new_peer.as_ref().map(|p| {
+        if p.hostname.is_empty() {
+            p.addr.clone()
+        } else {
+            format!("{} ({})", p.hostname, p.addr)
+        }
+    });
     let now = config::now_epoch();
     let stats = sync::merge_state(&mut config.hosts, &mut config.sync_deleted, &ev.hosts, &ev.deleted, now);
     // Mirror into runtime state: drop tombstoned hosts, upsert the rest.
@@ -5227,10 +5541,17 @@ fn apply_sync_event(
     if stats.added > 0 { parts.push(format!("+{}", stats.added)); }
     if stats.updated > 0 { parts.push(format!("~{}", stats.updated)); }
     if stats.removed > 0 { parts.push(format!("-{}", stats.removed)); }
-    if parts.is_empty() {
-        "sync: already up to date".to_string()
+    // Routine syncs stay silent (last-sync is visible per device in the Y
+    // menu). Only a fresh pairing or a propagated removal earns a banner.
+    if let Some(who) = joined {
+        let detail = if parts.is_empty() { "already up to date".to_string() } else { parts.join(" ") };
+        (format!("paired with {} ({})", who, detail), true)
+    } else if stats.removed > 0 {
+        (format!("sync: {} ({})", parts.join(" "), ev.from_addr), true)
+    } else if parts.is_empty() {
+        ("sync: already up to date".to_string(), false)
     } else {
-        format!("sync: {} ({})", parts.join(" "), ev.from_addr)
+        (format!("sync: {} ({})", parts.join(" "), ev.from_addr), false)
     }
 }
 
@@ -5278,6 +5599,7 @@ fn run_serve(bind: &str, port: u16) -> io::Result<()> {
     let (sync_tx, sync_rx) = std::sync::mpsc::sync_channel::<sync::SyncEvent>(32);
     let page = web::new_shared_page();
     let web_enabled = Arc::new(AtomicBool::new(true));
+    let started_unix = config::now_epoch();
     {
         let mut cache = HashMap::new();
         let snap = build_web_snapshot(&hosts, &mut cache);
@@ -5289,6 +5611,7 @@ fn run_serve(bind: &str, port: u16) -> io::Result<()> {
         if let Ok(mut shared) = page.write() {
             shared.hosts = snap;
             shared.theme = theme;
+            shared.started_unix = started_unix;
         }
     }
     let web_port_live = Arc::new(std::sync::atomic::AtomicU16::new(port));
@@ -5374,9 +5697,13 @@ fn run_serve(bind: &str, port: u16) -> io::Result<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         for ev in sync_rx.try_iter() {
-            let summary = apply_sync_event(&mut hosts, &mut config, &shared_hosts, &mut history_cache, ev);
+            let (summary, notable) = apply_sync_event(&mut hosts, &mut config, &shared_hosts, &mut history_cache, ev);
             save_serve_config(&config);
-            println!("{}", summary);
+            // Service logs stay quiet like the TUI: pairings and removals
+            // only. Per-device last-sync is one `--sync-peers` away.
+            if notable {
+                println!("{}", summary);
+            }
         }
         if last_publish.elapsed() > Duration::from_secs(2) {
             last_publish = Instant::now();
@@ -5527,8 +5854,8 @@ fn run_sync_code(port: u16) -> io::Result<()> {
     let token = config.sync_token.clone().unwrap_or_default();
     let host = sync::primary_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string());
     println!("{}", sync::make_join_code(&host, port, &token));
-    println!("share this code with the other device: ping-uin --sync-join <code>  (or Y → join in its TUI)");
-    println!("note: this device must be running (TUI or --serve) for the other side to reach it");
+    println!("share it: ping-uin --sync-join <code>  (or join from their TUI with Y)");
+    println!("keep this device running (TUI or --serve) so they can reach it");
     Ok(())
 }
 
@@ -5560,7 +5887,7 @@ fn run_sync_join(code: &str, port: u16) -> io::Result<()> {
                 None => config.sync_peers.push(peer),
             }
             config.save().map_err(|e| io::Error::other(format!("cannot save config: {}", e)))?;
-            println!("paired with {}: +{} ~{} -{} hosts (bidirectional from here on while both run)", via, stats.added, stats.updated, stats.removed);
+            println!("paired with {}: +{} ~{} -{} (syncs both ways while both run)", via, stats.added, stats.updated, stats.removed);
             Ok(())
         }
         Err(e) => {
@@ -5595,7 +5922,7 @@ fn run_sync_forget(addr: &str) -> io::Result<()> {
         std::process::exit(1);
     }
     config.save().map_err(|e| io::Error::other(format!("cannot save config: {}", e)))?;
-    println!("forgot {} — its hosts stay, future pushes stop", addr);
+    println!("forgot {} — hosts stay, syncing stops", addr);
     Ok(())
 }
 
@@ -5772,6 +6099,8 @@ fn main() -> io::Result<()> {
         web_bind,
         web_port,
         web_port_live: Arc::new(std::sync::atomic::AtomicU16::new(web_port)),
+        started: Instant::now(),
+        started_unix: config::now_epoch(),
     };
     // Session restore: re-select last session's host.
     if let Some(sel) = app.config.selected.clone() {
@@ -5788,6 +6117,15 @@ fn main() -> io::Result<()> {
     if app.config.sync_token.is_some() {
         let (bind, port) = (app.web_bind.clone(), app.web_port);
         ensure_server_running(&mut app, &shutdown, &sync_tx, &bind, port);
+    }
+    // A persisted page choice restores itself: W once means serving on
+    // every boot, no flags or clicks. Runs after the sync autostart so a
+    // moved port is already settled before the page enables over it.
+    if app.config.serve_page {
+        let (bind, port) = (app.web_bind.clone(), app.web_port);
+        ensure_tui_web_server(&mut app, &shutdown, &sync_tx, &bind, port);
+        // Don't pop a notice for the automatic restore; the menu shows it.
+        app.update_state = UpdateState::Idle;
     }
     // Always run: with zero peers it just sleeps, and it picks up pairings
     // made while running (disk is re-read every round).

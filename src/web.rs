@@ -25,7 +25,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, HostConfig, SyncDeletion};
+use crate::config::{now_epoch, Config, HostConfig, SyncDeletion};
+use crate::config::format_duration;
 use crate::sync::{device_hostname, primary_lan_ip, SyncEvent};
 
 /// Point-in-time copy of one host for the web thread. Built by the probing
@@ -89,11 +90,13 @@ impl Default for SharedTheme {
     }
 }
 
-/// Everything the page needs in one lock: hosts + serving theme.
+/// Everything the page needs in one lock: hosts + serving theme. The
+/// process start epoch is written once at startup and never changes.
 #[derive(Clone, Debug, Default)]
 pub struct PageState {
     pub hosts: Vec<HostSnapshot>,
     pub theme: SharedTheme,
+    pub started_unix: i64,
 }
 
 pub type SharedPage = Arc<RwLock<PageState>>;
@@ -169,16 +172,19 @@ fn status_rank(status: &str) -> u8 {
     }
 }
 
-/// Parsed page query: sort + direction + optional group-label filter.
+/// Parsed page query: sort + direction + optional group-label filter +
+/// grouped-cards view. Default is a flat table like the TUI (ungrouped);
+/// `?view=grouped` restores the collapsible per-label cards.
 #[derive(Clone, Debug, Default)]
 pub struct PageQuery {
     pub sort: SortKey,
     pub desc: bool,
     pub group: Option<String>,
+    pub grouped: bool,
 }
 
-/// Parse `sort`/`order`/`group` from a raw query string.
-/// Unknown values fall back to grouped view, ascending.
+/// Parse `sort`/`order`/`group`/`view` from a raw query string.
+/// Unknown values fall back to the flat ungrouped view, ascending.
 pub fn parse_query(query: &str) -> PageQuery {
     let mut out = PageQuery::default();
     for pair in query.split('&') {
@@ -196,6 +202,9 @@ pub fn parse_query(query: &str) -> PageQuery {
                 if !v.is_empty() {
                     out.group = Some(v.to_string());
                 }
+            }
+            "view" | "layout" => {
+                out.grouped = matches!(v.to_lowercase().as_str(), "grouped" | "groups" | "1");
             }
             _ => {}
         }
@@ -258,8 +267,7 @@ pub fn lan_urls(bind: &str, port: u16) -> Vec<String> {
     }
 }
 
-fn sparkstrip(history: &[u64]) -> String {
-    history
+fn sparkstrip(history: &[u64]) -> String {    history
         .iter()
         .rev()
         .map(|lat| {
@@ -273,9 +281,8 @@ fn sparkstrip(history: &[u64]) -> String {
         .join(" ")
 }
 
-fn host_row(h: &HostSnapshot) -> String {
-    let sla = h.sla_24h.map(|v| format!("{:.1}%", v)).unwrap_or_else(|| "\u{2014}".to_string());
-    let lat = if h.up {
+fn latency_text(h: &HostSnapshot) -> String {
+    if h.up {
         format!("{:.0} ms", h.latency_ms)
     } else if h.muted {
         "muted".to_string()
@@ -283,7 +290,18 @@ fn host_row(h: &HostSnapshot) -> String {
         format!("down {}s", s)
     } else {
         "\u{2014}".to_string()
-    };
+    }
+}
+
+fn sla_text(h: &HostSnapshot) -> String {
+    h.sla_24h
+        .map(|v| format!("{:.1}%", v))
+        .unwrap_or_else(|| "\u{2014}".to_string())
+}
+
+fn host_row(h: &HostSnapshot) -> String {
+    let sla = sla_text(h);
+    let lat = latency_text(h);
     format!(
         "<tr><td>{}</td><td class=\"dim mono\">{}</td><td><span class=\"status {}\">\u{25cf} {}</span></td><td class=\"mono\">{}</td><td class=\"dim\">{}</td><td class=\"mono\">{:.1}%</td><td class=\"mono\">{}</td><td class=\"spark mono\">{}</td></tr>\n",
         html_escape(&h.display_name),
@@ -308,7 +326,7 @@ fn group_label(h: &HostSnapshot) -> String {
 
 /// Header link for a sortable column: clicking the active column toggles
 /// asc/desc, clicking another column sorts ascending by it. Preserves the
-/// group filter.
+/// group filter and the grouped/flat view.
 fn sort_link(label: &str, key: SortKey, q: &PageQuery) -> String {
     let arrow = if q.sort == key {
         if q.desc { " \u{25bc}" } else { " \u{25b2}" }
@@ -317,26 +335,163 @@ fn sort_link(label: &str, key: SortKey, q: &PageQuery) -> String {
     };
     let order = if q.sort == key && !q.desc { "desc" } else { "asc" };
     let group = q.group.as_deref().map(|g| format!("&amp;group={}", html_escape(g))).unwrap_or_default();
+    let view: String = if q.grouped { "&amp;view=grouped".to_string() } else { String::new() };
     format!(
-        "<a href=\"/?sort={}&amp;order={}{}\">{}{}</a>",
+        "<a href=\"/?sort={}&amp;order={}{}{}\">{}{}</a>",
         key.param(),
         order,
         group,
+        view,
         html_escape(label),
         arrow
     )
 }
 
+/// App uptime display ("3d4h") from the process start epoch. Shared by the
+/// initial HTML and the live feed so both agree.
+pub fn app_uptime_text(started_unix: i64) -> String {
+    if started_unix <= 0 {
+        return "\u{2014}".to_string();
+    }
+    let secs = (now_epoch() - started_unix).max(0) as u64;
+    format_duration(secs)
+}
+
+/// Live data feed for the page's own poller (`GET /api/state`, same query
+/// params as `/`). NOT a public API: no stability promise, shaped exactly
+/// for the inline script (preformatted display strings so formatting logic
+/// lives here once). Read-only and page-gated like `/` itself.
+pub fn state_json(hosts: &[HostSnapshot], version: &str, generated: &str, q: &PageQuery, started_unix: i64) -> String {
+    let mut owned: Vec<HostSnapshot> = hosts
+        .iter()
+        .filter(|h| q.group.as_deref().map_or(true, |g| group_label(h) == g))
+        .cloned()
+        .collect();
+    if q.sort != SortKey::None {
+        apply_sort(&mut owned, q.sort, q.desc);
+    }
+    let up = owned.iter().filter(|h| h.up).count();
+    let items: Vec<serde_json::Value> = owned
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                    "display": h.display_name,
+                    "target": h.target,
+                "group": group_label(h),
+                "status": h.status,
+                "up": h.up,
+                "latency": latency_text(h),
+                "uptime": format!("{:.1}%", h.uptime_pct),
+                "sla": sla_text(h),
+                "history": h.history,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "generated": generated,
+        "version": version,
+        "up": up,
+        "down": items.len().saturating_sub(up),
+        "app_uptime": app_uptime_text(started_unix),
+        "hosts": items,
+    })
+    .to_string()
+}
+
+/// Inline live-update script (vanilla JS, no dependencies). Raw string so
+/// quoting stays natural; must never contain the sequence `"##`.
+/// Inline live-update script (vanilla JS, no dependencies). Raw string so
+/// quoting stays natural: single-quoted JS strings; HTML attributes use
+/// double quotes inside them. Must never contain the sequence `"##`.
+const POLLER_SCRIPT: &str = r##"
+</div><script>
+(function(){
+var content=document.getElementById('content');
+if(!content){return;}
+var params=new URLSearchParams(window.location.search);
+var grouped=params.get('view')==='grouped';
+var api='/api/state'+window.location.search;
+var prev={};
+var fails=0,timer=null;
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function cls(s){return s==='UP'?'up':(s==='DOWN'?'down':((s==='WARN'||s==='FLAP')?'warn':'muted'));}
+function spark(h){var o='',i;for(i=h.length-1;i>=0;i--){if(i<h.length-1){o+=' ';}o+=h[i]>0?'<span class="u">■</span>':'<span class="d">_</span>';}return o;}
+function headHtml(){
+var g=params.get('group'),v=grouped?'&amp;view=grouped':'';
+var gg=g?('&amp;group='+encodeURIComponent(g)):'';
+function th(label,key){
+var active=params.get('sort')===key;
+var order=(active&&params.get('order')!=='desc')?'desc':'asc';
+var arrow=active?(params.get('order')==='desc'?' ▼':' ▲'):'';
+return '<th'+(active?' class="active"' :'')+'><a href="/?sort='+key+'&amp;order='+order+gg+v+'">'+label+arrow+'</a></th>';
+}
+return '<thead><tr>'+th('Host','name')+'<th>Target</th>'+th('Status','status')+th('Latency','latency')+th('Group','group')+'<th>Uptime</th>'+th('SLA 24h','sla')+'<th>History</th></tr></thead>';
+}
+function row(h){
+var changed=prev[h.display]!==undefined&&prev[h.display]!==h.status;
+return '<tr'+(changed?' class="flash"' :'')+'><td>'+esc(h.display)+'</td><td class="dim mono">'+esc(h.target)+'</td><td><span class="status '+cls(h.status)+'">● '+esc(h.status)+'</span></td><td class="mono">'+esc(h.latency)+'</td><td class="dim">'+esc(h.group)+'</td><td class="mono">'+esc(h.uptime)+'</td><td class="mono">'+esc(h.sla)+'</td><td class="spark mono">'+spark(h.history)+'</td></tr>';
+}
+function renderFlat(hosts){return '<div class="table-wrap"><table>'+headHtml()+'<tbody>'+hosts.map(row).join('')+'</tbody></table></div>';}
+function renderGrouped(hosts){
+var map={},names=[],i,h;
+for(i=0;i<hosts.length;i++){h=hosts[i];if(!map[h.group]){map[h.group]=[];names.push(h.group);}map[h.group].push(h);}
+names.sort(function(a,b){
+var ad=map[a].some(function(x){return !x.up;}),bd=map[b].some(function(x){return !x.up;});
+if(ad!==bd){return ad?-1:1;}
+return a<b?-1:(a>b?1:0);
+});
+var open={};
+content.querySelectorAll('details[data-group]').forEach(function(d){open[d.getAttribute('data-group')]=d.open;});
+var out=names.map(function(n){
+var ms=map[n].slice().sort(function(a,b){
+if(a.up!==b.up){return a.up?1:-1;}
+var x=a.display.toLowerCase(),y=b.display.toLowerCase();
+return x<y?-1:(x>y?1:0);
+});
+var u=ms.filter(function(x){return x.up;}).length;
+var isOpen=open[n]!==false;
+return '<details'+(isOpen?' open':'')+' data-group="'+esc(n)+'"><summary><span class="gname">'+esc(n)+'</span><span class="tally"> · <span class="up">'+u+' up</span> · <span class="down">'+(ms.length-u)+' down</span></span></summary><div class="table-wrap"><table>'+headHtml()+'<tbody>'+ms.map(row).join('')+'</tbody></table></div></details>';
+}).join('');
+return out||'<p class="sub">No hosts in this view.</p>';
+}
+function render(d){
+var i,h,next={};
+for(i=0;i<d.hosts.length;i++){h=d.hosts[i];next[h.display]=h.status;}
+document.getElementById('pillUp').textContent='● '+d.up+' up';
+document.getElementById('pillDown').textContent='● '+d.down+' down';
+document.getElementById('metaGen').textContent='generated '+d.generated;
+document.getElementById('appUp').textContent='up '+d.app_uptime;
+document.getElementById('liveNote').textContent='live';
+content.innerHTML=grouped?renderGrouped(d.hosts):renderFlat(d.hosts);
+prev=next;
+}
+function poll(){
+if(document.hidden){timer=setTimeout(poll,5000);return;}
+fetch(api,{cache:'no-store'}).then(function(r){if(!r.ok){throw new Error('http '+r.status);}return r.json();}).then(function(d){
+fails=0;render(d);timer=setTimeout(poll,5000);
+}).catch(function(){
+fails++;var note=document.getElementById('liveNote');if(note){note.textContent='reconnecting…';}
+timer=setTimeout(poll,Math.min(30000,5000*fails));
+});
+}
+timer=setTimeout(poll,5000);
+})();
+</script>
+"##;
+
+
 /// Full HTML status page in the serving instance's theme. Static CSS + meta
-/// refresh so it works in any browser with no JS. Default view groups hosts
-/// by label (TUI-style, groups down-first, collapsible via `<details>`);
-/// any `?sort=` switches to a flat sorted table.
+/// refresh so it works in any browser with no JS. The default view is a flat
+/// table — every host its own row, like the TUI; `?view=grouped` restores
+/// the collapsible per-label cards, and any `?sort=` switches to a flat
+/// sorted table.
 pub fn render_status_page(
     hosts: &[HostSnapshot],
     theme: &SharedTheme,
     version: &str,
     generated: &str,
     q: &PageQuery,
+    started_unix: i64,
 ) -> String {
     let visible: Vec<&HostSnapshot> = hosts
         .iter()
@@ -356,7 +511,10 @@ pub fn render_status_page(
     if let Some(g) = q.group.as_deref() {
         state_note.push_str(&format!(" \u{00b7} group <code>{}</code>", html_escape(g)));
     }
-    if q.sort != SortKey::None || q.group.is_some() {
+    if q.grouped {
+        state_note.push_str(" \u{00b7} grouped view");
+    }
+    if q.sort != SortKey::None || q.group.is_some() || q.grouped {
         state_note.push_str(" \u{00b7} <a href=\"/\" style=\"color:accent\">reset</a>");
     }
     let state_note = state_note.replace("color:accent", &format!("color:{}", html_escape(&theme.accent)));
@@ -392,12 +550,18 @@ pub fn render_status_page(
         b_down.cmp(&a_down).then_with(|| a.cmp(b))
     });
 
-    // Group filter chips (pure links, no JS), preserving the current sort.
-    let base_qs = if q.sort == SortKey::None {
+    // Group filter chips (pure links, no JS), preserving the sort and view.
+    let mut base_qs = if q.sort == SortKey::None {
         String::new()
     } else {
         format!("sort={}&order={}", q.sort.param(), if q.desc { "desc" } else { "asc" })
     };
+    if q.grouped {
+        if !base_qs.is_empty() {
+            base_qs.push('&');
+        }
+        base_qs.push_str("view=grouped");
+    }
     let href_for = |group: Option<&str>| {
         let escaped = |s: &str| html_escape(s).replace('&', "&amp;");
         match (base_qs.is_empty(), group) {
@@ -421,6 +585,38 @@ pub fn render_status_page(
             html_escape(g),
         ));
     }
+    // View toggle: grouped cards vs the default flat table.
+    if q.grouped {
+        let flat_href = match (q.sort == SortKey::None, q.group.as_deref()) {
+            (true, None) => "/".to_string(),
+            (true, Some(g)) => format!("/?group={}", html_escape(g)),
+            (false, None) => format!(
+                "/?sort={}&amp;order={}",
+                q.sort.param(),
+                if q.desc { "desc" } else { "asc" }
+            ),
+            (false, Some(g)) => format!(
+                "/?sort={}&amp;order={}&amp;group={}",
+                q.sort.param(),
+                if q.desc { "desc" } else { "asc" },
+                html_escape(g)
+            ),
+        };
+        chips.push_str(&format!(
+            "<a class=\"chip active\" href=\"{}\">Grouped ✓</a>",
+            flat_href,
+        ));
+    } else {
+        let grouped_href = if base_qs.is_empty() {
+            "/?view=grouped".to_string()
+        } else {
+            format!("/?{}&amp;view=grouped", html_escape(&base_qs).replace('&', "&amp;"))
+        };
+        chips.push_str(&format!(
+            "<a class=\"chip\" href=\"{}\">Grouped</a>",
+            grouped_href,
+        ));
+    }
     chips.push_str("</nav>");
 
     let body = if q.sort != SortKey::None {
@@ -431,7 +627,7 @@ pub fn render_status_page(
             header,
             owned.iter().map(host_row).collect::<String>()
         )
-    } else {
+    } else if q.grouped {
         let mut out = String::new();
         for name in group_order {
             if q.group.as_deref().map_or(false, |g| g != name.as_str()) {
@@ -447,9 +643,11 @@ pub fn render_status_page(
             });
             let g_up = members.iter().filter(|h| h.up).count();
             let g_down = members.len().saturating_sub(g_up);
-            // Native collapsible: no JS needed.
+            // Native collapsible: no JS needed. data-group lets the live
+            // poller preserve open/closed state across re-renders.
             out.push_str(&format!(
-                "<details open><summary><span class=\"gname\">{}</span><span class=\"tally\"> \u{00b7} <span class=\"up\">{} up</span> \u{00b7} <span class=\"down\">{} down</span></span></summary><div class=\"table-wrap\"><table>{}<tbody>{}</tbody></table></div></details>\n",
+                "<details open data-group=\"{}\"><summary><span class=\"gname\">{}</span><span class=\"tally\"> \u{00b7} <span class=\"up\">{} up</span> \u{00b7} <span class=\"down\">{} down</span></span></summary><div class=\"table-wrap\"><table>{}<tbody>{}</tbody></table></div></details>\n",
+                html_escape(name),
                 html_escape(name),
                 g_up,
                 g_down,
@@ -461,12 +659,23 @@ pub fn render_status_page(
             out.push_str("<p class=\"sub\">No hosts in this view.</p>");
         }
         out
+    } else {
+        // Default: flat table, one row per host in probe order — like the TUI.
+        let rows: String = visible.iter().map(|h| host_row(h)).collect();
+        if rows.is_empty() {
+            "<p class=\"sub\">No hosts in this view.</p>".to_string()
+        } else {
+            format!(
+                "<div class=\"table-wrap\"><table>{}<tbody>{}</tbody></table></div>",
+                header, rows
+            )
+        }
     };
 
     format!(
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\">\
         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-        <meta http-equiv=\"refresh\" content=\"15\">\
+        <noscript><meta http-equiv=\"refresh\" content=\"15\"></noscript>\
         <title>ping-uin status</title><style>\
         :root{{--bg:{bg};--fg:{fg};--title:{title};--accent:{accent};--muted:{muted};--good:{good};--danger:{danger};--graph:{graph};--divider:{divider};--card:{card}}}\
         *{{box-sizing:border-box}}\
@@ -505,15 +714,19 @@ pub fn render_status_page(
         details .table-wrap{{border-top:1px solid var(--divider)}}\
         .table-wrap{{overflow-x:auto}}\
         .spark{{letter-spacing:2px;white-space:nowrap}}.u{{color:var(--graph)}}.d{{color:var(--danger)}}\
+        tbody tr.flash{{animation:flashbg 1.6s ease-out}}\
+        @keyframes flashbg{{0%{{background:transparent}}25%{{background:rgba(128,128,128,.22)}}100%{{background:transparent}}}}\
         code{{background:var(--card);border:1px solid var(--divider);padding:2px 6px;border-radius:4px;font-size:12px}}\
         @media (max-width:720px){{body{{padding:16px 12px 32px}}h1{{font-size:19px}}thead th,tbody td{{padding:7px 8px}}.pill{{font-size:12.5px;padding:5px 12px}}}}\
         </style></head><body><div class=\"wrap\">\
         <header class=\"hero\"><div><h1>((\u{2022}O\u{2022})) ping-uin status</h1>\
-        <p class=\"sub\">generated {generated} \u{00b7} v{version} \u{00b7} theme {themename} \u{00b7} auto-refreshes every 15s{note}</p></div>\
-        <div class=\"pills\"><span class=\"pill up\">\u{25cf} {up} up</span><span class=\"pill down\">\u{25cf} {down} down</span></div></header>\
+        <p class=\"sub\"><span id=\"metaGen\">generated {generated}</span> \u{00b7} v{version} \u{00b7} theme {themename} \u{00b7} <span id=\"appUp\">up {appup}</span> \u{00b7} <span id=\"liveNote\">auto-refresh</span>{note}</p></div>\
+        <div class=\"pills\"><span class=\"pill up\" id=\"pillUp\">\u{25cf} {up} up</span><span class=\"pill down\" id=\"pillDown\">\u{25cf} {down} down</span></div></header>\
         {chips}\
-        {body}\
-        </div></body></html>",
+        <main id=\"content\">{body}</main>\
+        {chips}\
+        <main id=\"content\">{body}</main>\
+        </div>{script}</body></html>",
         body = body,
         up = up,
         down = down,
@@ -521,6 +734,7 @@ pub fn render_status_page(
         version = html_escape(version),
         themename = html_escape(&theme.name),
         note = state_note,
+        appup = html_escape(&app_uptime_text(started_unix)),
         bg = html_escape(&theme.bg),
         fg = html_escape(&theme.fg),
         title = html_escape(&theme.title),
@@ -531,6 +745,7 @@ pub fn render_status_page(
         accent = html_escape(&theme.accent),
         graph = html_escape(&theme.graph),
         card = html_escape(&theme.card),
+        script = POLLER_SCRIPT,
     )
 }
 
@@ -742,12 +957,12 @@ fn handle_connection(
                 return;
             }
             let q = parse_query(&query);
-            let (hosts, theme) = page
+            let (hosts, theme, started_unix) = page
                 .read()
-                .map(|p| (p.hosts.clone(), p.theme.clone()))
+                .map(|p| (p.hosts.clone(), p.theme.clone(), p.started_unix))
                 .unwrap_or_default();
             let generated = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            let body = render_status_page(&hosts, &theme, version, &generated, &q);
+            let body = render_status_page(&hosts, &theme, version, &generated, &q, started_unix);
             let _ = stream.write_all(&http_response("200 OK", "text/html; charset=utf-8", &body));
         }
         "/health" | "/healthz" => {
@@ -755,6 +970,26 @@ fn handle_connection(
             // squatter), which decides the whole "empty reply" class of bugs.
             let body = format!("ok ping-uin {}\n", version);
             let _ = stream.write_all(&http_response("200 OK", "text/plain; charset=utf-8", &body));
+        }
+        "/api/state" | "/api/state/" => {
+            // Live feed for the page's own poller (same query params as /).
+            // Page-gated: no page, no feed.
+            if !web_enabled.load(Ordering::Relaxed) {
+                let _ = stream.write_all(&http_response(
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    "web page not enabled on this device (press W in its TUI)\n",
+                ));
+                return;
+            }
+            let q = parse_query(&query);
+            let (hosts, started_unix) = page
+                .read()
+                .map(|p| (p.hosts.clone(), p.started_unix))
+                .unwrap_or_default();
+            let generated = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+            let body = state_json(&hosts, version, &generated, &q, started_unix);
+            let _ = stream.write_all(&http_response("200 OK", "application/json", &body));
         }
         _ => {
             let _ = stream.write_all(&http_response(
@@ -977,7 +1212,7 @@ mod tests {
     }
 
     fn render_default(hosts: &[HostSnapshot], q: &PageQuery) -> String {
-        render_status_page(hosts, &SharedTheme::default(), "0.1.0", "2026-01-01 00:00:00", q)
+        render_status_page(hosts, &SharedTheme::default(), "0.1.0", "2026-01-01 00:00:00", q, 1790460000)
     }
 
     #[test]
@@ -991,10 +1226,24 @@ mod tests {
     }
 
     #[test]
-    fn status_page_groups_by_label() {
+    fn status_page_default_is_flat_like_the_tui() {
         let html = render_default(&sample(), &PageQuery::default());
+        // No group blocks (NB: the inline script mentions "<details"+suffix
+        // without a space, so "<details " only matches real elements).
+        assert!(!html.contains("<details "));
+        assert!(html.contains("Google DNS"));
+        assert!(html.contains("db:5432"));
+        let goog = html.find("Google DNS").unwrap();
+        let db = html.find("db:5432").unwrap();
+        assert!(goog < db, "flat view keeps probe order");
+    }
+
+    #[test]
+    fn status_page_groups_by_label() {
+        let q = PageQuery { sort: SortKey::None, desc: false, group: None, grouped: true };
+        let html = render_default(&sample(), &q);
         // Group blocks with tallies, down-group first.
-        assert!(html.contains("<details open>"));
+        assert!(html.contains("<details open data-group"));
         assert!(html.contains(">g<"));
         assert!(html.contains(">external<"));
         let g_pos = html.find(">g<").unwrap();
@@ -1004,7 +1253,7 @@ mod tests {
 
     #[test]
     fn status_page_group_filter() {
-        let q = PageQuery { sort: SortKey::None, desc: false, group: Some("g".to_string()) };
+        let q = PageQuery { sort: SortKey::None, desc: false, group: Some("g".to_string()), grouped: false };
         let html = render_default(&sample(), &q);
         assert!(html.contains("db:5432"));
         assert!(!html.contains("Google DNS"));
@@ -1015,18 +1264,27 @@ mod tests {
         let mut theme = SharedTheme::default();
         theme.name = "dracula".to_string();
         theme.bg = "#282a36".to_string();
-        let html = render_status_page(&sample(), &theme, "0.1.0", "t", &PageQuery::default());
+        let html = render_status_page(&sample(), &theme, "0.1.0", "t", &PageQuery::default(), 1790460000);
         assert!(html.contains("#282a36"));
         assert!(html.contains("theme dracula"));
     }
 
     #[test]
     fn status_page_headers_are_sort_links() {
-        let q = PageQuery { sort: SortKey::Name, desc: false, group: None };
+        let q = PageQuery { sort: SortKey::Name, desc: false, group: None, grouped: false };
         let html = render_default(&sample(), &q);
         assert!(html.contains("?sort=name"));
         assert!(html.contains("?sort=status"));
         assert!(html.contains("sorted by <code>name asc</code>"));
+    }
+
+    #[test]
+    fn view_param_toggles_grouped_cards() {
+        let q = parse_query("view=grouped");
+        assert!(q.grouped);
+        assert!(parse_query("").grouped == false);
+        assert!(parse_query("view=flat").grouped == false);
+        assert!(parse_query("sort=name&view=grouped").sort == SortKey::Name);
     }
 
     #[test]
@@ -1058,6 +1316,47 @@ mod tests {
         let port = holder.local_addr().unwrap().port();
         assert!(bind_listener("127.0.0.1", port).is_err());
         drop(holder);
+    }
+
+    #[test]
+    fn state_feed_shape_sort_and_filter() {
+        // Flat default: probe order, counts, app uptime, preformatted cells.
+        let body = state_json(&sample(), "0.1.0", "2026-01-01 00:00:00", &PageQuery::default(), 1790460000);
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["down"], 1);
+        assert_eq!(v["hosts"].as_array().unwrap().len(), 2);
+        assert_eq!(v["hosts"][0]["display"], "Google DNS");
+        assert_eq!(v["hosts"][1]["status"], "DOWN");
+        assert_eq!(v["hosts"][0]["latency"], "12 ms");
+        assert_eq!(v["hosts"][1]["latency"], "down 90s");
+        assert_eq!(v["hosts"][0]["history"], serde_json::json!([12, 11, 0]));
+        assert!(v["app_uptime"].as_str().unwrap().len() > 0);
+        // Sort + group params apply to the feed exactly like the page.
+        let q = parse_query("sort=status&order=desc");
+        let v: serde_json::Value =
+            serde_json::from_str(&state_json(&sample(), "0.1.0", "t", &q, 0)).unwrap();
+        assert_eq!(v["hosts"][0]["status"], "UP");
+        let q = parse_query("group=g");
+        let v: serde_json::Value =
+            serde_json::from_str(&state_json(&sample(), "0.1.0", "t", &q, 0)).unwrap();
+        assert_eq!(v["hosts"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hosts"][0]["target"], "db:5432");
+    }
+
+    #[test]
+    fn page_updates_without_reload() {
+        // No full-page meta refresh anymore; the poller + pill/meta IDs the
+        // script needs are present; noscript keeps a refresh fallback.
+        let html = render_default(&sample(), &PageQuery::default());
+        // No bare full-page refresh: exactly one refresh tag exists, and it
+        // lives inside <noscript> as the JS-less fallback.
+        assert_eq!(html.matches("http-equiv=\"refresh\"").count(), 1);
+        assert!(html.contains("<noscript><meta http-equiv=\"refresh\" content=\"15\"></noscript>"));
+        for id in ["content", "pillUp", "pillDown", "metaGen", "appUp", "liveNote"] {
+            assert!(html.contains(&format!("id=\"{}\"", id)), "missing #{}", id);
+        }
+        assert!(html.contains("/api/state"));
+        assert!(html.contains("setTimeout(poll,5000)"));
     }
 
     #[test]

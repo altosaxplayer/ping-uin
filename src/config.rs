@@ -390,7 +390,13 @@ pub fn format_duration(secs: u64) -> String {
     } else if secs < 86400 {
         format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
     } else {
-        format!("{}d", secs / 86400)
+        let d = secs / 86400;
+        let h = (secs % 86400) / 3600;
+        if h == 0 {
+            format!("{}d", d)
+        } else {
+            format!("{}d{}h", d, h)
+        }
     }
 }
 
@@ -546,6 +552,11 @@ pub struct Config {
     /// Persisted outage-mail state per host. See `EmailOutageState`.
     #[serde(default)]
     pub email_state: std::collections::HashMap<String, EmailOutageState>,
+    /// Whether the read-only LAN page was showing when the TUI last ran.
+    /// `W` toggles it; a set value auto-serves on the next startup so the
+    /// page survives reboots without any flags or clicks.
+    #[serde(default)]
+    pub serve_page: bool,
 }
 
 /// One paired neighbor instance: where to push + which token it expects.
@@ -625,6 +636,7 @@ impl Default for Config {
             sync_peers: Vec::new(),
             sync_deleted: Vec::new(),
             email_state: std::collections::HashMap::new(),
+            serve_page: false,
         }
     }
 }
@@ -829,6 +841,7 @@ impl Config {
                     .get("email_state")
                     .and_then(|v| serde_json::from_value::<std::collections::HashMap<String, EmailOutageState>>(v.clone()).ok())
                     .unwrap_or_default(),
+                serve_page: value.get("serve_page").and_then(|v| v.as_bool()).unwrap_or(false),
             };
         }
         // Corrupt config: back it up instead of silently discarding user data.
@@ -994,7 +1007,8 @@ mod tests {
         assert_eq!(format_duration(45), "45s");
         assert_eq!(format_duration(600), "10m");
         assert_eq!(format_duration(5400), "1h30m");
-        assert_eq!(format_duration(90000), "1d");
+        assert_eq!(format_duration(86400), "1d");
+        assert_eq!(format_duration(90000), "1d1h");
     }
 
     #[test]

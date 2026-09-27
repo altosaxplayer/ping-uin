@@ -745,6 +745,8 @@ mod tests {
     /// Reads each request FULLY (headers + body) before responding: replying
     /// early would RST a client still sending its body, flaking the test.
     /// Binds with retries: parallel tests can briefly exhaust ephemeral ports.
+    /// Only honors joins carrying `expect_token`: parallel tests' scans must
+    /// not pair with each other's stubs.
     fn stub_listener() -> std::net::TcpListener {
         for _ in 0..20 {
             if let Ok(l) = std::net::TcpListener::bind("127.0.0.1:0") {
@@ -755,7 +757,7 @@ mod tests {
         panic!("no ephemeral port available for stub peer");
     }
 
-    fn stub_peer(listener: std::net::TcpListener) {
+    fn stub_peer(listener: std::net::TcpListener, expect_token: String) {
         use std::io::{Read, Write};
         for stream in listener.incoming().take(256) {
             let mut stream = match stream {
@@ -805,10 +807,25 @@ mod tests {
             }
             let req = String::from_utf8_lossy(&buf);
             let first = req.lines().next().unwrap_or("");
+            // Joins must present this stub's token: parallel tests scan
+            // overlapping loopback ranges, and cross-talk pairing would
+            // flake every scan test. (/health stays open like production.)
+            let presented = req
+                .split_once("\r\n\r\n")
+                .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(b).ok())
+                .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(|s| s.to_string()))
+                .unwrap_or_default();
             let resp = if first.starts_with("GET /health") {
                 "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n".to_string()
-            } else if first.starts_with("POST /sync/join") {
+            } else if first.starts_with("POST /sync/join") && presented == expect_token {
                 let body = r#"{"ok":true,"hosts":[],"deleted":[],"hostname":"stub"}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            } else if first.starts_with("POST /sync/join") {
+                let body = r#"{"ok":false,"error":"bad token"}"#;
                 format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -829,7 +846,9 @@ mod tests {
         // can steal the port; readiness is retried, not slept on.
         let listener = stub_listener();
         let port = listener.local_addr().unwrap().port();
-        let stub = std::thread::spawn(move || stub_peer(listener));
+        let token = generate_token();
+        let stub_token = token.clone();
+        let stub = std::thread::spawn(move || stub_peer(listener, stub_token));
         let stub_addr = format!("127.0.0.1:{}", port);
         let mut ready = false;
         for _ in 0..40 {
@@ -842,7 +861,6 @@ mod tests {
         assert!(ready, "stub peer never answered /health");
         assert!(!health_ok("127.0.0.1:1"));
         // Simulate the fallback's inner loop directly: dead then live.
-        let token = generate_token();
         let r1 = try_candidate("127.0.0.1:1", &token, "127.0.0.1:9999", &token, "tester");
         assert!(r1.is_none());
         let r2 = try_candidate(&format!("127.0.0.1:{}", port), &token, "127.0.0.1:9999", &token, "tester");
@@ -859,8 +877,9 @@ mod tests {
         // live stub must resolve to the stub. Should take ~2s, not tens.
         let listener = stub_listener();
         let port = listener.local_addr().unwrap().port();
-        let stub = std::thread::spawn(move || stub_peer(listener));
         let token = generate_token();
+        let stub_token = token.clone();
+        let stub = std::thread::spawn(move || stub_peer(listener, stub_token));
         let start = std::time::Instant::now();
         let found = scan_subnet(
             "127.0.0",
@@ -890,8 +909,9 @@ mod tests {
         // after its join code was generated.
         let listener = stub_listener();
         let port = listener.local_addr().unwrap().port();
-        let stub = std::thread::spawn(move || stub_peer(listener));
         let token = generate_token();
+        let stub_token = token.clone();
+        let stub = std::thread::spawn(move || stub_peer(listener, stub_token));
         // start_port saturated: scan must not wrap past 65535.
         let start = port.saturating_sub(1).max(1024);
         let found = scan_subnet("127.0.0", start, None, &token, "127.0.0.1:9999", &token, "tester");

@@ -35,7 +35,7 @@ A pink little penguin face ((•O•)) watches over your network.
 * **Notifications** — generic webhook POST plus optional terminal bell on transitions
 * **Headless `--once` mode** — one pass over all hosts as text or JSON, exit code doubles as the probe result
 * **HTML status export** — one keypress renders a shareable status page
-* **Read-only LAN web page** — `W` serves the live table as a website (grouped by label, themed like the TUI), `--serve` runs it headless, `--install-startup` starts it on boot
+* **Read-only LAN web page** — `W` serves the live table as a website (flat like the TUI, themed like it, updates live with no reloads), `--serve` runs it headless, `--install-startup` or `R` starts it on boot
 * **Device sync** — `Y` pairs instances with join codes; adds, edits, and removals converge both ways
 * **Mouse support**, compact density (`v`), session restore, first-run wizard
 * **Multiple themes** — `btop`, `dracula`, `nord`, `gruvbox-dark`, `ayu-light`, `archwave`
@@ -101,7 +101,7 @@ app re-selects last session's host on startup.
 | `?` | full key-binding cheat sheet |
 | mouse | click to select, wheel to scroll |
 | `t` | theme picker (live preview, persists) |
-| `o` | email (SMTP) alert settings — threshold, escalations, themed like the TUI |
+| `o` | email (SMTP) alert settings — threshold, escalations, client-safe styling |
 | `u` | check for updates / install when available |
 | `M` | full menu (actionable) |
 | `q` / `Ctrl+C` | quit (cleanly!) |
@@ -250,10 +250,12 @@ discarded.
   plaintext relays. `to` accepts a comma-separated list. Delivery is
   fire-and-forget so a slow relay never stalls pinging.
 
-Emails are styled with the **currently active theme**: page background,
-card, and text colors come from the theme, and the status is unmissable —
-a full-width banner in the theme's danger color (`● DOWN`) or good color
-(`● UP`), with host, target, group, timestamp, latency, and streak.
+Emails use the same modern card layout as the web page: unmissable status
+banner (`● DOWN` / `● UP`), status pill, and detail card with host, target,
+group, timestamp, latency, and streak. Because mail clients mangle dark
+backgrounds, emails always render on a light, client-safe canvas — theme
+status and accent colors are carried over but darkened until they pass
+contrast checks, so white-on-dark theme fonts never arrive invisible.
 
 Downstream hosts with `depends_on` pointing at a down upstream read `DEP`
 and stay silent — fix the upstream, not the noise. `!` mutes a host for an
@@ -277,11 +279,12 @@ Nothing is served unless you ask. Press **`W`** in the TUI to start serving
 the live table as a website, press **`W`** again to stop it — or run it
 headless (no terminal needed) with `--serve`. Press **`B`** to open the
 page in your default browser (starts serving first when off). The `M` menu
-always shows whether the page is currently being served.
+always shows whether the page is currently being served. Your choice
+persists: a shown page comes back on every launch with no flags or clicks.
 
 ```bash
 ping-uin --serve --bind 0.0.0.0 --port 8080
-# HTML:  http://<this-host>:8080/          (auto-refreshes every 15s)
+# HTML:  http://<this-host>:8080/          (live updates, no reloads; plain refresh without JS)
 # Health: http://<this-host>:8080/health   ("ok", for supervisors/monitors)
 ```
 
@@ -299,13 +302,15 @@ carry the actual port).
   network; use `--bind 127.0.0.1` for local-only. The startup banner and the
   `W` popup print the real LAN IP + port (e.g. `http://192.168.1.42:8080/`),
   so you know exactly what to type from other devices.
-* **Grouped by label** — like the TUI grouped view: collapsible per-group
-  cards (no JS, native `<details>`), groups and hosts down-first, per-group
-  up/down tallies, plus one-click group filter chips. `?group=<label>`
-  filters to one group.
+* **Flat by default, grouped on demand** — the page opens as one table with
+  every host its own row, like the TUI. The `Grouped` chip (or
+  `?view=grouped`) switches to collapsible per-label cards, groups and
+  hosts down-first with per-group tallies. `?group=<label>` filters to one
+  group either way, plus one-click group filter chips.
 * **Modern card UI, zero JS** — status summary pills, per-status badges,
   sticky table headers, row hover, system fonts with monospace numerals,
-  and a responsive layout that stacks on phones. Auto-refresh keeps it live;
+  and a responsive layout that stacks on phones. Values update in place every 5s with no reload
+  (changed rows flash; collapsed groups stay put; plain meta-refresh fallback without JS);
   sorting, filtering, and collapsing are all plain links.
 * **Sorting** — click any table header (Host, Status, Latency, Group, Uptime,
   SLA 24h) for a flat sorted table; clicking the active header toggles
@@ -362,9 +367,10 @@ ping-uin --sync-join PUIN-192.168.1.42-8080-abcd-efgh-jklm --port 8080
 
 ### Start on boot (opt-in)
 
-Nothing is installed automatically. Only `--install-startup` creates a boot
-entry, and `--uninstall-startup` removes it again. To start the status page
-each time the machine restarts:
+Nothing is installed automatically. Only `--install-startup` (or `R` in the
+`M` menu) creates a boot entry, and `--uninstall-startup` (or `R` again)
+removes it. The menu always shows whether it is on. To start the status
+page each time the machine restarts:
 
 ```bash
 ping-uin --install-startup --bind 0.0.0.0 --port 8080
