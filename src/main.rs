@@ -5216,6 +5216,13 @@ fn sync_email_state(config: &mut Config, h: &HostState) -> bool {
 /// `ping-uin --serve`: headless probing loop + read-only LAN page + sync.
 /// No TUI, no stdin needed — suited for startup services and LAN viewing.
 fn run_serve(bind: &str, port: u16) -> io::Result<()> {
+    let _instance_lock = match config::acquire_instance_lock() {
+        Ok(lock) => lock,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            std::process::exit(1);
+        }
+    };
     let mut config = Config::load();
     if config.hosts.is_empty() {
         eprintln!("no hosts configured (add some in the TUI first)");
@@ -5456,9 +5463,15 @@ fn print_usage() {
     println!("  ping-uin --help          show this help");
 }
 
-/// One-shot CLI helpers. These touch the config file directly, so quit the
-/// TUI on this device first if it is running (it is the live writer).
+/// One-shot CLI helpers. The mutating ones take the instance lock: with a
+/// TUI or --serve running on this data dir they refuse instead of racing
+/// it over the config file (read-only commands skip the lock).
+fn hold_instance_lock() -> io::Result<config::InstanceLock> {
+    config::acquire_instance_lock().map_err(io::Error::other)
+}
+
 fn run_sync_code(port: u16) -> io::Result<()> {
+    let _instance_lock = hold_instance_lock()?;
     let mut config = Config::load();
     if config.sync_token.as_deref().map_or(true, |t| t.is_empty()) {
         config.sync_token = Some(sync::generate_token());
@@ -5474,6 +5487,7 @@ fn run_sync_code(port: u16) -> io::Result<()> {
 
 fn run_sync_join(code: &str, port: u16) -> io::Result<()> {
     let (peer_addr, peer_token) = sync::parse_join_code(code).map_err(|e| io::Error::other(e))?;
+    let _instance_lock = hold_instance_lock()?;
     let mut config = Config::load();
     if config.sync_token.as_deref().map_or(true, |t| t.is_empty()) {
         config.sync_token = Some(sync::generate_token());
@@ -5525,6 +5539,7 @@ fn run_sync_peers() -> io::Result<()> {
 }
 
 fn run_sync_forget(addr: &str) -> io::Result<()> {
+    let _instance_lock = hold_instance_lock()?;
     let mut config = Config::load();
     let before = config.sync_peers.len();
     config.sync_peers.retain(|p| p.addr != addr && p.hostname != addr);
@@ -5625,6 +5640,17 @@ fn main() -> io::Result<()> {
         }
         return run_once(&format);
     }
+
+    // One copy per data dir: refuse instead of silently fighting another
+    // ping-uin over the config, probes, mails, and listener port. Held to
+    // the end of main via _instance_lock (Drop releases on exit).
+    let _instance_lock = match config::acquire_instance_lock() {
+        Ok(lock) => lock,
+        Err(msg) => {
+            eprintln!("{}", msg);
+            std::process::exit(1);
+        }
+    };
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

@@ -120,6 +120,178 @@ pub fn paths() -> &'static Paths {
     PATHS.get_or_init(resolve_paths)
 }
 
+/// Single-instance lock for one data directory.
+///
+/// Long runners (the TUI, `--serve`) hold this while alive so a second copy
+/// against the SAME data dir refuses to start instead of silently fighting
+/// over the config (clobbered saves), the probes (duplicates), the mails
+/// (duplicates), and the listener port. Different data dirs (e.g. portable
+/// vs installed) have different lock files and stay independent.
+///
+/// The lock file holds our PID. A pre-existing lock is only honored when its
+/// PID is both alive AND looks like ping-uin (PID reuse must never block a
+/// legitimate start); otherwise it is stale (crash, kill -9) and taken over.
+/// Released automatically on clean exit via Drop.
+pub struct InstanceLock {
+    path: PathBuf,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn lock_path() -> PathBuf {
+    paths().config.parent().map(|d| d.join("ping-uin.lock")).unwrap_or_else(|| PathBuf::from("ping-uin.lock"))
+}
+
+/// Process command name for `pid`, if observable. Used to tell a live
+/// ping-uin apart from an unrelated PID reuse. Linux reads procfs directly
+/// (no subprocess); macOS shells to `ps`; Windows to `tasklist`.
+fn process_comm(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid))
+            .ok()?
+            .trim()
+            .to_string();
+        if comm.is_empty() {
+            None
+        } else {
+            Some(comm)
+        }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let comm = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if comm.is_empty() {
+            None
+        } else {
+            Some(comm)
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.lines()
+            .filter_map(|l| l.split(',').next())
+            .map(|s| s.trim_matches('"').to_string())
+            .find(|s| !s.is_empty())
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Pure verdict for a pre-existing lock PID: refuse only when the process is
+/// observable AND its command looks like ping-uin. Anything else (dead PID,
+/// unobservable process, recycled PID now running something else) is stale
+/// and safe to take over.
+fn lock_verdict(pid_alive: bool, comm_matches: bool) -> bool {
+    pid_alive && comm_matches
+}
+
+/// How to stop the other copy, per OS (used in the refusal message).
+fn stop_hint(pid: u32) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        format!("Task Manager, `taskkill /PID {} /F`, or `schtasks /end /tn ping-uin` for the startup task", pid)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!("`kill {}` (systemd service: `systemctl --user stop ping-uin`)", pid)
+    }
+}
+
+/// Try to become the instance owning this data dir.
+/// - `Ok(lock)`: hold it for as long as this process runs (Drop releases).
+/// - `Err(msg)`: another live ping-uin owns the dir — show `msg` and exit.
+pub fn acquire_instance_lock() -> Result<InstanceLock, String> {
+    acquire_instance_lock_in(&lock_path())
+}
+
+/// Testable core: lock `path` itself (production passes the data-dir lock
+/// file). See [`acquire_instance_lock`] for the contract.
+pub fn acquire_instance_lock_in(path: &PathBuf) -> Result<InstanceLock, String> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    let path = path.clone();
+    let me = std::process::id();
+    // Atomic: exactly one racer wins; the loser sees the file.
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{}", me);
+            return Ok(InstanceLock { path });
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            // Fail open with a loud warning: without a writable data dir
+            // nothing else persists either, so refusing would only strand.
+            eprintln!("warning: cannot create instance lock ({}); running unlocked", e);
+            return Ok(InstanceLock { path });
+        }
+    }
+    // Someone was here first: honor it only if it's a live ping-uin.
+    let holder: Option<u32> = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|pid| *pid != me);
+    match holder {
+        Some(pid) => {
+            let comm = process_comm(pid).unwrap_or_default().to_lowercase();
+            let alive = !comm.is_empty();
+            if lock_verdict(alive, comm.contains("ping-uin") || comm.contains("ping_uin")) {
+                return Err(format!(
+                    "another ping-uin (PID {}) is already using {} — one copy per data dir.\nQuit it first ({}) or run --once for a lock-free check.",
+                    pid,
+                    path.parent().map(|d| d.display().to_string()).unwrap_or_else(|| ".".to_string()),
+                    stop_hint(pid)
+                ));
+            }
+            // Stale or foreign lock: take over.
+            let _ = fs::remove_file(&path);
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut f) => {
+                    let _ = writeln!(f, "{}", me);
+                    Ok(InstanceLock { path })
+                }
+                Err(e) => Err(format!("instance lock race lost or unwritable ({}); try again", e)),
+            }
+        }
+        // Unparseable/own lock file: take over (same crash-recovery path).
+        None => {
+            let _ = fs::remove_file(&path);
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| format!("cannot create instance lock ({}); is the data dir writable?", e))
+                .and_then(|mut f| {
+                    writeln!(f, "{}", me)
+                        .map_err(|e| format!("cannot write instance lock ({})", e))?;
+                    Ok(InstanceLock { path })
+                })
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct HostConfig {
     pub name: String,
@@ -840,6 +1012,43 @@ mod tests {
         assert_eq!(h.target(), "db:5432");
         let p = HostConfig::new("db", 60, "g", None, None);
         assert_eq!(p.target(), "db");
+    }
+
+    #[test]
+    fn lock_verdict_only_refuses_live_ping_uin() {
+        // Live ping-uin holder: refuse.
+        assert!(lock_verdict(true, true));
+        // Dead PID, unobservable process, or recycled PID running something
+        // else: all stale, all take over.
+        assert!(!lock_verdict(false, false));
+        assert!(!lock_verdict(false, true));
+        assert!(!lock_verdict(true, false));
+    }
+
+    #[test]
+    fn instance_lock_roundtrip_and_takeover() {
+        let dir = std::env::temp_dir().join(format!("puin-lock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ping-uin.lock");
+        // Fresh acquire works and holds.
+        let lock = acquire_instance_lock_in(&path).expect("fresh acquire");
+        assert!(path.exists());
+        // Our own test binary is NOT named ping-uin, so a second acquire
+        // correctly treats us as foreign (PID-reuse safety) and takes over.
+        // To test the live-holder path deterministically, simulate it via
+        // lock_verdict above; here assert takeover never errors.
+        drop(lock);
+        assert!(!path.exists(), "Drop releases the lock file");
+        // Stale lock (dead PID) is taken over.
+        std::fs::write(&path, "4294967295").unwrap();
+        let lock2 = acquire_instance_lock_in(&path).expect("stale takeover");
+        assert!(path.exists());
+        drop(lock2);
+        // Garbage lock file is taken over, not fatal.
+        std::fs::write(&path, "not-a-pid").unwrap();
+        assert!(acquire_instance_lock_in(&path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
