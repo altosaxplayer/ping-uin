@@ -371,6 +371,9 @@ pub struct Config {
     /// Propagated deletions (tombstones). See `SyncDeletion`.
     #[serde(default)]
     pub sync_deleted: Vec<SyncDeletion>,
+    /// Persisted outage-mail state per host. See `EmailOutageState`.
+    #[serde(default)]
+    pub email_state: std::collections::HashMap<String, EmailOutageState>,
 }
 
 /// One paired neighbor instance: where to push + which token it expects.
@@ -405,6 +408,19 @@ pub struct SyncDeletion {
     pub at: i64,
 }
 
+/// Persisted per-host outage-mail state so a restart doesn't resend DOWN
+/// mail for an outage that was already mailed (or skip a recovery that is
+/// still owed). Keyed by host name in `Config::email_state`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EmailOutageState {
+    /// A DOWN mail went out for the current outage; cleared on recovery.
+    #[serde(default)]
+    pub down_sent: bool,
+    /// Escalation ladder level reached (0 none, 1 = 5m, 2 = 30m).
+    #[serde(default)]
+    pub escalation: u8,
+}
+
 fn default_timeout() -> u64 {
     DEFAULT_TIMEOUT_MS
 }
@@ -436,6 +452,7 @@ impl Default for Config {
             sync_token: None,
             sync_peers: Vec::new(),
             sync_deleted: Vec::new(),
+            email_state: std::collections::HashMap::new(),
         }
     }
 }
@@ -636,6 +653,10 @@ impl Config {
                     .get("sync_deleted")
                     .and_then(|v| serde_json::from_value::<Vec<SyncDeletion>>(v.clone()).ok())
                     .unwrap_or_default(),
+                email_state: value
+                    .get("email_state")
+                    .and_then(|v| serde_json::from_value::<std::collections::HashMap<String, EmailOutageState>>(v.clone()).ok())
+                    .unwrap_or_default(),
             };
         }
         // Corrupt config: back it up instead of silently discarding user data.
@@ -652,6 +673,35 @@ impl Config {
         fs::write(&tmp, json)?;
         fs::rename(&tmp, &paths().config)?;
         Ok(())
+    }
+}
+
+/// Merge one CSV import row keyed by immutable IP.
+///
+/// Matching is trimmed + case-insensitive so `DB.internal` updates `db.internal`
+/// instead of duplicating it. On a match the stored IP spelling is kept and
+/// every other field comes from the row (the CSV is authoritative, including
+/// clearing an alias by leaving its cell empty). One piece of local-only
+/// state survives: the maintenance mute window (the CSV has no mute column,
+/// so an import must never silently unmute) — everything else is stamped
+/// fresh via `touch()` so neighbor sync prefers this side afterwards.
+/// Returns `(index, is_new)`.
+pub fn upsert_imported_host(hosts: &mut Vec<HostConfig>, mut entry: HostConfig) -> (usize, bool) {
+    entry.touch();
+    entry.name = entry.name.trim().to_string();
+    let key = entry.name.to_lowercase();
+    match hosts.iter().position(|h| h.name.trim().to_lowercase() == key) {
+        Some(i) => {
+            let muted_until = hosts[i].muted_until;
+            entry.name = hosts[i].name.clone();
+            entry.muted_until = muted_until;
+            hosts[i] = entry;
+            (i, false)
+        }
+        None => {
+            hosts.push(entry);
+            (hosts.len() - 1, true)
+        }
     }
 }
 
@@ -790,6 +840,42 @@ mod tests {
         assert_eq!(h.target(), "db:5432");
         let p = HostConfig::new("db", 60, "g", None, None);
         assert_eq!(p.target(), "db");
+    }
+
+    #[test]
+    fn import_matching_ip_overwrites_fields_keeps_ip_and_mute() {
+        let mut hosts = vec![{
+            let mut h = HostConfig::new("db.internal", 60, "old-group", Some("Old Alias".to_string()), None);
+            h.warn_latency_ms = Some(100);
+            h.muted_until = Some(9_999_999_999);
+            h.updated_at = 100;
+            h
+        }];
+        // Same IP, different case: updates in place, no duplicate.
+        let mut row = HostConfig::new("DB.INTERNAL", 120, "new-group", None, Some(5432));
+        row.updated_at = 50; // stale stamp is refreshed by the import itself
+        let (i, is_new) = upsert_imported_host(&mut hosts, row);
+        assert_eq!((i, is_new), (0, false));
+        assert_eq!(hosts.len(), 1);
+        let h = &hosts[0];
+        // IP spelling is immutable: the stored form wins.
+        assert_eq!(h.name, "db.internal");
+        // Every other CSV-managed field comes from the row (alias cleared).
+        assert_eq!(h.group, "new-group");
+        assert_eq!(h.alias, None);
+        assert_eq!(h.port, Some(5432));
+        assert_eq!(h.warn_latency_ms, None);
+        // Local-only mute window survives; edit is stamped fresh for sync.
+        assert_eq!(h.muted_until, Some(9_999_999_999));
+        assert!(h.updated_at > 100);
+    }
+
+    #[test]
+    fn import_unknown_ip_appends() {
+        let mut hosts = vec![HostConfig::new("a", 60, "g", None, None)];
+        let (i, is_new) = upsert_imported_host(&mut hosts, HostConfig::new("b", 60, "g", None, None));
+        assert_eq!((i, is_new), (1, true));
+        assert_eq!(hosts.len(), 2);
     }
 
     #[test]

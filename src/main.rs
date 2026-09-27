@@ -589,6 +589,37 @@ mod tests {
         assert!(!is_suppressed(&hosts, "nope")); // unknown host
     }
 
+    fn footer_text(theme: &Theme, width: usize) -> String {
+        build_footer_lines(theme, None, width)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn footer_shows_labels_never_bare_keys() {
+        let theme = build_themes().into_iter().next().unwrap();
+        // Wide windows: full-text labels, no overflow marker.
+        for width in [94usize, 140] {
+            let lines = build_footer_lines(&theme, None, width);
+            assert_eq!(lines.len(), MENU_ROWS, "width {}", width);
+            let text = footer_text(&theme, width);
+            for label in ["ping now", "clear stats", "web page", "browser", "sync", "quit"] {
+                assert!(text.contains(label), "width {} missing label: {}", width, label);
+            }
+            assert!(!text.contains("more [M]"), "width {} overflowed", width);
+        }
+        // 80-col window (inner width 74): abbreviated but still text labels —
+        // never bare keys, never hidden behind "+N more".
+        let text = footer_text(&theme, 74);
+        assert_eq!(build_footer_lines(&theme, None, 74).len(), MENU_ROWS);
+        for label in ["ping", "web", "sync", "quit"] {
+            assert!(text.contains(label), "width 74 missing label: {}", label);
+        }
+        assert!(!text.contains("more [M]"), "width 74 overflowed");
+    }
+
     #[test]
     fn popup_rect_fits_content_and_clamps_to_area() {
         use ratatui::layout::Rect;
@@ -717,6 +748,36 @@ mod tests {
         );
         assert_eq!(primary_web_url("http://127.0.0.1:8080/"), "http://127.0.0.1:8080/");
         assert_eq!(primary_web_url(""), "");
+    }
+
+    #[test]
+    fn outage_mail_state_persists_across_restart() {
+        let mut config = Config::default();
+        let mut h = HostState::new(&config.hosts[0]);
+        // Healthy: nothing persisted.
+        assert!(!sync_email_state(&mut config, &h));
+        assert!(config.email_state.is_empty());
+        // DOWN mailed: entry appears, repeat sync is a no-op.
+        h.down_email_sent = true;
+        assert!(sync_email_state(&mut config, &h));
+        assert!(config.email_state.get(&h.name).map_or(false, |e| e.down_sent));
+        assert!(!sync_email_state(&mut config, &h));
+        // Escalation advance: entry updates.
+        h.escalation = 1;
+        assert!(sync_email_state(&mut config, &h));
+        assert_eq!(config.email_state.get(&h.name).map(|e| e.escalation), Some(1));
+        // Recovery: entry cleared; clearing again is a no-op.
+        h.down_email_sent = false;
+        h.escalation = 0;
+        assert!(sync_email_state(&mut config, &h));
+        assert!(!config.email_state.contains_key(&h.name));
+        assert!(!sync_email_state(&mut config, &h));
+        // Survives a JSON round-trip (this is what the restart reads).
+        h.down_email_sent = true;
+        assert!(sync_email_state(&mut config, &h));
+        let json = serde_json::to_string(&config).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(back.email_state.get(&h.name).map_or(false, |e| e.down_sent));
     }
 
     #[test]
@@ -998,6 +1059,9 @@ impl App {
         if self.selected_idx < self.hosts.len() {
             let removed = self.hosts.remove(self.selected_idx);
             self.config.hosts.remove(self.selected_idx);
+            // A deleted host takes its outage-mail state with it, so a later
+            // re-add starts unmailed.
+            self.config.email_state.remove(&removed.name);
             // Tombstone so the delete propagates to synced neighbors instead
             // of being resurrected by their next push.
             let now = config::now_epoch();
@@ -1175,23 +1239,17 @@ impl App {
         }
     }
 
-    /// Read and merge hosts.csv: new rows get added; existing rows get updated.
-    /// Every touched row is stamped so neighbor sync prefers this side.
+    /// Read and merge hosts.csv: rows match devices by immutable IP
+    /// (case-insensitive); all other fields come from the row. See
+    /// `config::upsert_imported_host`.
     fn import_entries(&mut self, path: &std::path::Path, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
         if let Ok(entries) = read_entries_csv(path) {
-            for mut entry in entries {
-                entry.touch();
-                match self.config.hosts.iter().position(|h| h.name == entry.name) {
-                    Some(i) => {
-                        self.config.hosts[i] = entry.clone();
-                        if let Some(h) = self.hosts.get_mut(i) {
-                            h.sync_config(&entry);
-                        }
-                    }
-                    None => {
-                        self.hosts.push(HostState::new(&entry));
-                        self.config.hosts.push(entry.clone());
-                    }
+            for entry in entries {
+                let (i, is_new) = config::upsert_imported_host(&mut self.config.hosts, entry);
+                if is_new {
+                    self.hosts.push(HostState::new(&self.config.hosts[i]));
+                } else if let Some(h) = self.hosts.get_mut(i) {
+                    h.sync_config(&self.config.hosts[i]);
                 }
             }
             self.history_cache.clear();
@@ -1304,7 +1362,13 @@ impl App {
             h.down_since = None;
             h.escalation = 0;
         }
+        // Clearing stats forgets the outage too: drop any persisted mail
+        // state so a restart doesn't resurrect it.
+        if let Some(h) = self.hosts.get(self.selected_idx) {
+            self.config.email_state.remove(&h.name.clone());
+        }
         self.history_cache.clear();
+        self.persist();
     }
 
     /// Force the selected host to ping ASAP by resetting its schedule.
@@ -1966,9 +2030,11 @@ fn render_group_header(group: &str, hosts: &[HostState], theme: &Theme, collapse
 
 /// Fixed-height menu box: exactly MENU_ROWS content rows + top/bottom
 /// borders. Height never changes, so the table above never jumps and the
-/// menu reads as one distinct bar pinned to the bottom.
-const MENU_BOX_H: u16 = 4;
-const MENU_ROWS: usize = 2;
+/// menu reads as one distinct bar pinned to the bottom. Three rows keeps
+/// full-text labels visible at normal widths; narrower windows fall back to
+/// abbreviated labels, then bare keys + a "+N more [M]" marker.
+const MENU_BOX_H: u16 = 5;
+const MENU_ROWS: usize = 3;
 
 fn footer_hints() -> Vec<(&'static str, &'static str)> {
     vec![
@@ -2025,7 +2091,7 @@ fn short_footer_hints() -> Vec<(&'static str, &'static str)> {
 
 /// Keys-only last resort: every binding as a bare key, packed into MENU_ROWS.
 fn keys_only_lines(theme: &Theme, max_width: usize) -> Vec<Line<'static>> {
-    let keys = ["↑↓", "Spc", "a", "d", "e", "h", "c", "i", "E", "g", "f", "s", "/", "?", "t", "o", "u", "q", "Esc"];
+    let keys = ["↑↓", "Spc", "a", "d", "e", "h", "c", "i", "E", "W", "B", "Y", "g", "f", "s", "/", "?", "t", "o", "u", "q", "Esc"];
     let mut rows: Vec<Vec<Span<'static>>> = vec![vec![Span::raw("  ")]];
     let mut used = 2usize;
     for k in keys {
@@ -4680,6 +4746,14 @@ fn run_app<B: ratatui::backend::Backend>(
                             send_smtp_email(smtp, subject, text, html);
                         }
                     }
+                    // Persist outage-mail state (if it changed) so a restart
+                    // neither resends DOWN mail for an already-mailed outage
+                    // nor forgets a recovery that is still owed.
+                    if let Some(h) = app.hosts.iter().find(|h| h.name == host) {
+                        if sync_email_state(&mut app.config, h) {
+                            let _ = app.config.save();
+                        }
+                    }
                 }
                 Message::UpdateAvailable { version } => {
                     app.update_available = Some(version);
@@ -4741,6 +4815,13 @@ fn run_app<B: ratatui::backend::Backend>(
             for (name, display, target, group, streak, latency_ms, level) in pending {
                 if let Some(h) = app.hosts.iter_mut().find(|h| h.name == name) {
                     h.escalation = level;
+                }
+                // Persist the ladder level with the outage state (restarts
+                // must not re-mail an escalation that already went out).
+                if let Some(h) = app.hosts.iter().find(|h| h.name == name) {
+                    if sync_email_state(&mut app.config, h) {
+                        let _ = app.config.save();
+                    }
                 }
                 let event = if level >= 2 { "still_down_30m" } else { "still_down_5m" };
                 if let Some(url) = app.config.webhook_url.clone() {
@@ -5058,6 +5139,23 @@ fn apply_sync_event(
         "sync: already up to date".to_string()
     } else {
         format!("sync: {} ({})", parts.join(" "), ev.from_addr)
+    }
+}
+
+/// Mirror a host's in-memory outage-mail flags into the persisted
+/// `email_state` map. Returns true when the persisted entry changed, so
+/// callers save only on real transitions (mails are rare; probes are not).
+fn sync_email_state(config: &mut Config, h: &HostState) -> bool {
+    if h.down_email_sent {
+        let e = config.email_state.entry(h.name.clone()).or_default();
+        if !e.down_sent || e.escalation != h.escalation {
+            e.down_sent = true;
+            e.escalation = h.escalation;
+            return true;
+        }
+        false
+    } else {
+        config.email_state.remove(&h.name).is_some()
     }
 }
 
@@ -5425,6 +5523,16 @@ fn main() -> io::Result<()> {
         .map(HostState::new)
         .collect();
     seed_from_log(&mut hosts, config.graph_width)?;
+    // Restore persisted outage-mail flags so a restart neither resends DOWN
+    // mail for an already-mailed outage nor forgets a pending recovery.
+    // A host still DOWN keeps its mailed/escalation state; a host back UP
+    // will emit its owed recovery mail on the first successful probe.
+    for h in hosts.iter_mut() {
+        if let Some(st) = config.email_state.get(&h.name) {
+            h.down_email_sent = st.down_sent;
+            h.escalation = st.escalation;
+        }
+    }
 
     let shared_hosts = Arc::new(RwLock::new(schedules_from_config(&config.hosts)));
     let shutdown = Arc::new(AtomicBool::new(false));

@@ -226,7 +226,9 @@ discarded.
   at the 30-minute escalation).
 - `smtp` — sends **one DOWN email after `down_threshold` consecutive failures**
   (default 3, 1–100, one mail per outage), plus a **recovery UP email** when
-  the host comes back. Set `"escalations": true` to also mail the
+  the host comes back. Outage-mail state is persisted in `ping-uin.json`, so
+  quitting and reopening never resends DOWN mail for an already-mailed
+  outage (and a still-owed recovery still goes out). Set `"escalations": true` to also mail the
   `still_down_5m` / `still_down_30m` reminders. Port 465 uses
   SMTPS, other ports use STARTTLS; set `use_tls: false` only for local
   plaintext relays. `to` accepts a comma-separated list. Delivery is

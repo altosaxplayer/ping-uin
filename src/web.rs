@@ -788,6 +788,14 @@ pub fn run_server(
     while !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Accepted sockets inherit the listener's non-blocking mode
+                // on Windows, which makes the handler's first read fail
+                // instantly and drops every connection. Force blocking:
+                // handlers do one request per thread and want plain reads.
+                // Harmless no-op where streams are already blocking.
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
                 let page = page.clone();
                 let version = version.clone();
                 let web_enabled = web_enabled.clone();
@@ -824,6 +832,57 @@ pub fn start_in_background(
 mod tests {
     use super::*;
     use std::sync::mpsc::sync_channel;
+
+    fn get(port: u16, target: &str) -> String {
+        let mut s = std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.write_all(format!("GET {} HTTP/1.0\r\n\r\n", target).as_bytes()).unwrap();
+        let mut body = String::new();
+        s.read_to_string(&mut body).unwrap();
+        body
+    }
+
+    /// Full stack over real TCP: bind → accept → read → route → respond.
+    /// Guards the Windows failure where accepted sockets inherited the
+    /// listener's non-blocking mode and every connection was dropped.
+    #[test]
+    fn live_server_serves_page_and_health() {
+        let page = new_shared_page();
+        {
+            let mut p = page.write().unwrap();
+            p.hosts = sample();
+        }
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let enabled = Arc::new(AtomicBool::new(true));
+        let (tx, _rx) = sync_channel::<SyncEvent>(8);
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let handle = start_in_background(
+            page,
+            "127.0.0.1".to_string(),
+            port,
+            shutdown.clone(),
+            enabled,
+            tx,
+        );
+        let mut page_body = String::new();
+        let mut health_body = String::new();
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+                page_body = get(port, "/");
+                health_body = get(port, "/health");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        assert!(page_body.contains("200 OK"), "page head: {}", &page_body[..page_body.len().min(200)]);
+        assert!(page_body.contains("ping-uin status"));
+        assert!(page_body.contains("Google DNS"));
+        assert!(health_body.contains("200 OK") && health_body.contains("ok"));
+    }
 
     fn sample() -> Vec<HostSnapshot> {
         vec![
