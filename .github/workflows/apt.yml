@@ -19,6 +19,13 @@ name: apt
 on:
   release:
     types: [published]
+  # The release workflow creates the GitHub release with GITHUB_TOKEN, which
+  # does not fire secondary `release` events. Trigger explicitly when it
+  # finishes so the apt repo stays in sync with every published release.
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
