@@ -73,12 +73,20 @@ jobs:
 
       - name: Fetch packaging files from main
         # The tag being packaged predates the apt scaffolding (or may do so
-        # again), so always take key.asc/index.html from main, not the tag.
+        # again), so always take key.asc/index.html from main via the API —
+        # never from the tag checkout. Fail loudly on empty downloads.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git fetch origin main --depth 1
           mkdir -p /tmp/packaging-apt
-          git show FETCH_HEAD:packaging/apt/key.asc > /tmp/packaging-apt/key.asc
-          git show FETCH_HEAD:packaging/apt/index.html > /tmp/packaging-apt/index.html
+          for f in key.asc index.html; do
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github.raw" \
+              "https://api.github.com/repos/${{ github.repository }}/contents/packaging/apt/$f?ref=main" \
+              -o "/tmp/packaging-apt/$f"
+            test -s "/tmp/packaging-apt/$f"
+          done
+          wc -c /tmp/packaging-apt/key.asc /tmp/packaging-apt/index.html
 
       - name: Update apt repo on gh-pages
         env:
@@ -105,6 +113,8 @@ jobs:
           mkdir -p /tmp/site/apt/pool/main/p/ping-uin /tmp/site/apt/dists/stable/main/binary-amd64
           cp "$DEB" /tmp/site/apt/pool/main/p/ping-uin/
           cp /tmp/packaging-apt/key.asc /tmp/site/apt/key.asc
+          test -s /tmp/site/apt/key.asc
+          wc -c /tmp/site/apt/key.asc
           touch /tmp/site/.nojekyll
           if [ ! -f /tmp/site/index.html ]; then
             cp /tmp/packaging-apt/index.html /tmp/site/index.html
