@@ -11,6 +11,6 @@ NestedInstallerFiles:
 Installers:
   - Architecture: x64
     InstallerUrl: https://github.com/altosaxplayer/ping-uin/releases/download/v0.1.7/ping-uin-windows-x86_64.zip
-    InstallerSha256: 7AFD54DC4485AB51D7E8BF1EB2314EAEE2222C2E70BD5A4A5EACE070578858B6
+    InstallerSha256: C0446861D9E092272E7F1E939F82EE3C805EC7C5FDE2B31F8DDE4D770A0DD88D
 ManifestType: installer
 ManifestVersion: 1.6.0
