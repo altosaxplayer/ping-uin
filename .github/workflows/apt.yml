@@ -158,7 +158,9 @@ jobs:
           # shellcheck disable=SC2086
           sudo apt-get $APT_OPTS install --download-only -y ping-uin
           mkdir -p /tmp/fakeroot/var/lib/dpkg
-          sudo dpkg --force-not-root --root=/tmp/fakeroot --admindir=/tmp/fakeroot/var/lib/dpkg --log=/tmp/dpkg.log -i "$DEB"
+          # --unpack only (no configure): the bare fakeroot has no libc6,
+          # so a full install would fail dependency checks by design.
+          sudo dpkg --force-not-root --root=/tmp/fakeroot --admindir=/tmp/fakeroot/var/lib/dpkg --log=/tmp/dpkg.log --unpack "$DEB"
           test -x /tmp/fakeroot/usr/bin/ping-uin
           echo "apt repo verification passed"
 
