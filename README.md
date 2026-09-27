@@ -343,7 +343,10 @@ ping-uin --sync-join PUIN-192.168.1.42-8080-abcd-efgh-jklm --port 8080
   address, and a busy port is reported instead of failing silently. Same
   Wi-Fi (no client isolation), allow ping-uin through the device firewall,
   and make sure the IP in the join code is reachable (VPNs/Docker can put a
-  wrong one in — join errors say which of these it looks like).
+  wrong one in — join errors say which of these it looks like). If the
+  code's IP is wrong, keep the code and append the right address when
+  joining: `Y → j`, paste `PUIN-…-…`, add ` @ 192.168.1.42`, Enter
+  (CLI: `--sync-join "CODE @ 192.168.1.42"` or `--sync-join CODE 192.168.1.42`).
 
 ### Start on boot (opt-in)
 

@@ -2565,7 +2565,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     Text::from(Line::from(vec![
                         Span::styled("Join with code ", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                         Span::styled(q, Style::default().fg(theme.hi_fg)),
-                        Span::styled("   [Enter] join   [Esc] back", Style::default().fg(theme.inactive_fg)),
+                        Span::styled("   [@ ip overrides]   [Enter] join   [Esc] back", Style::default().fg(theme.inactive_fg)),
                     ]))
                 }
                 InputMode::Normal => unreachable!(),
@@ -3133,6 +3133,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
                         Span::styled("  join code:   ", Style::default().fg(theme.inactive_fg)),
                         Span::styled(code, Style::default().fg(theme.hi_fg).add_modifier(Modifier::BOLD)),
                     ]));
+                    lines.push(Line::from("  wrong IP in the code (VPN/Docker)? join with: code @ 192.168.1.42").style(Style::default().fg(theme.inactive_fg)));
                 }
                 None => {
                     lines.push(Line::from("  no join code yet — press [g] to create one.").style(Style::default().fg(theme.hi_fg)));
@@ -5380,7 +5381,7 @@ fn print_usage() {
     println!("                         headless probing + read-only LAN page (+ sync when paired)");
     println!("  ping-uin --sync-code [--port 8080]");
     println!("                         print this device's join code (creates one if needed)");
-    println!("  ping-uin --sync-join <code>");
+    println!("  ping-uin --sync-join <code>[@host[:port]]");
     println!("                         pair with another device (one-time pull; ongoing sync needs TUI/--serve running)");
     println!("  ping-uin --sync-peers     list paired devices (hostname, joined, last sync)");
     println!("  ping-uin --sync-forget <ip:port>   unpair a device (its hosts stay)");
@@ -5520,9 +5521,15 @@ fn main() -> io::Result<()> {
     if let Some(pos) = args.iter().position(|a| a == "--sync-join") {
         let code = args.get(pos + 1).cloned().unwrap_or_default();
         if code.is_empty() || code.starts_with("--") {
-            eprintln!("usage: ping-uin --sync-join <code>");
+            eprintln!("usage: ping-uin --sync-join <code>[@host[:port]]  (append @host if the code's IP isn't reachable)");
             std::process::exit(1);
         }
+        // Shells split on spaces, so `--sync-join CODE 192.168.1.42` also
+        // works: a non-flag second arg becomes the @host override.
+        let code = match args.get(pos + 2) {
+            Some(extra) if !extra.starts_with('-') => format!("{} @ {}", code, extra),
+            _ => code,
+        };
         return run_sync_join(&code, parse_web_port(&args));
     }
     if args.iter().any(|a| a == "--sync-peers") {

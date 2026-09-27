@@ -85,7 +85,16 @@ pub fn make_join_code(host: &str, port: u16, token: &str) -> String {
 
 /// Parse a join code back into (`addr` = `host:port`, token).
 /// Tolerant of case, spaces, and dashes inside hostnames.
+///
+/// If the code carries the wrong IP (VPNs and Docker interfaces often win
+/// the automatic guess), override it by appending `@` plus the reachable
+/// address: `PUIN-172.16.10.2-8080-abcd-efgh-jkmn @ 192.168.1.42`
+/// (or `... @ 192.168.1.42:8080` to override the port too).
 pub fn parse_join_code(code: &str) -> Result<(String, String), String> {
+    let (code, override_addr) = match code.split_once('@') {
+        Some((c, o)) => (c, Some(o.trim().to_string())),
+        None => (code, None),
+    };
     let c = code.trim().to_uppercase().replace(' ', "");
     let c = c.strip_prefix("PUIN-").unwrap_or(&c).to_lowercase();
     let parts: Vec<&str> = c.split('-').collect();
@@ -108,7 +117,31 @@ pub fn parse_join_code(code: &str) -> Result<(String, String), String> {
     if host.is_empty() {
         return Err("missing address in join code".to_string());
     }
-    Ok((format!("{}:{}", host, port), token))
+    let mut addr = format!("{}:{}", host, port);
+    // Optional `@host[:port]` override for when the code's IP isn't the
+    // reachable one (checked last so the error names the real target).
+    if let Some(o) = override_addr {
+        if o.is_empty() {
+            return Err("nothing after @ — give the reachable address, e.g. code @ 192.168.1.42".to_string());
+        }
+        // rsplit: a trailing :port wins for plain hosts/IPv4. Any other colon
+        // is rejected outright (IPv6 sync isn't targeted, and `host:abc` is
+        // a typo, not a hostname) instead of misdialing later.
+        let (ohost, oport) = match o.rsplit_once(':') {
+            Some((h, p)) if !h.is_empty() && !h.contains(':') && p.parse::<u16>().map_or(false, |n| n > 0) => {
+                (h.to_string(), p.parse::<u16>().unwrap())
+            }
+            _ if o.contains(':') => {
+                return Err("bad address after @ — use host or host:port (1-65535)".to_string());
+            }
+            _ => (o, port),
+        };
+        if ohost.is_empty() {
+            return Err("bad address after @".to_string());
+        }
+        addr = format!("{}:{}", ohost.to_lowercase(), oport);
+    }
+    Ok((addr, token))
 }
 
 /// One-line diagnosis for a failed join, so the fix is obvious instead of
@@ -456,6 +489,27 @@ mod tests {
         assert!(parse_join_code("hello").is_err());
         assert!(parse_join_code("PUIN-1.2.3.4-8080-abc").is_err());
         assert!(parse_join_code("PUIN-1.2.3.4-0-abcdefgh-jklm-nopq").is_err());
+    }
+
+    #[test]
+    fn join_code_at_override_replaces_unreachable_ip() {
+        let base = "PUIN-172.16.10.2-8080-abcd-efgh-jkmn";
+        // Bare code keeps its own address.
+        assert_eq!(
+            parse_join_code(base).unwrap(),
+            ("172.16.10.2:8080".to_string(), "abcdefghjkmn".to_string())
+        );
+        // @host overrides the IP, keeps port + token.
+        let (addr, token) = parse_join_code(&format!("{} @ 192.168.1.42", base)).unwrap();
+        assert_eq!(addr, "192.168.1.42:8080");
+        assert_eq!(token.len(), 12);
+        // @host:port overrides both.
+        let (addr, _) = parse_join_code(&format!("{}@mylan:9999", base)).unwrap();
+        assert_eq!(addr, "mylan:9999");
+        // Dangling @ and bad ports are errors, not silent misdials.
+        assert!(parse_join_code(&format!("{} @", base)).is_err());
+        assert!(parse_join_code(&format!("{} @ 192.168.1.42:0", base)).is_err());
+        assert!(parse_join_code(&format!("{} @ :8080", base)).is_err());
     }
 
     fn host(name: &str, at: i64, group: &str) -> HostConfig {
