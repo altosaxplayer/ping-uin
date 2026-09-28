@@ -850,7 +850,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "ping-uin"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "chrono",
  "crossterm",
