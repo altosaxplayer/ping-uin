@@ -827,6 +827,66 @@ mod tests {
         assert!(no_delete.is_empty());
     }
 
+    fn host_row_for(idx: usize) -> VisibleRow {
+        VisibleRow { kind: RowKind::Host, host_idx: Some(idx) }
+    }
+
+    fn header_row_for(name: &str) -> VisibleRow {
+        VisibleRow {
+            kind: RowKind::GroupHeader { name: name.to_string(), collapsed: false, hidden: 0 },
+            host_idx: None,
+        }
+    }
+
+    #[test]
+    fn reanchor_keeps_viewport_after_regroup() {
+        // Edited device (host 1) moved away; selection stays on the
+        // anchored visible row, which now holds its neighbor (host 2).
+        let rows = vec![
+            header_row_for("cameras"),
+            host_row_for(0),
+            header_row_for("router"),
+            host_row_for(2),
+        ];
+        assert_eq!(reanchor(&rows, Some(2), 1), 2);
+        // Anchor past the end clamps into the list.
+        assert_eq!(reanchor(&rows, Some(99), 0), 2);
+        // Unknown anchor keeps the current selection.
+        assert_eq!(reanchor(&rows, None, 7), 7);
+        // No hosts at all: keep.
+        assert_eq!(reanchor(&[], Some(0), 3), 3);
+        // Anchor on a header with hosts only before it: nearest before wins.
+        let tail = vec![host_row_for(0), header_row_for("x")];
+        assert_eq!(reanchor(&tail, Some(1), 9), 0);
+    }
+
+    #[test]
+    fn reanchor_skips_edited_device_in_new_group() {
+        // Grouped view before edit:
+        //   [H_A, h0, h1(selected @2), H_B, h2]
+        // After moving h1 into group B, the anchor (2) sits on the new
+        // H_B header with the edited device right after it:
+        //   [H_A, h0, H_B, h1, h2]
+        // A naive forward search lands on h1 (jump with device); the
+        // viewport must stay on a neighbor instead.
+        let rows = vec![
+            header_row_for("a"),
+            host_row_for(0),
+            header_row_for("b"),
+            host_row_for(1),
+            host_row_for(2),
+        ];
+        assert_eq!(reanchor(&rows, Some(2), 1), 1, "naive reanchor follows the device");
+        assert_eq!(
+            reanchor_excluding(&rows, Some(2), 1, 1),
+            2,
+            "excluding the edited device keeps the viewport on its neighbor"
+        );
+        // Only the edited device left: fall back instead of vanishing.
+        let solo = vec![header_row_for("b"), host_row_for(1)];
+        assert_eq!(reanchor_excluding(&solo, Some(2), 1, 0), 0);
+    }
+
     #[test]
     fn menu_status_rows_show_on_off() {
         let theme = build_themes().into_iter().next().unwrap();
@@ -1350,13 +1410,13 @@ enum InputMode {
     SmtpForm(SmtpForm),
     SortPicker { selected: usize },
     GroupFilterPicker { groups: Vec<String>, selected: usize },
-    ImportPath { path: String },
-    ExportPath { path: String },
+    ImportPath { path: String, cursor: usize },
+    ExportPath { path: String, cursor: usize },
     HistoryView { host_idx: usize, range: HistoryRange, compare_idx: Option<usize> },
     ThemePicker { original: usize, selected: usize },
     MenuModal,
     KeysHelp,
-    Search { query: String },
+    Search { query: String, cursor: usize },
     ConfirmDelete,
     /// Linux: a privileged-port bind failed — offer to grant
     /// CAP_NET_BIND_SERVICE interactively. `page` = enable the web page
@@ -1365,7 +1425,7 @@ enum InputMode {
     /// Device sync menu (join code, peers with hostname/join/last-sync).
     SyncMenu,
     /// Join form: paste the other device's code.
-    SyncJoin { code: String },
+    SyncJoin { code: String, cursor: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -1391,6 +1451,10 @@ struct App {
     sort_mode: SortMode,
     collapsed: HashSet<String>,
     collapsed_rev: u64,
+    /// Bumped on every structural host change (add/remove/edit/import/sync)
+    /// so the row cache rebuilds: probe counters alone don't catch renames,
+    /// regroups, or alias edits.
+    content_rev: u64,
     search: Option<String>,
     compact: bool,
     wizard_dismissed: bool,
@@ -1536,6 +1600,10 @@ impl App {
 
     /// Persist config JSON + shadow CSV export.
     fn persist(&mut self) {
+        // Structural host changes invalidate the visible-row cache (probe
+        // counters alone don't catch renames/regroups): bump here so no
+        // mutation site can forget it.
+        self.content_rev = self.content_rev.wrapping_add(1);
         self.config.save().ok();
         self.write_entries_csv().ok();
     }
@@ -1661,6 +1729,11 @@ impl App {
 
     /// Apply one all-fields edit (from the EditEntry form) by original name.
     fn edit_entry(&mut self, original: String, form: AddHostForm, shared_hosts: &Arc<RwLock<Vec<HostSchedule>>>) {
+        // Anchor the viewport BEFORE mutating: which visible row the
+        // selection sits on. After a regroup the device moves, but the
+        // view stays put so nearby entries can be edited next.
+        let current = self.selected_idx;
+        let anchor = selected_visible_position(cached_visible_rows(self), current);
         let new_name = form.host.trim().to_string();
         let original_identity = self.config.hosts.iter()
             .find(|h| config::names_equal(&h.name, &original))
@@ -1691,6 +1764,26 @@ impl App {
             if let Ok(mut h) = shared_hosts.write() {
                 *h = schedules_from_config(&self.config.hosts);
             }
+            // persist() bumped content_rev, so rows rebuild fresh from the
+            // edited list with the device in its proper (possibly new)
+            // group. When the edit moved the device far (regroup/rename
+            // reorder), keep the selection on the anchored visible row —
+            // a neighbor — instead of jumping with the device, so the
+            // viewport stays put for editing nearby entries. In-place
+            // edits stay on the device itself.
+            let rows = cached_visible_rows(self).clone();
+            let new_pos = selected_visible_position(&rows, idx);
+            let moved_far = match (anchor, new_pos) {
+                (Some(a), Some(n)) => a.abs_diff(n) > 1,
+                // Hidden by collapse/filter, or anchor unknown: don't chase.
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            self.selected_idx = if moved_far {
+                reanchor_excluding(&rows, anchor, idx, current)
+            } else {
+                idx
+            };
         }
     }
 
@@ -2181,6 +2274,7 @@ struct RowKey {
     sort_mode: SortMode,
     search: Option<String>,
     collapsed_rev: u64,
+    content_rev: u64,
 }
 
 /// Borrow the cached visible rows, rebuilding only on change. Cuts per-frame
@@ -2194,6 +2288,7 @@ fn cached_visible_rows(app: &mut App) -> &Vec<VisibleRow> {
         sort_mode: app.sort_mode,
         search: app.search.clone(),
         collapsed_rev: app.collapsed_rev,
+        content_rev: app.content_rev,
     };
     if key != app.row_key {
         app.row_cache = build_visible_rows(
@@ -2347,6 +2442,43 @@ fn build_visible_rows(
 
 fn selected_visible_position(rows: &[VisibleRow], selected_idx: usize) -> Option<usize> {
     rows.iter().position(|r| r.host_idx == Some(selected_idx))
+}
+
+/// Selection that keeps the viewport still after a regroup: the host now
+/// sitting on the previously-selected visible row (nearest host at/after
+/// it, else the nearest before). Falls back to `keep` when the anchor is
+/// unknown or no host rows remain.
+fn reanchor(rows: &[VisibleRow], anchor_pos: Option<usize>, keep: usize) -> usize {
+    reanchor_excluding(rows, anchor_pos, usize::MAX, keep)
+}
+
+/// Same as [`reanchor`] but never selects `exclude` (the just-edited device
+/// when it moved groups). Without this, an anchor left on a group header
+/// resolves forward onto the edited device itself in its new group — i.e.
+/// the view still jumps with the device.
+fn reanchor_excluding(
+    rows: &[VisibleRow],
+    anchor_pos: Option<usize>,
+    exclude: usize,
+    fallback: usize,
+) -> usize {
+    let Some(a) = anchor_pos else {
+        return fallback;
+    };
+    if rows.is_empty() {
+        return fallback;
+    }
+    let pos = a.min(rows.len().saturating_sub(1));
+    rows[pos..]
+        .iter()
+        .find_map(|r| r.host_idx.filter(|&i| i != exclude))
+        .or_else(|| {
+            rows[..pos]
+                .iter()
+                .rev()
+                .find_map(|r| r.host_idx.filter(|&i| i != exclude))
+        })
+        .unwrap_or(fallback)
 }
 
 fn move_selection_up(app: &mut App) {
@@ -3079,8 +3211,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     Span::raw("   "),
                     Span::raw("[Esc/?] close").style(Style::default().fg(theme.inactive_fg)),
                 ])),
-                InputMode::Search { ref query } => {
-                    let q = if query.is_empty() { " ".to_string() } else { format!("{}▌", query) };
+                InputMode::Search { ref query, cursor } => {
+                    let q = if query.is_empty() { " ".to_string() } else { render_cursor(query, cursor) };
                     Text::from(Line::from(vec![
                         Span::styled("Search ", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                         Span::styled(q, Style::default().fg(theme.hi_fg)),
@@ -3092,8 +3224,8 @@ fn ui(frame: &mut Frame, app: &mut App) {
                     Span::raw("   "),
                     Span::raw("[g] new code   [j] join   [1-9] forget   [Esc] close").style(Style::default().fg(theme.inactive_fg)),
                 ])),
-                InputMode::SyncJoin { ref code } => {
-                    let q = if code.is_empty() { " ".to_string() } else { format!("{}▌", code) };
+                InputMode::SyncJoin { ref code, cursor } => {
+                    let q = if code.is_empty() { " ".to_string() } else { render_cursor(code, cursor) };
                     Text::from(Line::from(vec![
                         Span::styled("Join with code ", Style::default().fg(theme.title).add_modifier(Modifier::BOLD)),
                         Span::styled(q, Style::default().fg(theme.hi_fg)),
@@ -3141,11 +3273,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
             for i in 0..AddHostForm::FIELDS {
                 let focused = form.focus == i;
                 let marker = if focused { "▶ " } else { "  " };
-                // Visible text cursor on the focused field so keyboard-first
-                // use is obvious even though editing is append-only.
+                // Visible text cursor at the edit position (←/→ to move).
                 let mut value = if values[i].is_empty() { placeholder[i].to_string() } else { values[i].clone() };
                 if focused {
-                    value.push('▌');
+                    value = render_cursor(&value, form.cursor);
                 }
                 let style = if values[i].is_empty() {
                     Style::default().fg(theme.inactive_fg)
@@ -3229,7 +3360,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
                 };
                 let mut shown = shown;
                 if focused {
-                    shown.push('▌');
+                    // Cursor on the displayed text (the password mask has the
+                    // same length, clamped for overlong secrets).
+                    shown = render_cursor(&shown, form.cursor);
                 }
                 let style = if values[i].is_empty() {
                     Style::default().fg(theme.inactive_fg)
@@ -3331,9 +3464,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
         }
-        InputMode::ImportPath { ref path } => {
+        InputMode::ImportPath { ref path, cursor } => {
             let popup_area = centered_rect(60, 30, area);
-            let display_path = if path.is_empty() { " ".to_string() } else { path.clone() };
+            let display_path = if path.is_empty() { " ".to_string() } else { render_cursor(path, cursor) };
             let popup = Paragraph::new(Text::from(vec![
                 Line::from(""),
                 Line::from("Path to hosts.csv:").style(Style::default().fg(theme.inactive_fg)),
@@ -3352,9 +3485,9 @@ fn ui(frame: &mut Frame, app: &mut App) {
             frame.render_widget(Clear, popup_area);
             frame.render_widget(popup, popup_area);
         }
-        InputMode::ExportPath { ref path } => {
+        InputMode::ExportPath { ref path, cursor } => {
             let popup_area = centered_rect(60, 30, area);
-            let display_path = if path.is_empty() { " ".to_string() } else { path.clone() };
+            let display_path = if path.is_empty() { " ".to_string() } else { render_cursor(path, cursor) };
             let popup = Paragraph::new(Text::from(vec![
                 Line::from(""),
                 Line::from("Export host list to directory:").style(Style::default().fg(theme.inactive_fg)),
@@ -4525,11 +4658,11 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             KeyCode::Char('i') | KeyCode::Char('I') => {
                                 let default_path = paths().csv.to_string_lossy().to_string();
-                                app.input_mode = InputMode::ImportPath { path: default_path };
+                                app.input_mode = InputMode::ImportPath { cursor: default_path.len(), path: default_path };
                             }
                             KeyCode::Char('E') => {
                                 let default_dir = dirs::home_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| ".".to_string());
-                                app.input_mode = InputMode::ExportPath { path: default_dir };
+                                app.input_mode = InputMode::ExportPath { cursor: default_dir.len(), path: default_dir };
                             }
                             KeyCode::Char('w') | KeyCode::Char('W') => {
                                 toggle_web_page(app, &shutdown, &sync_tx);
@@ -4601,7 +4734,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             KeyCode::Char('/') => {
                                 let q = app.search.clone().unwrap_or_default();
-                                app.input_mode = InputMode::Search { query: q };
+                                app.input_mode = InputMode::Search { cursor: q.len(), query: q };
                             }
                             // Enter collapses/expands the selected host's group.
                             KeyCode::Enter => {
@@ -4767,8 +4900,9 @@ fn run_app<B: ratatui::backend::Backend>(
                                 _ => {}
                             }
                         }
-                        InputMode::ImportPath { ref path } => {
+                        InputMode::ImportPath { ref path, cursor } => {
                             let mut path = path.clone();
+                            let mut cursor = cursor;
                             match key.code {
                                 KeyCode::Esc => { app.input_mode = InputMode::Normal; }
                                 KeyCode::Enter => {
@@ -4777,13 +4911,35 @@ fn run_app<B: ratatui::backend::Backend>(
                                         app.import_entries(std::path::Path::new(&path), &shared_hosts);
                                     }
                                 }
-                                KeyCode::Backspace => { path.pop(); app.input_mode = InputMode::ImportPath { path }; }
-                                KeyCode::Char(c) => { path.push(c); app.input_mode = InputMode::ImportPath { path }; }
+                                KeyCode::Left => {
+                                    cursor_left(&path, &mut cursor);
+                                    app.input_mode = InputMode::ImportPath { path, cursor };
+                                }
+                                KeyCode::Right => {
+                                    cursor_right(&path, &mut cursor);
+                                    app.input_mode = InputMode::ImportPath { path, cursor };
+                                }
+                                KeyCode::Home => {
+                                    app.input_mode = InputMode::ImportPath { path, cursor: 0 };
+                                }
+                                KeyCode::End => {
+                                    let cursor = path.len();
+                                    app.input_mode = InputMode::ImportPath { path, cursor };
+                                }
+                                KeyCode::Backspace => {
+                                    cursor_backspace(&mut path, &mut cursor);
+                                    app.input_mode = InputMode::ImportPath { path, cursor };
+                                }
+                                KeyCode::Char(c) => {
+                                    cursor_insert(&mut path, &mut cursor, c);
+                                    app.input_mode = InputMode::ImportPath { path, cursor };
+                                }
                                 _ => {}
                             }
                         }
-                        InputMode::ExportPath { ref path } => {
+                        InputMode::ExportPath { ref path, cursor } => {
                             let mut path = path.clone();
+                            let mut cursor = cursor;
                             match key.code {
                                 KeyCode::Esc => { app.input_mode = InputMode::Normal; }
                                 KeyCode::Enter => {
@@ -4802,8 +4958,29 @@ fn run_app<B: ratatui::backend::Backend>(
                                         }
                                     }
                                 }
-                                KeyCode::Backspace => { path.pop(); app.input_mode = InputMode::ExportPath { path }; }
-                                KeyCode::Char(c) => { path.push(c); app.input_mode = InputMode::ExportPath { path }; }
+                                KeyCode::Left => {
+                                    cursor_left(&path, &mut cursor);
+                                    app.input_mode = InputMode::ExportPath { path, cursor };
+                                }
+                                KeyCode::Right => {
+                                    cursor_right(&path, &mut cursor);
+                                    app.input_mode = InputMode::ExportPath { path, cursor };
+                                }
+                                KeyCode::Home => {
+                                    app.input_mode = InputMode::ExportPath { path, cursor: 0 };
+                                }
+                                KeyCode::End => {
+                                    let cursor = path.len();
+                                    app.input_mode = InputMode::ExportPath { path, cursor };
+                                }
+                                KeyCode::Backspace => {
+                                    cursor_backspace(&mut path, &mut cursor);
+                                    app.input_mode = InputMode::ExportPath { path, cursor };
+                                }
+                                KeyCode::Char(c) => {
+                                    cursor_insert(&mut path, &mut cursor, c);
+                                    app.input_mode = InputMode::ExportPath { path, cursor };
+                                }
                                 _ => {}
                             }
                         }
@@ -4904,7 +5081,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 KeyCode::Char('/') => {
                                     let q = app.search.clone().unwrap_or_default();
-                                    app.input_mode = InputMode::Search { query: q };
+                                    app.input_mode = InputMode::Search { cursor: q.len(), query: q };
                                 }
                                 KeyCode::Char('?') => {
                                     app.input_mode = InputMode::KeysHelp;
@@ -4971,8 +5148,9 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             _ => {}
                         },
-                        InputMode::Search { ref query } => {
+                        InputMode::Search { ref query, cursor } => {
                             let mut query = query.clone();
+                            let mut cursor = cursor;
                             match key.code {
                                 // Esc clears the filter entirely; Enter keeps it.
                                 KeyCode::Esc => {
@@ -4983,15 +5161,30 @@ fn run_app<B: ratatui::backend::Backend>(
                                 KeyCode::Enter => {
                                     app.input_mode = InputMode::Normal;
                                 }
+                                KeyCode::Left => {
+                                    cursor_left(&query, &mut cursor);
+                                    app.input_mode = InputMode::Search { query, cursor };
+                                }
+                                KeyCode::Right => {
+                                    cursor_right(&query, &mut cursor);
+                                    app.input_mode = InputMode::Search { query, cursor };
+                                }
+                                KeyCode::Home => {
+                                    app.input_mode = InputMode::Search { query, cursor: 0 };
+                                }
+                                KeyCode::End => {
+                                    let cursor = query.len();
+                                    app.input_mode = InputMode::Search { query, cursor };
+                                }
                                 KeyCode::Backspace => {
-                                    query.pop();
+                                    cursor_backspace(&mut query, &mut cursor);
                                     app.search = if query.is_empty() { None } else { Some(query.clone()) };
-                                    app.input_mode = InputMode::Search { query };
+                                    app.input_mode = InputMode::Search { query, cursor };
                                 }
                                 KeyCode::Char(c) => {
-                                    query.push(c);
+                                    cursor_insert(&mut query, &mut cursor, c);
                                     app.search = Some(query.clone());
-                                    app.input_mode = InputMode::Search { query };
+                                    app.input_mode = InputMode::Search { query, cursor };
                                 }
                                 _ => {}
                             }
@@ -5001,8 +5194,26 @@ fn run_app<B: ratatui::backend::Backend>(
                             let mut form = form.clone();
                             match key.code {
                                 KeyCode::Esc => { app.input_mode = InputMode::Normal; }
-                                KeyCode::Tab | KeyCode::Down => { form.focus = (form.focus + 1) % AddHostForm::FIELDS; app.input_mode = InputMode::EditEntry { original, form }; }
-                                KeyCode::BackTab | KeyCode::Up => { form.focus = (form.focus + AddHostForm::FIELDS - 1) % AddHostForm::FIELDS; app.input_mode = InputMode::EditEntry { original, form }; }
+                                KeyCode::Tab | KeyCode::Down => { form.move_focus(form.focus + 1); app.input_mode = InputMode::EditEntry { original, form }; }
+                                KeyCode::BackTab | KeyCode::Up => { form.move_focus(form.focus + AddHostForm::FIELDS - 1); app.input_mode = InputMode::EditEntry { original, form }; }
+                                KeyCode::Left => {
+                                    let text = form.field().to_string();
+                                    cursor_left(&text, &mut form.cursor);
+                                    app.input_mode = InputMode::EditEntry { original, form };
+                                }
+                                KeyCode::Right => {
+                                    let text = form.field().to_string();
+                                    cursor_right(&text, &mut form.cursor);
+                                    app.input_mode = InputMode::EditEntry { original, form };
+                                }
+                                KeyCode::Home => {
+                                    form.cursor = 0;
+                                    app.input_mode = InputMode::EditEntry { original, form };
+                                }
+                                KeyCode::End => {
+                                    form.cursor = form.field().len();
+                                    app.input_mode = InputMode::EditEntry { original, form };
+                                }
                                 KeyCode::Enter => {
                                     if form.host.trim().is_empty() {
                                         app.update_state = UpdateState::Info("enter a host or IP".to_string());
@@ -5039,23 +5250,19 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.edit_entry(original, form2, &shared_hosts);
                                 }
                                 KeyCode::Backspace => {
-                                    match form.focus {
-                                        0 => { form.host.pop(); }
-                                        1 => { form.interval.pop(); }
-                                        2 => { form.group.pop(); }
-                                        3 => { form.alias.pop(); }
-                                        _ => { form.port.pop(); }
-                                    }
+                                    let mut text = form.field().to_string();
+                                    let mut cursor = form.cursor;
+                                    cursor_backspace(&mut text, &mut cursor);
+                                    *form.field_mut() = text;
+                                    form.cursor = cursor;
                                     app.input_mode = InputMode::EditEntry { original, form };
                                 }
                                 KeyCode::Char(c) => {
-                                    match form.focus {
-                                        0 => form.host.push(c),
-                                        1 => form.interval.push(c),
-                                        2 => form.group.push(c),
-                                        3 => form.alias.push(c),
-                                        _ => form.port.push(c),
-                                    }
+                                    let mut text = form.field().to_string();
+                                    let mut cursor = form.cursor;
+                                    cursor_insert(&mut text, &mut cursor, c);
+                                    *form.field_mut() = text;
+                                    form.cursor = cursor;
                                     app.input_mode = InputMode::EditEntry { original, form };
                                 }
                                 _ => {}
@@ -5119,7 +5326,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                         ensure_server_running(app, &shutdown, &sync_tx, &bind, port, false);
                                     }
                                     KeyCode::Char('j') | KeyCode::Char('J') => {
-                                app.input_mode = InputMode::SyncJoin { code: String::new() };
+                                app.input_mode = InputMode::SyncJoin { code: String::new(), cursor: 0 };
                             }
                             KeyCode::Char(c) if ('1'..='9').contains(&c) => {
                                 let idx = (c as usize) - ('1' as usize);
@@ -5134,15 +5341,31 @@ fn run_app<B: ratatui::backend::Backend>(
                             }
                             _ => {}
                         },
-                        InputMode::SyncJoin { ref code } => {
+                        InputMode::SyncJoin { ref code, cursor } => {
                             let mut code = code.clone();
+                            let mut cursor = cursor;
                             match key.code {
                                 KeyCode::Esc => {
                                     app.input_mode = InputMode::SyncMenu;
                                 }
+                                KeyCode::Left => {
+                                    cursor_left(&code, &mut cursor);
+                                    app.input_mode = InputMode::SyncJoin { code, cursor };
+                                }
+                                KeyCode::Right => {
+                                    cursor_right(&code, &mut cursor);
+                                    app.input_mode = InputMode::SyncJoin { code, cursor };
+                                }
+                                KeyCode::Home => {
+                                    app.input_mode = InputMode::SyncJoin { code, cursor: 0 };
+                                }
+                                KeyCode::End => {
+                                    let cursor = code.len();
+                                    app.input_mode = InputMode::SyncJoin { code, cursor };
+                                }
                                 KeyCode::Backspace => {
-                                    code.pop();
-                                    app.input_mode = InputMode::SyncJoin { code };
+                                    cursor_backspace(&mut code, &mut cursor);
+                                    app.input_mode = InputMode::SyncJoin { code, cursor };
                                 }
                                 KeyCode::Enter => {
                                     let code = code.trim().to_string();
@@ -5200,13 +5423,13 @@ fn run_app<B: ratatui::backend::Backend>(
                                         }
                                         Err(e) => {
                                             app.update_state = UpdateState::Info(e);
-                                            app.input_mode = InputMode::SyncJoin { code };
+                                            app.input_mode = InputMode::SyncJoin { code, cursor };
                                         }
                                     }
                                 }
                                 KeyCode::Char(c) => {
-                                    code.push(c);
-                                    app.input_mode = InputMode::SyncJoin { code };
+                                    cursor_insert(&mut code, &mut cursor, c);
+                                    app.input_mode = InputMode::SyncJoin { code, cursor };
                                 }
                                 _ => {}
                             }
@@ -5216,44 +5439,48 @@ fn run_app<B: ratatui::backend::Backend>(
                             match key.code {
                                 KeyCode::Esc => { app.input_mode = InputMode::Normal; }
                                 KeyCode::Tab | KeyCode::Down => {
-                                    form.focus = (form.focus + 1) % SmtpForm::FIELDS;
+                                    form.move_focus(form.focus + 1);
                                     app.input_mode = InputMode::SmtpForm(form);
                                 }
                                 KeyCode::BackTab | KeyCode::Up => {
-                                    form.focus = (form.focus + SmtpForm::FIELDS - 1) % SmtpForm::FIELDS;
+                                    form.move_focus(form.focus + SmtpForm::FIELDS - 1);
+                                    app.input_mode = InputMode::SmtpForm(form);
+                                }
+                                KeyCode::Left => {
+                                    let text = form.field().to_string();
+                                    cursor_left(&text, &mut form.cursor);
+                                    app.input_mode = InputMode::SmtpForm(form);
+                                }
+                                KeyCode::Right => {
+                                    let text = form.field().to_string();
+                                    cursor_right(&text, &mut form.cursor);
+                                    app.input_mode = InputMode::SmtpForm(form);
+                                }
+                                KeyCode::Home => {
+                                    form.cursor = 0;
+                                    app.input_mode = InputMode::SmtpForm(form);
+                                }
+                                KeyCode::End => {
+                                    form.cursor = form.field().len();
                                     app.input_mode = InputMode::SmtpForm(form);
                                 }
                                 KeyCode::Enter => {
                                     app.save_smtp_form(form);
                                 }
                                 KeyCode::Backspace => {
-                                    match form.focus {
-                                        0 => { form.enabled.pop(); }
-                                        1 => { form.host.pop(); }
-                                        2 => { form.port.pop(); }
-                                        3 => { form.username.pop(); }
-                                        4 => { form.password.pop(); }
-                                        5 => { form.from.pop(); }
-                                        6 => { form.to.pop(); }
-                                        7 => { form.use_tls.pop(); }
-                                        8 => { form.threshold.pop(); }
-                                        _ => { form.escalations.pop(); }
-                                    }
+                                    let mut text = form.field().to_string();
+                                    let mut cursor = form.cursor;
+                                    cursor_backspace(&mut text, &mut cursor);
+                                    *form.field_mut() = text;
+                                    form.cursor = cursor;
                                     app.input_mode = InputMode::SmtpForm(form);
                                 }
                                 KeyCode::Char(c) => {
-                                    match form.focus {
-                                        0 => form.enabled.push(c),
-                                        1 => form.host.push(c),
-                                        2 => form.port.push(c),
-                                        3 => form.username.push(c),
-                                        4 => form.password.push(c),
-                                        5 => form.from.push(c),
-                                        6 => form.to.push(c),
-                                        7 => form.use_tls.push(c),
-                                        8 => form.threshold.push(c),
-                                        _ => form.escalations.push(c),
-                                    }
+                                    let mut text = form.field().to_string();
+                                    let mut cursor = form.cursor;
+                                    cursor_insert(&mut text, &mut cursor, c);
+                                    *form.field_mut() = text;
+                                    form.cursor = cursor;
                                     app.input_mode = InputMode::SmtpForm(form);
                                 }
                                 _ => {}
@@ -5360,7 +5587,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                 ));
                             }
                         }
-                        let lat_u64 = if up { latency_ms.round() as u64 } else { 0 };
+                        let lat_u64 = if up { latency_ms.round().max(1.0) as u64 } else { 0 };
                         h.history.push_back(lat_u64);
                         while h.history.len() > app.config.graph_width {
                             h.history.pop_front();
@@ -6126,7 +6353,7 @@ fn run_serve(bind: &str, port: u16) -> io::Result<()> {
                             h.down_since = Some(Instant::now());
                         }
                     }
-                    let lat_u64 = if up { latency_ms.round() as u64 } else { 0 };
+                    let lat_u64 = if up { latency_ms.round().max(1.0) as u64 } else { 0 };
                     h.history.push_back(lat_u64);
                     while h.history.len() > config.graph_width {
                         h.history.pop_front();
@@ -6525,6 +6752,7 @@ fn main() -> io::Result<()> {
         sort_mode: config.sort_mode,
         collapsed,
         collapsed_rev: 0,
+        content_rev: 0,
         search: None,
         compact: config.compact,
         wizard_dismissed: false,
