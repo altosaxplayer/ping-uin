@@ -888,6 +888,23 @@ mod tests {
     }
 
     #[test]
+    fn seed_latency_never_marks_up_as_down() {
+        // The log writes UP latency with `{:.0}`, so sub-0.5ms LAN pings
+        // land as "0" — seeding that raw would paint phantom red ticks
+        // while uptime/SLA stay 100%. UP rows always seed >= 1.
+        assert_eq!(seed_latency(true, Some("1")), 1);
+        assert_eq!(seed_latency(true, Some("12")), 12);
+        assert_eq!(seed_latency(true, Some("0")), 1);
+        assert_eq!(seed_latency(true, Some("0.4")), 1);
+        assert_eq!(seed_latency(true, Some("")), 1);
+        assert_eq!(seed_latency(true, None), 1);
+        // DOWN rows always seed 0, whatever the field holds.
+        assert_eq!(seed_latency(false, Some("")), 0);
+        assert_eq!(seed_latency(false, None), 0);
+        assert_eq!(seed_latency(false, Some("5")), 0);
+    }
+
+    #[test]
     fn menu_status_rows_show_on_off() {
         let theme = build_themes().into_iter().next().unwrap();
         let on = status_row(true, "web page", "on — x".to_string(), &theme);
@@ -1974,6 +1991,23 @@ fn log_result(timestamp: &str, host: &str, status: &str, latency_ms: f64) -> io:
     Ok(())
 }
 
+/// Map a log row to its history-deque value. `0` renders as a down tick
+/// everywhere (TUI graph, web sparkstrip), so successful checks must never
+/// seed as `0` — the log records sub-0.5ms LAN pings as `"0"` (`{:.0}`),
+/// which used to resurface as phantom red ticks after every restart while
+/// uptime/SLA (driven by the status column) correctly stayed 100%.
+/// Mirrors the live probe path (`round().max(1.0)`); status is the source
+/// of truth, so an UP row with missing latency still seeds as up.
+fn seed_latency(up: bool, field: Option<&str>) -> u64 {
+    if !up {
+        return 0;
+    }
+    field
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|v| v.round().max(1.0) as u64)
+        .unwrap_or(1)
+}
+
 fn seed_from_log(hosts: &mut [HostState], graph_width: usize) -> io::Result<()> {
     ensure_log()?;
     let mut rdr = csv::Reader::from_path(&paths().log)?;
@@ -1981,10 +2015,10 @@ fn seed_from_log(hosts: &mut [HostState], graph_width: usize) -> io::Result<()> 
         let rec = result?;
         let host = rec.get(1).unwrap_or("");
         if let Some(idx) = hosts.iter().position(|h| h.name == host) {
+            let up = rec.get(2) == Some("UP");
             hosts[idx].total_checks += 1;
-            if rec.get(2) == Some("UP") { hosts[idx].up_checks += 1; }
-            let lat = rec.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            hosts[idx].history.push_back(lat);
+            if up { hosts[idx].up_checks += 1; }
+            hosts[idx].history.push_back(seed_latency(up, rec.get(3)));
         }
     }
     for h in hosts.iter_mut() {
