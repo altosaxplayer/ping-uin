@@ -1,14 +1,14 @@
 Package: ping-uin
-Version: 0.2.14-1
+Version: 0.2.15-1
 Architecture: amd64
 Maintainer: altosaxplayer <https://github.com/altosaxplayer>
 Installed-Size: 6416
 Depends: libc6 (>= 2.39)
-Filename: pool/main/p/ping-uin/ping-uin_0.2.14-1_amd64.deb
-Size: 2064232
-MD5sum: 68fb725d3c5f3372e99d6c6ad45be3be
-SHA1: 9b1749689d97b88aeb3f962e01594896fa9d7f22
-SHA256: 452ee77c692dd0b75e036c62abae6933ef73d6343d799c80b1d65e247d79b6ea
+Filename: pool/main/p/ping-uin/ping-uin_0.2.15-1_amd64.deb
+Size: 2059624
+MD5sum: 951b1888080abad8b552e3aa37f55b2e
+SHA1: c6931fba573aecdbe808305b8919a1849110aaf7
+SHA256: 62abe41d2d1557389c6d2f0fb1c7fd438e740c88c9ee63cbdb9f80d638f6fd78
 Section: net
 Priority: optional
 Description: [generated from Rust crate ping-uin]

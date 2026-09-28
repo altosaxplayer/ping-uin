@@ -4,38 +4,38 @@ Hash: SHA512
 Architectures: amd64
 Codename: stable
 Components: main
-Date: Mon, 28 Sep 2026 22:08:56 +0000
+Date: Mon, 28 Sep 2026 22:40:19 +0000
 Description: ping-uin apt archive
 Label: ping-uin
 Origin: altosaxplayer
 Suite: stable
 MD5Sum:
- 1c5d63925bd7a1be9a949845ce20d952              179 Release
- cf877e470d7458f525c27d32bb947eaf              733 main/binary-amd64/Packages
- 3ec16d74aca9f2bffe487cdf1656b3ea              525 main/binary-amd64/Packages.gz
+ 09c1dc970fede33a67af640d5c5a0648              179 Release
+ 149cb74e79ddfae20b40830c16a305ef              733 main/binary-amd64/Packages
+ b0f10b7da35ed81a6b2bdadc8c14e4a9              525 main/binary-amd64/Packages.gz
 SHA1:
- ee9ba696ac04e1b8ba75607c6ccc99d280fabf59              179 Release
- 1d9dbeca21b19c0dfe5020d6b943a3aca1bffc53              733 main/binary-amd64/Packages
- a28e4bac528513ec35a92e9a3c3a33a05fe85488              525 main/binary-amd64/Packages.gz
+ df25521bf287c47515cc86b16ef173f3b4774a68              179 Release
+ c1001e7a54f94486cc9efe25e9f5002cdc875618              733 main/binary-amd64/Packages
+ 8e52dd04866b49a1cde3823c613cfe6f5e84f060              525 main/binary-amd64/Packages.gz
 SHA256:
- aa2a2f47ef0ae1bcb444cec3f55da837a3741bc4d054a5d8c0aa9bad47c0777e              179 Release
- f8e0e242a74de2c8d461d864a0f4e56d96939174de46c88fe8adcdd154ba1a94              733 main/binary-amd64/Packages
- 32632e1839a0676e0aa3c090f15031e91dde584abe175c96f1dad70518c2c694              525 main/binary-amd64/Packages.gz
+ 89624c74c775f012ca73fdb66759ee6c1652a173befd807982482057e5d01216              179 Release
+ 7c398372730d35eb46da8e46d36270e16148b85271be786eaca64a99ad351900              733 main/binary-amd64/Packages
+ eacdf2dcdee3b49de250b723db6161a0ddce0bde2a1f62bd8df273700292e6cd              525 main/binary-amd64/Packages.gz
 SHA512:
- 9f193d800ea5355e32b2683c73bb9752ad1bec01b7aaf0d38bdc96c582bfee089da3060ebfabc3248c68a835e395c326304fe05c0cba69f1801dd6f9e99f21c9              179 Release
- 0e22f193ff3848b25dc472060e1a2ef3010c3e60405e36d406fb38f2335b09c72c156e8b3525571153a89aaaae429b91d3d75e28d0fc89c29da7fc3c7176a23d              733 main/binary-amd64/Packages
- 2300d61b6f82f4b70986fe7b94119fddbf449737895d927df4ce20d6af562ebb1ef54575ef48bfad5d5a342cfb2cef4541014edc3a01c949b643324f4e7bd99d              525 main/binary-amd64/Packages.gz
+ 1721e0f031513aeb5ac6df984a659492b4f4c027bbbb7a95395a4d552d9b3936f05b950157ebf8f0bec0ad8afb07fda0d6e03f71a9b1e9d971e0776e4404f871              179 Release
+ e49395607d91c958e2cb2a412189ba6837a8bdb3f839fdaafff264694ac041157d25cde9860010df56c9f69a5f1e6dd1d579bfb9095281f6391190fba2521c71              733 main/binary-amd64/Packages
+ 5705d8b8fa2840cafb78f89d0db65f694634a83bdb3a79002fdb5c6557d75b7175ecf3a86d9230700ee8e68d86cf08fcdd9837b91ccf0f7604e5585969d975cc              525 main/binary-amd64/Packages.gz
 -----BEGIN PGP SIGNATURE-----
 
-iQGzBAEBCgAdFiEEM0yhKlnmeqKc8JFoPIusYB4DscoFAmq65XkACgkQPIusYB4D
-scoY9gv8C/XUBS3JRLDI+D+WSTHmf/vqJstHJfDDNOuXYmZync8oyv++bouSulK3
-kh/XZ4nNH8r38UBJpFeVQFxP6m8aIwm+GTs5Sq9XZEGmTikT9db3BjPZ9eH0CulD
-Mqy9WTzC4d2Fa78I5yupMMFoNSyqxDgQ9+YuVjuNZSzA1RCkZYKcfriTiZuowidR
-tv7RM+Xp3NPaBipVdGSL7ucjTDvy8VYp0kE1UcPYRcuJKrkVbtSyqB+CGykfYm7g
-QEprgO7RXi08yJRsRLgeXDr+uihBIDbacjao0gfgdZBkAlYYI/IxgjE37xGn3nwa
-jSQeujzpfanUxrP63EI8AVdDbJrzJSOg6+3LSTDBLNJOpLOCJ24cBUDQbXb+sn7W
-+HrbPPt1BHDSofc2neFh0qdUMtkJ0z9n1HjNS+C/Jj+ayjQ+Wx7OOpNROqBuFR5W
-dLf2hSxFydchyOioT5zL2+r+xgw3VJ4h+oqkQSjTDvwPXkSG/PgsqE3NQRJn1cYx
-Nd4CalYH
-=P47e
+iQGzBAEBCgAdFiEEM0yhKlnmeqKc8JFoPIusYB4DscoFAmq67NMACgkQPIusYB4D
+scoWPwv6As07ZrHrtZbFLUCmXSs57Do2eyZ+q/JxDvKfCu3gwW+6faQbdBhMO9Bb
+Ulmt2KIahpj7rtKpvfALyJPY7JnlFVs6Y+ss6x3P35KPqCEg/9fbF+Q11NEA9qVR
+9bfmbNYeRslecjRb3KoN0K9OCy9we91tv+IiTMw4ivBq/kdqUA0M2pA946jxuKJJ
+VEmEpfGxiStoCbwZPOCLsnnuTzNzEy6NfHX9QWAHqpieCwTUrH35JR6XCDA+Xa1y
+Qp049YZ1+7ApsZvfD5R1fZb5eS1sCT8j9A02vKkOQgHewsG0lgPzFvtSazONER3m
+e6otdW5K8Jy4ZQcaImcqNM2HjWq5rsed8UfUmnvT0ocCmvD3X2UkMyJ4Q9VqWrY3
+4vlzaUy11hlQQiYzX+Hv96/O94HAEgcOAfZxP6oLh2MkglWwfnoqjRunCfTqkns4
+a4prufmWPyTSRwGlvqaM/alOC2xAeo2g/LmM5VlHZ5E2CvhVFpeE/GBMS0jvfABb
+yOQs/N+9
+=n0tK
 -----END PGP SIGNATURE-----
